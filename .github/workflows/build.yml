@@ -93,7 +93,7 @@ jobs:
       - name: 准备 7-Zip（Apple Silicon）
         run: |
           mkdir -p tools/darwin/7z
-          curl -L -o /tmp/7z-mac.tar.xz https://www.7-zip.org/a/7z2409-mac.tar.xz
+          curl -L -o /tmp/7z-mac.tar.xz https://www.7-zip.org/a/7z2301-mac.tar.xz
           tar -xf /tmp/7z-mac.tar.xz -C tools/darwin/7z
       - name: 打包 .app
         run: python packaging/build.py
@@ -119,7 +119,7 @@ jobs:
       - name: 准备 7-Zip（Intel）
         run: |
           mkdir -p tools/darwin/7z
-          curl -L -o /tmp/7z-mac.tar.xz https://www.7-zip.org/a/7z2409-mac.tar.xz
+          curl -L -o /tmp/7z-mac.tar.xz https://www.7-zip.org/a/7z2301-mac.tar.xz
           tar -xf /tmp/7z-mac.tar.xz -C tools/darwin/7z
       - name: 打包 .app
         run: python packaging/build.py
@@ -148,7 +148,7 @@ jobs:
       - name: 准备 7-Zip（Linux）
         run: |
           mkdir -p tools/linux/7z
-          curl -L -o /tmp/7z-linux.tar.xz https://www.7-zip.org/a/7z2409-linux-x64.tar.xz
+          curl -L -o /tmp/7z-linux.tar.xz https://www.7-zip.org/a/7z2301-linux-x64.tar.xz
           tar -xf /tmp/7z-linux.tar.xz -C tools/linux/7z
       - name: 打包
         run: |

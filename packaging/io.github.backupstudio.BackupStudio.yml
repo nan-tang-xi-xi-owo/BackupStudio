@@ -33,11 +33,10 @@
       "sources": [
         {
           "type": "archive",
-          "url": "https://www.7-zip.org/a/7z2409-linux-x64.tar.xz",
-          "sha256": "3a2d3bdcb6a1d4df43b3f0fa3ff3c94b3f2c1c1d6b3c9e5f7d8a0b1c2d3e4f50"
+          "url": "https://www.7-zip.org/a/7z2301-linux-x64.tar.xz",
+          "sha256": "23babcab045b78016e443f862363e4ab63c77d75bc715c0b3463f6134cbcf318"
         }
       ],
-      "comment": "sha256 需按实际下载文件更新（flatpak-builder 会提示正确答案）"
     },
     {
       "name": "backupstudio",
