@@ -520,6 +520,22 @@ class TaskEngine:
             )
 
         # 4. 压缩
+        # 提前判定压缩引擎（force=True 时允许降级到内置），失败时给出明确原因
+        from .archives import BackendUnavailable, backend_for_format
+
+        try:
+            engine_choice = backend_for_format(opts.fmt, force=opts.force)
+        except BackendUnavailable as exc:
+            record.status = "failure"
+            record.errors = [str(exc)]
+            record.finished_at = _now()
+            record.duration = round(time.monotonic() - started, 2)
+            self._log(f"[{task.name}] 无法开始备份：{exc}")
+            return ExecutionResult(record, message=str(exc))
+        warnings.append(f"压缩引擎：{engine_choice.name}")
+        if engine_choice.note:
+            warnings.append(engine_choice.note)
+
         # 分卷模式：create_archive 会把 7z/rar 的「原生分卷」统一映射为字节切片，
         # 这样外部压缩程序失败时也能无缝回退到内置引擎。
         chosen_multivolume = opts.multivolume or None

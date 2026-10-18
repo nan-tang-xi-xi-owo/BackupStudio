@@ -1233,11 +1233,14 @@ def create_archive(
         with contextlib.suppress(OSError):
             if dest.exists() and dest.stat().st_size == 0:
                 dest.unlink()
-        if fmt in ("zip", "rar"):
-            # 外部引擎失败：ZIP / RAR 降级都用内置 zipfile（真 ZIP，中文名可用）
-            backend_name = "rar-as-zipfile-forced" if fmt == "rar" else "zipfile-builtin"
+        if fmt == "zip":
+            # ZIP 请求：内置 zipfile，产出标准 ZIP
             fallback_notes.append(f"外部压缩程序失败（{reason}），已改用内置 ZIP 引擎")
-            return ZipFileCompressor(dest, _as_zip_spec(_spec_for(fmt, None)), progress)
+            return ZipFileCompressor(dest, _spec_for("zip", None), progress)
+        if fmt == "rar":
+            # RAR 请求且 RAR 引擎不可用：内置 ZIP 容器（扩展名保持 .rar，内容为 ZIP）
+            fallback_notes.append(f"外部压缩程序失败（{reason}），已改用内置 ZIP 引擎（扩展名 .rar）")
+            return ZipFileCompressor(dest, _as_zip_spec(_spec_for("rar", None)), progress)
         if fmt == "7z" and py7zr is not None and not name.startswith("py7zr"):
             fallback_notes.append(f"外部程序失败（{reason}），已改用内置 7z 引擎")
             return _TarStreamTo7z(dest, _spec_for("7z", mode_value), progress)
