@@ -49,6 +49,7 @@ def fetch_sha256(url: str) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--check", action="store_true", help="只校验 manifest 是否完整")
     parser.add_argument("--fetch", action="store_true", help="下载 7-Zip 并写回真实校验值（YAML）")
     args = parser.parse_args()
 
