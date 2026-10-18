@@ -1,1 +1,6 @@
+# 开发 / CI 依赖：运行时依赖 + 测试与打包工具
 -r requirements.txt
+pytest>=8
+pyinstaller>=6.3
+pyyaml>=6.0
+ruff>=0.6
