@@ -1,0 +1,210 @@
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  test:
+    name: 单元测试
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - name: pytest
+        run: python -m pytest tests -q
+
+  windows:
+    name: Windows exe / 安装包
+    runs-on: windows-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - name: 准备随包 7-Zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force tools/win32/7z | Out-Null
+          curl.exe -L -o 7zr.exe https://www.7-zip.org/a/7zr.exe
+          curl.exe -L -o 7z-extra.7z https://github.com/ip7z/7zip/releases/download/24.09/7z2409-extra.7z
+          ./7zr.exe x 7z-extra.7z -otools/win32/7z-extract -y
+          Copy-Item tools/win32/7z-extract/x64/7za.exe tools/win32/7z/
+          Copy-Item tools/win32/7z-extract/x64/7za.dll tools/win32/7z/
+          Copy-Item tools/win32/7z-extract/x64/7zxa.dll tools/win32/7z/
+          Copy-Item tools/win32/7z-extract/License.txt tools/win32/7z/
+      - name: 打包 PyInstaller
+        run: python packaging/build.py
+      - name: 安装 Inno Setup
+        run: choco install innosetup --no-progress -y
+      - name: 生成安装包
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = "C:\Program Files\Inno Setup 6\ISCC.exe" }
+          ./packaging/make-windows-installer.ps1 -ISCC $iscc -SkipBuild
+      - name: 便携 zip
+        shell: pwsh
+        run: Compress-Archive -Path dist/BackupStudio/* -DestinationPath dist/BackupStudio-1.0.0-windows-x64.zip
+      - name: 冒烟测试
+        shell: pwsh
+        run: |
+          ./dist/BackupStudio/BackupStudio.exe --version
+          ./dist/BackupStudio/BackupStudio.exe selftest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/BackupStudio-1.0.0-windows-x64.zip
+            dist/BackupStudio-Setup-*.exe
+
+  macos-arm64:
+    name: macOS arm64 dmg
+    runs-on: macos-14
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - name: 准备 7-Zip（Apple Silicon）
+        run: |
+          mkdir -p tools/darwin/7z
+          curl -L -o /tmp/7z-mac.tar.xz https://www.7-zip.org/a/7z2409-mac.tar.xz
+          tar -xf /tmp/7z-mac.tar.xz -C tools/darwin/7z
+      - name: 打包 .app
+        run: python packaging/build.py
+      - name: 生成 DMG
+        run: bash packaging/make-dmg.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: dist/*.dmg
+
+  macos-x64:
+    name: macOS x64 dmg
+    runs-on: macos-13
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - name: 准备 7-Zip（Intel）
+        run: |
+          mkdir -p tools/darwin/7z
+          curl -L -o /tmp/7z-mac.tar.xz https://www.7-zip.org/a/7z2409-mac.tar.xz
+          tar -xf /tmp/7z-mac.tar.xz -C tools/darwin/7z
+      - name: 打包 .app
+        run: python packaging/build.py
+      - name: 生成 DMG
+        run: bash packaging/make-dmg.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-x64
+          path: dist/*.dmg
+
+  linux-appimage:
+    name: Linux AppImage
+    runs-on: ubuntu-22.04
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: 依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse2 file libegl1 libxkbcommon-x11-0 libxcb-cursor0 libnotify-bin
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - name: 准备 7-Zip（Linux）
+        run: |
+          mkdir -p tools/linux/7z
+          curl -L -o /tmp/7z-linux.tar.xz https://www.7-zip.org/a/7z2409-linux-x64.tar.xz
+          tar -xf /tmp/7z-linux.tar.xz -C tools/linux/7z
+      - name: 打包
+        run: |
+          python packaging/build.py
+          bash packaging/make-appimage.sh
+      - name: 烟雾测试
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          ./dist/BackupStudio-*-x86_64.AppImage --version
+          ./dist/BackupStudio-*-x86_64.AppImage info | head -20
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage
+          path: dist/*.AppImage
+
+  linux-flatpak:
+    name: Flatpak
+    runs-on: ubuntu-22.04
+    needs: test
+    container:
+      image: bilelmoussaoui/flatpak-github-actions:kde-6.8
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      - name: 构建 Flatpak
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: BackupStudio.flatpak
+          manifest-path: packaging/io.github.backupstudio.BackupStudio.yml
+          cache-key: flatpak-${{ github.sha }}
+          build-bundle: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-flatpak
+          path: BackupStudio.flatpak
+
+  release:
+    name: 发布 Release
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    needs: [windows, macos-arm64, macos-x64, linux-appimage, linux-flatpak]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: 生成校验值
+        run: |
+          cd artifacts
+          ls -la
+          sha256sum * > SHA256SUMS.txt || true
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: BackupStudio ${{ github.ref_name }}
+          body_path: docs/RELEASE_NOTES_1.0.0.md
+          files: artifacts/**/*
+          fail_on_unmatched_files: false

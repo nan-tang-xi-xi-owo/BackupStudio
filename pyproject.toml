@@ -1,0 +1,51 @@
+[project]
+name = "backupstudio"
+version = "1.0.0"
+description = "跨平台定时文件夹备份与多格式压缩工具（GUI + 托盘 + CLI）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "BackupStudio contributors" }]
+keywords = ["backup", "archive", "compression", "7z", "zip", "tar", "qt"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Environment :: X11 Applications :: Qt",
+    "Environment :: Win32 (MS Windows)",
+    "Environment :: MacOS X",
+    "Operating System :: OS Independent",
+    "Topic :: System :: Archiving :: Backup",
+    "Topic :: System :: Archiving :: Compression",
+]
+
+dependencies = [
+    # 核心能力
+    "PySide6-Essentials>=6.5",
+    "pyzmq>=25.0",
+    "psutil>=5.9",
+    "py7zr>=1.0",
+    "pycryptodomex>=3.19",
+    "rarfile>=4.1",
+    "pyzstd>=0.15",
+    "zstandard>=0.22",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pyinstaller>=6.3"]
+# 只有 Fedora/RHEL 等发行版需要（它们没打包 PySide6，用 RPM 从 PyPI 安装）
+rpm = ["PySide6>=6.5"]
+
+[project.scripts]
+backupstudio = "backupstudio.app:main"
+
+[project.gui-scripts]
+backupstudio-gui = "backupstudio.app:main"
+
+[tool.setuptools]
+packages = ["backupstudio", "backupstudio.gui"]
+
+[tool.setuptools.package-data]
+backupstudio = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

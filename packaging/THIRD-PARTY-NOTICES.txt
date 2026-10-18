@@ -1,0 +1,39 @@
+BackupStudio 第三方组件与许可
+=============================
+
+本程序（BackupStudio / 备份工坊）自身代码以 MIT 许可发布，见 LICENSE。
+分发二进制时请同时附带本说明。
+
+1. Qt 6 / PySide6
+   - 许可：LGPL-3.0（另有商业许可）
+   - 本程序以动态链接方式使用 PySide6 及其随附的 Qt 库；如需替换 Qt 版本，
+     可替换程序目录中的 Qt 动态库（Windows 在 _internal/PySide6 下）。
+   - 源码：https://code.qt.io / https://download.qt.io/official_releases/QtForPython/
+   - Python 绑定：https://pypi.org/project/PySide6/
+
+2. 7-Zip（7za / 7zz / 7zr 压缩组件）
+   - 许可：GNU LGPL 2.1+，但其中 unRAR 代码受“不得用于反编译 RAR 压缩算法”的限制
+   - 版权：Igor Pavlov
+   - 项目主页：https://www.7-zip.org/
+   - Windows 版程序目录 tools/win32/7z/ 内含 7-Zip 24.09 的 7za.exe / 7za.dll 与 License.txt
+
+3. RAR / WinRAR
+   - RAR 是 RARLAB（Alexander Roshal）的专有软件，**不随本程序分发**。
+   - 本程序仅在用户自行安装后可调用其命令行，用于创建 .rar。
+   - 未注册版本只能解压不能打包；创建 RAR 需要有效的 WinRAR / RAR 许可。
+   - 下载：https://www.rarlab.com/download.htm
+
+4. Python 组件
+   - py7zr（LGPL-2.1+）           https://github.com/miurahr/py7zr
+   - pyzmq（BSD-3-Clause / LGPL） https://github.com/zeromq/pyzmq
+   - psutil（BSD-3-Clause）       https://github.com/giampaolo/psutil
+   - rarfile（ISC）               https://github.com/markokr/rarfile
+   - pyzstd（BSD-2-Clause）       https://github.com/animalize/pyzstd
+   - zstandard（BSD-3-Clause）    https://github.com/indygreg/python-zstandard
+
+5. 其它
+   - 程序使用 Python 标准库的 tarfile / zipfile / gzip / bz2 / lzma 实现部分格式。
+   - 通知功能在 Linux 上调用 notify-send（libnotify），macOS 上调用 osascript。
+
+完整许可证文本可从各项目主页获取；如需随二进制分发的完整文本副本，
+请把上述项目目录中的 LICENSE 文件一同放入发行包的 licenses/ 目录。

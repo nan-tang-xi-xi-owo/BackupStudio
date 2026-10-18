@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.backupstudio.BackupStudio</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <name>BackupStudio</name>
+  <summary>Scheduled folder backups with multi-format compression</summary>
+  <summary xml:lang="zh_CN">定时文件夹备份与多格式压缩</summary>
+  <description>
+    <p>BackupStudio backs up folders or selected files inside a folder on a schedule you choose
+    (interval, daily, weekly, monthly) and compresses them with ZIP, 7z, RAR or tar family
+    formats to any destination you pick.</p>
+    <ul>
+      <li>Compression formats: zip, 7z, rar, tar, tar.gz, tar.bz2, tar.xz, tar.zst</li>
+      <li>Password protection (AES-256 / ZipCrypto) and split volumes</li>
+      <li>Retention policy: keep by count, days or total size</li>
+      <li>Detects the Linux distribution and tells you which packages are missing</li>
+      <li>Runs in the system tray; backups continue when the window is closed</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.backupstudio.BackupStudio.desktop</launchable>
+  <url type="homepage">https://github.com/backupstudio/backupstudio</url>
+  <developer_name>BackupStudio contributors</developer_name>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="1.0.0" date="2026-10-18">
+      <description>
+        <p>First release: multi-format scheduled backups, tray support, cross-platform packaging.</p>
+      </description>
+    </release>
+  </releases>
+</component>

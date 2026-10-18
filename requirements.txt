@@ -1,0 +1,8 @@
+PySide6-Essentials>=6.5
+pyzmq>=25.0
+psutil>=5.9
+py7zr>=1.0
+pycryptodomex>=3.19
+rarfile>=4.1
+pyzstd>=0.15
+zstandard>=0.22

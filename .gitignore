@@ -1,0 +1,17 @@
+﻿__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+.venv/
+
+# 随包二进制：7-Zip 的许可证允许分发，但仓库里通过脚本下载更轻量
+tools/*/7z/*
+# RAR 为专有软件：不随仓库分发
+tools/*/rar/
+
+# 开发期截图与构建中间产物
+build/shots/
+dev/__pycache__/

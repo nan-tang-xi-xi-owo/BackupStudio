@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=BackupStudio
+Name[zh_CN]=备份工坊
+GenericName=Backup Tool
+GenericName[zh_CN]=备份与压缩工具
+Comment=Scheduled folder backups with ZIP/7z/tar/RAR compression
+Comment[zh_CN]=定时把文件夹压缩备份到自定义位置，支持 ZIP/7z/tar/RAR、密码与分卷
+Exec=backupstudio %U
+TryExec=backupstudio
+Icon=io.github.backupstudio.BackupStudio
+Terminal=false
+Categories=Utility;Archiving;Backup;
+Keywords=backup;archive;compress;zip;7z;tar;备份;压缩;
+StartupWMClass=BackupStudio
+X-GNOME-UsesNotifications=true
