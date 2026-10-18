@@ -26,8 +26,15 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
+      - name: 环境自检（定位各 runner 的压缩工具差异）
+        shell: pwsh
+        run: |
+          python -m backupstudio info
+          python -c "from backupstudio.tools import find_7z, probe_7z; print('7z =', find_7z()); print(probe_7z())"
+          Write-Host "PATH 中的 7z/7za/tar："
+          Get-Command 7z,7za,7zr,tar -ErrorAction SilentlyContinue | Select-Object Name,Source
       - name: pytest
-        run: python -m pytest tests -q
+        run: python -m pytest tests -q -x
 
   windows:
     name: Windows exe / 安装包
