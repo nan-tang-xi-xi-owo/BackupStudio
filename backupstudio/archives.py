@@ -1041,22 +1041,21 @@ def backend_for_format(fmt: str, force: bool = False) -> BackendChoice:
         if rar_available():
             return BackendChoice("rar-native", lambda d, s, p: RarCompressor(d, s, p))
         if force:
+            # 强制 RAR 的产出容器：优先「真 ZIP + .rar 扩展名」（任何解压软件都能打开），
+            # 其次才是内置 7z 容器。两者都会在结果里明确提示。
             exe = find_7z()
             if exe:
                 return BackendChoice(
                     "rar-as-zip-forced",
                     lambda d, s, p, _e=exe: SevenZipCompressor(d, _as_zip_spec(s), p, _e),
-                    note="强制模式：未检测到可写 RAR 的引擎，改用 ZIP 容器（扩展名仍为 .rar，普通解压软件可打开，但不是真正的 RAR）",
+                    note="强制模式：未检测到可写 RAR 的引擎，改用 ZIP 容器（扩展名仍为 .rar，普通解压软件可打开）",
                 )
-            if py7zr is not None:
-                return BackendChoice(
-                    "rar-as-py7zr-forced",
-                    lambda d, s, p: _TarStreamTo7z(d, _as_py7zr_spec(s), p),
-                    note="强制模式：改用内置 7z 引擎写入（扩展名 .rar，但内容为 7z，请用 7-Zip / Keka 打开）",
-                )
-            raise BackendUnavailable(
-                "强制创建 RAR 仍需 7-Zip 或 py7zr",
-                fix=f"安装 7-Zip：{info.install_command('7zip')}；或 pip install py7zr",
+            from .py7zr_backend import ZipFileCompressor
+
+            return BackendChoice(
+                "rar-as-zipfile-forced",
+                lambda d, s, p: ZipFileCompressor(d, _as_zip_spec(s), p),
+                note="强制模式：改用内置 ZIP 引擎（扩展名 .rar，内容是标准 ZIP，任何解压软件都能打开）",
             )
         raise BackendUnavailable(
             "未检测到可创建压缩包的 RAR（WinRAR / RAR 为专有软件，需自行安装并同意其授权）",
@@ -1077,7 +1076,11 @@ def backend_for_format(fmt: str, force: bool = False) -> BackendChoice:
 
 
 class _TarStreamTo7z:
-    """强制模式：把 tar 流暂存后用 py7zr 写成 7z。"""
+    """强制模式的内置后端包装：7z 走 py7zr，ZIP 走标准库 zipfile。
+
+    注意：Py7zrCompressor 对 ``spec.fmt == "zip"`` 会改用 zipfile，
+    因此调用方必须传入**正确的 fmt**（不能把 ZIP 请求交给 7z 容器）。
+    """
 
     name = "py7zr"
 
@@ -1086,6 +1089,7 @@ class _TarStreamTo7z:
 
         self.dest = dest_path
         self.inner = Py7zrCompressor(dest_path, spec, progress)
+        self.name = getattr(self.inner, "name", "py7zr")
 
     @property
     def warnings(self) -> list[str]:
@@ -1214,22 +1218,29 @@ def create_archive(
             follow_symlinks=spec.follow_symlinks, force=spec.force,
         )
 
+    from .py7zr_backend import ZipFileCompressor
+
     fallback_notes: list[str] = []
     factory = choice.factory
 
     def _fallback(exc: BaseException, mode_value: str | None):
-        """强制模式下外部程序失败：换内置引擎（返回新的 backend）。"""
+        """强制模式下外部程序失败：换内置引擎（返回新的 backend）。
+
+        关键：必须按**原格式**选择后备，不能把 ZIP 请求交给 7z 容器。
+        """
         reason = (str(exc).splitlines() or [type(exc).__name__])[0][:120]
         name = str(getattr(choice, "name", ""))
         with contextlib.suppress(OSError):
             if dest.exists() and dest.stat().st_size == 0:
                 dest.unlink()
-        if fmt in ("7z", "rar") and py7zr is not None and not name.startswith(("py7zr", "rar-as-py7zr")):
+        if fmt in ("zip", "rar"):
+            # 外部引擎失败：ZIP / RAR 降级都用内置 zipfile（真 ZIP，中文名可用）
+            backend_name = "rar-as-zipfile-forced" if fmt == "rar" else "zipfile-builtin"
+            fallback_notes.append(f"外部压缩程序失败（{reason}），已改用内置 ZIP 引擎")
+            return ZipFileCompressor(dest, _as_zip_spec(_spec_for(fmt, None)), progress)
+        if fmt == "7z" and py7zr is not None and not name.startswith("py7zr"):
             fallback_notes.append(f"外部程序失败（{reason}），已改用内置 7z 引擎")
-            return _TarStreamTo7z(dest, _as_py7zr_spec(_spec_for(fmt, mode_value)), progress)
-        if fmt == "zip":
-            fallback_notes.append(f"7-Zip 失败（{reason}），已改用内置 zipfile")
-            return ZipCompressor(dest, _spec_for(fmt, None), progress)
+            return _TarStreamTo7z(dest, _spec_for("7z", mode_value), progress)
         raise exc
 
     try:

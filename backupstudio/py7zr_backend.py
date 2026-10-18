@@ -27,6 +27,14 @@ from .staging import make_staging_dir
 class _Cancelled(Exception):
     """取消信号（由 archives.create_archive 转成 ArchiveCancelled）。"""
 
+
+def to_archive_cancelled(exc: BaseException) -> None:
+    """把内部的 _Cancelled 转成对外的 ArchiveCancelled。"""
+    from .archives import ArchiveCancelled
+
+    if isinstance(exc, _Cancelled):
+        raise ArchiveCancelled() from None
+
 # 单段暂存上限（源字节）。
 STREAM_LIMIT = 512 * 1024 * 1024
 
@@ -255,3 +263,100 @@ class Py7zrCompressor:
         with contextlib.suppress(OSError):
             if self.dest.exists() and self.dest.stat().st_size == 0:
                 self.dest.unlink()
+
+
+class ZipFileCompressor:
+    """纯内置 ZIP 写入器（不依赖 py7zr / 7-Zip）。
+
+    用于「强制压缩」且系统没有 7-Zip 时的 ZIP / RAR 降级输出，
+    保证产出是标准 ZIP（中文/emoji 文件名按 UTF-8 标志位保存）。
+    """
+
+    name = "zipfile-builtin"
+
+    def __init__(self, dest_path: Path, spec, progress) -> None:  # noqa: ANN001
+        import dataclasses
+        import zipfile
+
+        self.dest = Path(dest_path)
+        self.progress = progress
+        self._warnings: list[str] = []
+        self.notes: list[str] = []
+        if spec.multivolume == "native":
+            spec = dataclasses.replace(spec, multivolume="split")
+        self.spec = spec
+        self._cancel = None
+        level = max(1, min(9, int(spec.level or 5)))
+        try:
+            self._zip = zipfile.ZipFile(
+                self.dest, "w",
+                compression=zipfile.ZIP_STORED if spec.level == 0 else zipfile.ZIP_DEFLATED,
+                compresslevel=level,
+                allowZip64=True,
+            )
+        except OSError as exc:
+            raise RuntimeError(f"无法创建 ZIP：{exc}") from exc
+        if spec.password:
+            self._warnings.append("内置 ZIP 引擎不支持加密：本次未设置密码（ZIP 加密需要 7-Zip）")
+
+    @property
+    def warnings(self) -> list[str]:
+        return self._warnings
+
+    def set_cancel(self, cancel) -> None:  # noqa: ANN001
+        self._cancel = cancel
+
+    def _info(self, arcname: str, mtime: float | None, is_dir: bool):  # noqa: ANN201
+        import time as _time
+        import zipfile
+
+        ts = _time.localtime(mtime or _time.time())[:6]
+        if ts[0] < 1980:
+            ts = (1980, 1, 1, 0, 0, 0)
+        zi = zipfile.ZipInfo(arcname + ("/" if is_dir else ""), date_time=ts)
+        zi.external_attr = (0o40755 if is_dir else 0o100644) << 16
+        try:
+            zi.flag_bits |= 0x800
+        except Exception:  # noqa: BLE001
+            pass
+        return zi
+
+    def _check(self) -> None:
+        if self._cancel is not None and self._cancel():
+            raise _Cancelled()
+
+    def add_dir(self, arcname: str, mtime: float | None = None) -> None:
+        self._zip.writestr(self._info(arcname, mtime, True), b"")
+
+    def add_symlink(self, arcname: str, target: str, mtime: float | None = None) -> None:
+        self.add_bytes(target.encode("utf-8", "surrogateescape"), arcname, mtime)
+
+    def add_file(self, src: Path, arcname: str, mtime: float | None = None) -> int:
+
+        self._check()
+        st = src.stat()
+        with open(src, "rb") as fh, self._zip.open(self._info(arcname, mtime or st.st_mtime, False), "w") as out:
+            while True:
+                self._check()
+                chunk = fh.read(1 << 20)
+                if not chunk:
+                    break
+                out.write(chunk)
+                self.progress.add(len(chunk))
+        return st.st_size
+
+    def add_bytes(self, data: bytes, arcname: str, mtime: float | None = None) -> int:
+        self._zip.writestr(self._info(arcname, mtime, False), data)
+        self.progress.add(len(data))
+        return len(data)
+
+    def close(self) -> None:
+        self._zip.close()
+
+    def abort(self) -> None:
+        import contextlib
+
+        with contextlib.suppress(Exception):
+            self._zip.close()
+        with contextlib.suppress(OSError):
+            self.dest.unlink()

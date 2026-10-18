@@ -231,9 +231,11 @@ class TestEngine:
         assert any(f.startswith("t-") for f in files)
         # 能重新打开并读到内容
         if fmt == "zip":
+            # 无论走 7-Zip 还是内置 zipfile，产物都必须是真 ZIP 且含源文件
+            assert zipfile.is_zipfile(result.record.archive), "zip 产物不是有效 ZIP"
             with zipfile.ZipFile(result.record.archive) as zf:
                 assert "data/a.txt" in zf.namelist()
-        elif fmt.startswith("tar"):
+        elif fmt.startswith("tar") and fmt != "tar.zst":
             with tarfile.open(result.record.archive) as tf:
                 assert "data/a.txt" in tf.getnames()
 

@@ -232,8 +232,33 @@ def verify_archive(main: Path, fmt: str, password: str | None = None) -> tuple[b
         if fmt.startswith("tar"):
             import tarfile
 
-            mode = "r:*"
-            with tarfile.open(main, mode) as tf:
+            if fmt == "tar.zst":
+                # Python < 3.14 的 tarfile 不认识 zstd：优先用 7-Zip，其次 zstd 解压后校验
+                from .tools import find_7z
+
+                seven = find_7z()
+                if seven:
+                    import subprocess
+                    import sys
+
+                    kwargs: dict = {"capture_output": True, "timeout": 3600}
+                    if sys.platform == "win32":
+                        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    proc = subprocess.run([seven, "t", str(main)], **kwargs)
+                    out = (proc.stdout or b"").decode("utf-8", "replace")
+                    if proc.returncode == 0:
+                        return True, "7-Zip 测试通过"
+                    return False, f"7-Zip 测试失败（退出码 {proc.returncode}）" + out.strip()[-200:]
+                zstd = __import__("shutil").which("zstd")
+                if zstd:
+                    import subprocess
+
+                    proc = subprocess.run([zstd, "-t", str(main)], capture_output=True, timeout=3600)
+                    return proc.returncode == 0, "zstd 校验通过" if proc.returncode == 0 else "zstd 校验失败"
+                with tarfile.open(main, "r:*") as tf:
+                    count = sum(1 for _ in tf)
+                return True, f"{count} 个条目可读取"
+            with tarfile.open(main, "r:*") as tf:
                 count = 0
                 for _ in tf:
                     count += 1
