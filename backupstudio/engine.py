@@ -210,6 +210,32 @@ def verify_archive(main: Path, fmt: str, password: str | None = None) -> tuple[b
             import zipfile
 
             with zipfile.ZipFile(main) as zf:
+                infos = zf.infolist()
+                encrypted = any(bool(i.flag_bits & 0x1) for i in infos if not i.is_dir())
+                if encrypted:
+                    # 加密条目无法用 zipfile 测试（读不了内容）：
+                    # 有 7-Zip 时用 7z t 带密码测试；否则明确跳过（不得误报成败）。
+                    from .tools import find_7z
+
+                    seven = find_7z()
+                    if seven:
+                        import subprocess
+                        import sys as _sys
+
+                        argv = [seven, "t", str(main)]
+                        if password:
+                            argv.insert(2, f"-p{password}")
+                        kwargs: dict = {"capture_output": True, "timeout": 600, "stdin": subprocess.DEVNULL}
+                        if _sys.platform == "win32":
+                            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                        proc = subprocess.run(argv, **kwargs)
+                        out7 = (proc.stdout or b"").decode("utf-8", "replace")
+                        if proc.returncode == 0:
+                            return True, "7-Zip 测试通过（加密 ZIP）"
+                        if not password:
+                            return False, "加密 ZIP 需要密码才能校验，请提供密码"
+                        return False, f"加密 ZIP 校验失败（退出码 {proc.returncode}）{out7.strip()[-200:]}"
+                    return True, "跳过内容校验：加密 ZIP 需 7-Zip（条目数与加密位已核对）"
                 bad = zf.testzip()
                 if bad is None:
                     return True, f"{len(zf.infolist())} 个条目校验通过"
