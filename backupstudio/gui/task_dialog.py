@@ -72,6 +72,14 @@ class TaskDialog(QDialog):
         self._dark = state.palette.dark
         self._caps = format_capabilities()
         self._env = environment_report()
+        # 用户意图保真：capability 变化触发的"程序性取消勾选"不得洗白已保存的字段。
+        # _initial_* 记录任务原有值；_user_touched_* 只在用户手动切换开关时置位。
+        self._initial_password = self._task.options.password
+        self._initial_multivolume = self._task.options.multivolume
+        self._user_touched_pw = False
+        self._user_touched_mv = False
+        self._user_touched_mv_combo = False
+        self._loading = True
         self.setWindowTitle("编辑备份任务" if task else "新建备份任务")
         self.setMinimumSize(860, 720)
         self.resize(900, 780)
@@ -110,6 +118,7 @@ class TaskDialog(QDialog):
 
         self._load_task()
         self._refresh_capabilities()
+        self._loading = False
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -240,19 +249,29 @@ class TaskDialog(QDialog):
             self._reload_file_list()
 
     def _reload_file_list(self) -> None:
+        entries: list[tuple[str, bool]] = []
         base = Path(normalize_path(self.src_path.path())) if self.src_path.path() else None
+        if base is not None and base.is_dir():
+            try:
+                listed = sorted(base.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+            except OSError:
+                listed = []
+            entries = [(p.name, p.is_dir()) for p in listed[:5000]]
+        self._populate_files(entries)
+
+    def _populate_files(self, rel_paths: list[str] | list[tuple[str, bool]]) -> None:
+        """重建来源清单（去重）；条目数据即"已选"状态。"""
         self.src_files.clear()
-        if base is None or not base.is_dir():
-            return
-        try:
-            entries = sorted(base.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
-        except OSError:
-            return
-        for p in entries[:5000]:
-            item = QListWidgetItem(("📄 " if p.is_file() else "📁 ") + p.name)
-            item.setData(Qt.ItemDataRole.UserRole, p.name)
-            item.setToolTip(str(p))
-            if p.is_dir():
+        seen: set[str] = set()
+        for entry in rel_paths:
+            rel, is_dir = (entry, False) if isinstance(entry, str) else (entry[0], bool(entry[1]))
+            rel = str(rel)
+            if not rel or rel in seen:
+                continue
+            seen.add(rel)
+            item = QListWidgetItem(("📁 " if is_dir else "📄 ") + rel)
+            item.setData(Qt.ItemDataRole.UserRole, rel)
+            if is_dir:
                 item.setForeground(Qt.GlobalColor.gray)
             self.src_files.addItem(item)
 
@@ -395,6 +414,7 @@ class TaskDialog(QDialog):
         pw_card.add(self.pw_widget)
         self.pw_widget.setVisible(False)
         self.pw_enabled.toggled.connect(self.pw_widget.setVisible)
+        self.pw_enabled.toggled.connect(self._on_pw_toggled)
         lay.addWidget(pw_card)
 
         # 分卷
@@ -426,6 +446,7 @@ class TaskDialog(QDialog):
         for mode in MULTIVOLUME_MODES:
             self.mv_combo.addItem(MULTIVOLUME_LABELS.get(mode, mode), mode)
         self.mv_combo.currentIndexChanged.connect(self._refresh_capabilities)
+        self.mv_combo.currentIndexChanged.connect(self._on_mv_combo_changed)
         mf.addRow("分卷方式", self.mv_combo)
         self.mv_note = QLabel("")
         self.mv_note.setWordWrap(True)
@@ -434,6 +455,7 @@ class TaskDialog(QDialog):
         mv_card.add(self.mv_widget)
         self.mv_widget.setVisible(False)
         self.mv_enabled.toggled.connect(self.mv_widget.setVisible)
+        self.mv_enabled.toggled.connect(self._on_mv_toggled)
         lay.addWidget(mv_card)
 
         # 强制
@@ -455,6 +477,19 @@ class TaskDialog(QDialog):
         mode = QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
         self.pw_edit.setEchoMode(mode)
         self.pw_edit2.setEchoMode(mode)
+
+    def _on_pw_toggled(self, _checked: bool) -> None:
+        """区分"用户操作"与"程序设置"：只有非载入/非能力刷新期间的切换算用户意图。"""
+        if not self._loading:
+            self._user_touched_pw = True
+
+    def _on_mv_toggled(self, _checked: bool) -> None:
+        if not self._loading:
+            self._user_touched_mv = True
+
+    def _on_mv_combo_changed(self, _index: int) -> None:
+        if not self._loading:
+            self._user_touched_mv_combo = True
 
     def _on_level_changed(self, value: int) -> None:
         self.level_label.setText(LEVEL_TEXT.get(value, str(value)))
@@ -629,12 +664,7 @@ class TaskDialog(QDialog):
         src = t.sources[0] if t.sources else SourceConfig()
         self.src_path.edit.setText(src.path)
         self.source_mode.select_data(src.mode)
-        if src.mode == "files":
-            self._reload_file_list()
-            for rel in src.files:
-                item = QListWidgetItem("📄 " + rel)
-                item.setData(Qt.ItemDataRole.UserRole, rel)
-                self.src_files.addItem(item)
+        self._populate_files(src.files)
         self.src_files_box.setVisible(src.mode == "files")
         self.dest_path.edit.setText(t.destination)
         self.template.setText(t.options.filename_template)
@@ -762,11 +792,19 @@ class TaskDialog(QDialog):
         self.enc_combo.select_data(current if current in pw_available else (pw_available[0] if pw_available else current))
         self.enc_combo.blockSignals(False)
         if not pw_available:
+            # 程序性取消勾选（不视为用户意图，字段保真由 _collect 的 _initial_* 兜底）
+            prev = self.pw_enabled.blockSignals(True)
             self.pw_enabled.setChecked(False)
+            self.pw_enabled.blockSignals(prev)
             self.pw_enabled.setEnabled(False)
             self.enc_note.setText(f"当前格式暂不支持加密：{entry.get('reason', '')}")
         else:
             self.pw_enabled.setEnabled(True)
+            # 能力恢复：若任务原有密码或用户曾勾选，恢复勾选（不误标为用户操作）
+            if not self.pw_enabled.isChecked() and (self._initial_password or self._user_touched_pw):
+                prev = self.pw_enabled.blockSignals(True)
+                self.pw_enabled.setChecked(True)
+                self.pw_enabled.blockSignals(prev)
             mode = self.enc_combo.currentData()
             info = entry.get("password", {}).get(mode, {})
             note = info.get("note", "")
@@ -789,9 +827,16 @@ class TaskDialog(QDialog):
         self.mv_combo.setEnabled(bool(modes))
         if modes:
             self.mv_note.setText(entry["multivolume"][self.mv_combo.currentData()].get("note", ""))
+            # 能力恢复：任务原有分卷或用户曾勾选时恢复勾选（对照密码侧）
+            if not self.mv_enabled.isChecked() and (self._initial_multivolume or self._user_touched_mv):
+                prev = self.mv_enabled.blockSignals(True)
+                self.mv_enabled.setChecked(True)
+                self.mv_enabled.blockSignals(prev)
         else:
             self.mv_note.setText("该格式当前无法分卷")
+            prev = self.mv_enabled.blockSignals(True)
             self.mv_enabled.setChecked(False)
+            self.mv_enabled.blockSignals(prev)
             self.mv_enabled.setEnabled(False)
 
         # 强制提示
@@ -839,8 +884,11 @@ class TaskDialog(QDialog):
             QMessageBox.critical(self, "无法创建目录", f"备份位置不可用：\n{dest}\n\n{exc}")
             return None
 
-        password = self.pw_edit.text() if self.pw_enabled.isChecked() else ""
-        if self.pw_enabled.isChecked():
+        # 密码保真：用户没碰过开关时保留任务原有密码（capability 变化触发的程序性
+        # 取消勾选不得洗白已保存字段）；用户显式关掉开关才清空。
+        pw_intended = self.pw_enabled.isChecked() or (not self._user_touched_pw and bool(self._initial_password))
+        password = self.pw_edit.text() if pw_intended else ""
+        if pw_intended:
             if not password:
                 QMessageBox.warning(self, "密码为空", "已开启密码保护，请填写密码。")
                 self.tabs.setCurrentIndex(1)
@@ -865,7 +913,14 @@ class TaskDialog(QDialog):
             force = True
             self.force_switch.setChecked(True)
 
-        mv = self.mv_combo.currentData() if self.mv_enabled.isChecked() else ""
+        # 分卷保真：用户未触碰任何分卷控件时保留原值（含引擎允许但 UI 不提供的组合，
+        # 如 7z+split——引擎的 multivolume_mode_for 可正确映射）；显式操作才生效。
+        if self._user_touched_mv or self._user_touched_mv_combo:
+            mv = (self.mv_combo.currentData() or "") if self.mv_enabled.isChecked() else ""
+        elif self._initial_multivolume:
+            mv = self._initial_multivolume
+        else:
+            mv = (self.mv_combo.currentData() or "") if self.mv_enabled.isChecked() else ""
         if mv and mv not in [m for m in MULTIVOLUME_MODES if entry.get("multivolume", {}).get(m, {}).get("available")]:
             if not force:
                 QMessageBox.warning(self, "分卷不可用", "所选分卷方式在当前环境不可用，请更换或启用强制压缩。")
@@ -920,8 +975,13 @@ class TaskDialog(QDialog):
         if self.notif_failure.isChecked():
             notify.append("failure")
 
-        task = BackupTask(
-            id=self._task.id,
+        # 以原任务为基础 replace，只覆盖本对话框管理的字段——从根上杜绝
+        # destination_mode/on_error 等无 UI 字段被重置（此前每次编辑都会丢失）。
+        import dataclasses
+
+        base = self._task if self._task is not None else BackupTask()
+        task = dataclasses.replace(
+            base,
             name=name,
             enabled=self.enabled_switch.isChecked(),
             sources=[SourceConfig(path=src_path, mode=mode, files=files)],
@@ -931,12 +991,6 @@ class TaskDialog(QDialog):
             retention=retention,
             verify=self.verify_check.isChecked(),
             notify=notify,
-            last_run=self._task.last_run,
-            last_status=self._task.last_status,
-            last_message=self._task.last_message,
-            last_archive=self._task.last_archive,
-            last_duration=self._task.last_duration,
-            created_at=self._task.created_at,
         )
         return task
 

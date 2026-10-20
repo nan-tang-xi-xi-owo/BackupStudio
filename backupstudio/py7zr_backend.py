@@ -41,13 +41,23 @@ STREAM_LIMIT = 512 * 1024 * 1024
 # 压缩级别 → py7zr 过滤器（id 33 = LZMA2）
 
 
-def _filters_for(level: int):  # noqa: ANN001
-    """压缩级别 → py7zr 过滤器。id 33 = LZMA2，51 = Copy。"""
+def _filters_for(level: int, password: str | None = None):  # noqa: ANN001
+    """压缩级别 → py7zr 过滤器。id 33 = LZMA2，51 = Copy；有密码时追加 AES。
+
+    重要：py7zr 在显式传入 filters 时会忽略自身的默认加密过滤器追加逻辑
+    （1.1.4 及以前的多个版本均如此）——必须在 filters 列表里显式追加
+    FILTER_CRYPTO_AES256_SHA256，否则产出的载荷是明文 LZMA2（仅文件头被加密，
+    制造"看起来加密"的假象）。
+    """
     if py7zr is None:
         return None
     if level <= 0:
-        return [{"id": py7zr.FILTER_COPY}]
-    return [{"id": py7zr.FILTER_LZMA2, "preset": max(0, min(9, int(level)))}]
+        filters = [{"id": py7zr.FILTER_COPY}]
+    else:
+        filters = [{"id": py7zr.FILTER_LZMA2, "preset": max(0, min(9, int(level)))}]
+    if password:
+        filters = [*filters, {"id": py7zr.FILTER_CRYPTO_AES256_SHA256}]
+    return filters
 
 
 class _Reader:
@@ -236,7 +246,7 @@ class Py7zrCompressor:
         try:
             with py7zr.SevenZipFile(
                 str(self.dest), "w", password=password, header_encryption=header_enc,
-                filters=_filters_for(int(self.spec.level)),
+                filters=_filters_for(int(self.spec.level), password),
             ) as z:
                 for stream in self._streams:
                     with tarfile.open(stream, "r:") as tf:
@@ -278,6 +288,8 @@ class ZipFileCompressor:
         import dataclasses
         import zipfile
 
+        from .archives import PasswordRequired
+
         self.dest = Path(dest_path)
         self.progress = progress
         self._warnings: list[str] = []
@@ -286,6 +298,13 @@ class ZipFileCompressor:
             spec = dataclasses.replace(spec, multivolume="split")
         self.spec = spec
         self._cancel = None
+        if spec.password:
+            # fail-closed：内置 ZIP 无加密能力，明确拒绝而不是产出明文
+            raise PasswordRequired(
+                "内置 ZIP 引擎不支持加密：本次未创建归档（不会产出明文包）",
+                backend=self.name,
+                fix="安装 7-Zip 以加密 ZIP，或改用 7z 格式，或关闭密码保护",
+            )
         level = max(1, min(9, int(spec.level or 5)))
         try:
             self._zip = zipfile.ZipFile(
@@ -296,8 +315,6 @@ class ZipFileCompressor:
             )
         except OSError as exc:
             raise RuntimeError(f"无法创建 ZIP：{exc}") from exc
-        if spec.password:
-            self._warnings.append("内置 ZIP 引擎不支持加密：本次未设置密码（ZIP 加密需要 7-Zip）")
 
     @property
     def warnings(self) -> list[str]:

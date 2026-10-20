@@ -223,9 +223,14 @@ def stop_daemon(pid_file: Path, timeout: float = 8.0) -> bool:
 # --------------------------------------------------------------------------
 
 def gui_command() -> list[str]:
+    """自启动用的 GUI 启动命令（`--minimized` 由各平台写入点统一追加）。
+
+    统一使用 ``start`` 子命令：``tray --minimized`` 这类旧命令从未被 argparse 接受
+    （登录后 rc=2 立即退出），旧注册表项由 ``tray`` 子命令的兼容参数兜底。
+    """
     if is_frozen():
-        return [sys.executable]
-    return [sys.executable, "-m", "backupstudio", "tray"]
+        return [sys.executable, "start"]
+    return [sys.executable, "-m", "backupstudio", "start"]
 
 
 def launch_spec() -> tuple[str, list[str], str]:
@@ -260,16 +265,44 @@ def is_autostart_enabled() -> bool:
         return False
 
 
+def _autostart_argv() -> list[str]:
+    """自启动命令中应用自身收到的参数（即 ``python -m backupstudio`` 之后的 argv）。"""
+    args = gui_command()[1:]
+    if len(args) >= 2 and args[0] == "-m":
+        args = args[2:]  # 源码形态：跳过 "-m backupstudio"
+    return [*args, "--minimized"]
+
+
+def _verify_autostart_command() -> str:
+    """自检：生成的自启动命令必须能被 CLI 解析，否则登录后进程会立即退出。"""
+    argv = _autostart_argv()
+    try:
+        from .app import _build_parser  # 延迟导入，避免 autostart <-> app 循环依赖
+
+        _build_parser().parse_args(argv)
+    except SystemExit as exc:
+        return f"命令 {' '.join(argv)!r} 无法被解析（argparse 退出码 {exc.code}）"
+    except Exception as exc:  # noqa: BLE001 - 自检本身绝不能让设置流程崩溃
+        return f"自检执行失败：{type(exc).__name__}: {exc}"
+    return ""
+
+
 def set_autostart(enabled: bool) -> tuple[bool, str]:
     """开启/关闭开机自启动，返回 (成功, 说明)。"""
     try:
         if sys.platform == "win32":
-            return _set_autostart_windows(enabled)
-        if sys.platform == "darwin":
-            return _set_autostart_macos(enabled)
-        return _set_autostart_linux(enabled)
+            ok, msg = _set_autostart_windows(enabled)
+        elif sys.platform == "darwin":
+            ok, msg = _set_autostart_macos(enabled)
+        else:
+            ok, msg = _set_autostart_linux(enabled)
     except Exception as exc:
         return False, f"设置失败: {type(exc).__name__}: {exc}"
+    if ok and enabled:
+        problem = _verify_autostart_command()
+        if problem:
+            return False, f"自启动命令自检未通过：{problem}"
+    return ok, msg
 
 
 def _set_autostart_windows(enabled: bool) -> tuple[bool, str]:

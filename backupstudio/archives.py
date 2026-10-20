@@ -460,11 +460,11 @@ def _chunks_of(
 # --------------------------------------------------------------------------
 
 class ZipCompressor:
-    """标准库 zipfile 后端。
+    """标准库 zipfile 后端（不支持加密）。
 
-    密码说明：打包时用 ZipCrypto（传统加密）写入 ``flag_bits``；
-    真正的加密在 ``create_archive`` 完成后由 7-Zip 重写一遍来做（见 ``encrypt_zip_7z``），
-    因为标准库不支持写加密头。
+    若任务设置了密码，本后端会直接拒绝（PasswordRequired）——fail-closed：
+    宁可明确报错，也不产出"记录为已加密、实际明文"的归档。
+    需要加密 ZIP 请安装 7-Zip（走 SevenZipCompressor）或改用 7z 格式。
     """
 
     name = "python-zipfile"
@@ -475,6 +475,12 @@ class ZipCompressor:
         self.dest = dest_path
         self._warnings: list[str] = []
         self.notes: list[str] = []
+        if spec.password:
+            raise PasswordRequired(
+                "内置 ZIP 引擎不支持加密：本次未创建归档（不会产出明文包）",
+                backend=self.name,
+                fix="安装 7-Zip 以加密 ZIP，或改用 7z 格式，或关闭密码保护",
+            )
         comp = zipfile.ZIP_STORED if spec.level == 0 else zipfile.ZIP_DEFLATED
         self._zip = zipfile.ZipFile(
             dest_path, "w", compression=comp, compresslevel=max(1, min(9, spec.level)), allowZip64=True
@@ -751,16 +757,49 @@ class ExternalCompressor:
         self._fh.close()
         return self.staging_path
 
+    def _unpack_staging(self, tar_path: Path) -> Path:
+        """把 staging.tar 解开为目录（7-Zip 不会自动展开 tar，必须先解再打包）。
+
+        返回解包目录；随后删除 staging.tar 控制磁盘峰值（解包后即释源包）。
+        """
+        unpacked = self.tmpdir / "unpacked"
+        unpacked.mkdir(parents=True, exist_ok=True)
+        self._run([self.exe, "x", str(tar_path), f"-o{unpacked}", "-y", "-bso0", "-bsp0"])
+        with contextlib.suppress(OSError):
+            tar_path.unlink()
+        return unpacked
+
+    def _pack_from(self, src_dir: Path, out_path: Path, *, extra_args: list[str] | None = None) -> None:
+        """从解包目录打包到 out_path（cwd=源目录保证归档内路径与 arcname 一致）。"""
+        if self._cancel is not None and self._cancel():
+            raise ArchiveCancelled()
+        argv = [self.exe, "a", *self._args(), *(extra_args or []), str(out_path), "."]
+        self._run(argv, cwd=src_dir)
+
+    def _commit(self, tmp_dest: Path) -> None:
+        """事务性落地：校验临时产物后原子改名到最终名。"""
+        if not _is_valid_archive(tmp_dest):
+            raise CompressionError(
+                f"7-Zip 未能写入压缩包（{tmp_dest.name} 为空或不可读）",
+                backend=self.name,
+                fix=(
+                    "该目录可能被系统或安全软件限制写入：请换一个备份位置（例如用户目录下的文件夹），"
+                    "或勾选「强制压缩」改用内置引擎"
+                ),
+            )
+        os.replace(tmp_dest, self.dest)
+
     # ---- 压缩阶段
     def close(self) -> None:
         try:
             tar_path = self._finish_staging()
             self.progress.describe("compress")
+            src_dir = self._unpack_staging(tar_path)
             mode = self.spec.multivolume
             if mode == "native":
-                self._run_native_volumes(tar_path)
+                self._run_native_volumes(src_dir)
             else:
-                self._run_single(tar_path)
+                self._run_single(src_dir)
             # 通用分卷：由 create_archive 在收尾时调用 split_volumes
         finally:
             shutil.rmtree(self.tmpdir, ignore_errors=True)
@@ -775,26 +814,29 @@ class ExternalCompressor:
                 self._proc.kill()
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def _popen(self, argv: list[str]) -> subprocess.Popen:
+    def _popen(self, argv: list[str], cwd: str | None = None) -> subprocess.Popen:
         """启动外部压缩程序。
 
         部分受限环境（沙箱、低完整性）下 7z 子进程访问系统临时目录会被拒绝，
         这里给子进程显式设置 TMP/TEMP 到可写的暂存目录。
         """
-        kwargs: dict = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
+        kwargs: dict = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL}
         if sys.platform == "win32":
             kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         tmpdir = str(self.tmpdir)
         env = dict(os.environ, LC_ALL="C", LANG="C", TMP=tmpdir, TEMP=tmpdir, TMPDIR=tmpdir)
         kwargs["env"] = env
-        parent = Path(self.dest).parent
-        if parent.is_dir() and same_volume(parent, self.tmpdir):
-            kwargs["cwd"] = str(parent)
+        if cwd is not None:
+            kwargs["cwd"] = cwd
+        else:
+            parent = Path(self.dest).parent
+            if parent.is_dir() and same_volume(parent, self.tmpdir):
+                kwargs["cwd"] = str(parent)
         self._proc = subprocess.Popen(argv, **kwargs)
         return self._proc
 
-    def _run(self, argv: list[str]) -> str:
-        proc = self._popen(argv)
+    def _run(self, argv: list[str], cwd: str | None = None) -> str:
+        proc = self._popen(argv, cwd=cwd)
         if self._cancel is not None:
             # 边等待边检查取消：外部压缩（也是最慢的一步）必须可中断
             while True:
@@ -872,28 +914,25 @@ class SevenZipCompressor(ExternalCompressor):
                     self.notes.append("ZIP 使用 ZipCrypto 传统加密（兼容性好但强度弱）")
         return args
 
-    def _run_single(self, tar_path: Path) -> None:
-        argv = [self.exe, "a", *self._args(), str(self.dest), str(tar_path)]
-        self._run(argv)
-        if not _is_valid_archive(self.dest):
-            raise CompressionError(
-                f"7-Zip 未能写入压缩包（{self.dest.name} 为空或不可读）",
-                backend=self.name,
-                fix=(
-                    "该目录可能被系统或安全软件限制写入：请换一个备份位置（例如用户目录下的文件夹），"
-                    "或勾选「强制压缩」改用内置引擎"
-                ),
-            )
+    def _run_single(self, src_dir: Path) -> None:
+        tmp_dest = self.dest.with_name(f"{self.dest.name}.bs-tmp-{os.getpid()}")
+        try:
+            self._pack_from(src_dir, tmp_dest)
+            self._commit(tmp_dest)
+        finally:
+            with contextlib.suppress(OSError):
+                tmp_dest.unlink()
 
-    def _run_native_volumes(self, tar_path: Path) -> None:
+    def _run_native_volumes(self, src_dir: Path) -> None:
+        # native 分卷维持直接写最终名（组事务留待 manifest 批次）
         stem = self.dest.name
         for n in range(1, 10000):
             p = self.dest.with_name(f"{stem}.{n:03d}")
             if not p.exists():
                 break
             p.unlink()
-        argv = [self.exe, "a", *self._args(), f"-v{human_volume(self.spec.volume_size)}", str(self.dest), str(tar_path)]
-        self._run(argv)
+        argv = [self.exe, "a", *self._args(), f"-v{human_volume(self.spec.volume_size)}", str(self.dest), "."]
+        self._run(argv, cwd=src_dir)
         idx = 1
         while True:
             p = self.dest.with_name(f"{stem}.{idx:03d}")
@@ -956,6 +995,66 @@ def _is_valid_archive(path: Path) -> bool:
     return any(head.startswith(m) for m in _ARCHIVE_MAGIC) or b"ustar" in head[:512]
 
 
+def probe_encrypted(path: Path, fmt: str, password: str | None = None) -> bool | None:
+    """事后实测产物是否真的加密（None = 无法判定）。
+
+    * zip：读首条目 flag_bits 的加密位（0x1）；注意：不能按字节搜 AES 标识——
+      7z 的文件头本身也含 AES，会误判（见红队报告 E5 §1.2）。
+    * 7z：优先 py7zr 打开检查内容 coder chain 是否含 AES filter；
+      无 py7zr 时用 7za 列归档扫 7zAES 标记（字节级判定不可靠，此项为辅助）。
+    * tar 系：恒 False（无加密实现）。
+    """
+    try:
+        if fmt == "zip":
+            import zipfile
+
+            with zipfile.ZipFile(path) as zf:
+                infos = zf.infolist()
+                if not infos:
+                    return None
+                any_enc = any(bool(i.flag_bits & 0x1) for i in infos if not i.is_dir())
+                return any_enc
+        if fmt == "7z":
+            if py7zr is not None:
+                try:
+                    with py7zr.SevenZipFile(str(path), "r", password=password) as z:
+                        folders = z.header.main_streams.unpackinfo.folders
+                        aes_bytes = py7zr.FILTER_CRYPTO_AES256_SHA256.to_bytes(4, "big")
+                        for fo in folders:
+                            for coder in fo.coders:
+                                method = coder.get("method")
+                                if isinstance(method, bytes) and method == aes_bytes:
+                                    return True
+                        return False
+                except Exception:  # noqa: BLE001 - 打不开则交给外部探针
+                    pass
+            exe = find_7z()
+            if exe:
+                import subprocess
+                import sys
+
+                argv = [exe, "l", "-slt", str(path)]
+                if password:
+                    argv.insert(2, f"-p{password}")
+                kwargs: dict = {"capture_output": True, "timeout": 60, "stdin": subprocess.DEVNULL}
+                if sys.platform == "win32":
+                    kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                proc = subprocess.run(argv, **kwargs)
+                out = (proc.stdout or b"").decode("utf-8", "replace")
+                if proc.returncode != 0:
+                    return None
+                if "7zAES" in out or "Encrypted = +" in out:
+                    return True
+                if "Encrypted = -" in out:
+                    return False
+            return None
+        if fmt.startswith("tar"):
+            return False
+    except Exception:  # noqa: BLE001 - 探测失败不给结论
+        return None
+    return None
+
+
 class RarCompressor(ExternalCompressor):
     _METHOD = {0: "0", 1: "1", 3: "3", 5: "5", 7: "5", 9: "5"}
 
@@ -975,15 +1074,22 @@ class RarCompressor(ExternalCompressor):
             args += [f"-p{spec.password}", "-hp"]  # -hp 同时加密文件名
         return args
 
-    def _run_single(self, tar_path: Path) -> None:
-        self._run([self.exe, "a", *self._args(), str(self.dest), str(tar_path)])
-        if not self.dest.exists():
-            raise CompressionError("RAR 未生成压缩包", backend=self.name)
+    def _run_single(self, src_dir: Path) -> None:
+        tmp_dest = self.dest.with_name(f"{self.dest.name}.bs-tmp-{os.getpid()}")
+        try:
+            self._pack_from(src_dir, tmp_dest)
+            if not tmp_dest.exists():
+                raise CompressionError("RAR 未生成压缩包", backend=self.name)
+            self._commit(tmp_dest)
+        finally:
+            with contextlib.suppress(OSError):
+                tmp_dest.unlink()
 
-    def _run_native_volumes(self, tar_path: Path) -> None:
+    def _run_native_volumes(self, src_dir: Path) -> None:
+        # native 分卷维持直接写最终名（组事务留待 manifest 批次）
         spec = self.spec
-        argv = [self.exe, "a", *self._args(), f"-v{human_volume(spec.volume_size, 'b')}", str(self.dest), str(tar_path)]
-        self._run(argv)
+        argv = [self.exe, "a", *self._args(), f"-v{human_volume(spec.volume_size, 'b')}", str(self.dest), "."]
+        self._run(argv, cwd=src_dir)
         for p in sorted(self.dest.parent.glob(self.dest.with_suffix("").name + ".part*.rar")):
             if p.name.startswith(self.dest.with_suffix("").name + ".part"):
                 self.volumes.append(VolumeInfo(p, p.stat().st_size))
@@ -1210,6 +1316,12 @@ def create_archive(
     encrypt_mode = spec.encrypt_mode if spec.password else None
     if spec.password and not encrypt_mode:
         raise PasswordRequired("设置了密码但未指定加密方式", fix="选择 AES-256 或 ZipCrypto")
+    if spec.password and encrypt_mode == "gpg":
+        # gpg 加密尚未实现（fail-closed：静默产出明文比报错更危险）
+        raise BackendUnavailable(
+            "GPG 加密尚未实现：本次未创建归档（不会产出明文包）",
+            fix="改用 AES-256（7z/zip/rar）加密，或关闭密码保护",
+        )
 
     def _spec_for(f: str, mode_value: str | None) -> ArchiveSpec:
         return ArchiveSpec(
@@ -1353,6 +1465,20 @@ def create_archive(
         # 通用分卷模式下，主文件其实不存在，需修正 path
         if mode == "split" and result.volumes and not dest.exists():
             result.path = result.volumes[0].path
+
+        # 加密状态事后实测回填（不撒谎）：声明有密码但实测无加密 → 修正 + warning
+        if spec.password:
+            actual = probe_encrypted(result.path, fmt, spec.password or None)
+            if actual is False:
+                result.encrypted = False
+                result.secure = False
+                result.notes.append(
+                    "警告：已请求加密，但产物检查未发现加密标志——该归档可能未加密，请核对"
+                )
+            elif actual is True:
+                result.encrypted = True
+            else:
+                result.notes.append("提示：无法自动验证该归档的加密状态（工具不可用）")
 
         result.notes.extend(getattr(backend, "notes", []))
         for w in getattr(backend, "warnings", []):

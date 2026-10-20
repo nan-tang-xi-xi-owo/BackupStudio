@@ -28,10 +28,11 @@ def latest_expected(schedule: ScheduleConfig, now: datetime, last_run: datetime 
     if schedule.type == "manual":
         return None
     if schedule.type == "interval":
-        anchor = last_run or (now - timedelta(minutes=schedule.minutes))
         if last_run is None:
-            return anchor
-        return last_run + timedelta(minutes=schedule.minutes)
+            return now  # 首次：视为立即到点（保持既有"启用即跑"行为）
+        due_at = last_run + timedelta(minutes=schedule.minutes)
+        # 未到点返回 last_run → due() 的 `expected > last_run` 为 False（不触发）
+        return due_at if due_at <= now else last_run
     hh, mm = parse_hhmm(schedule.time)
     if schedule.type == "daily":
         today = now.replace(hour=hh, minute=mm, second=0, microsecond=0)

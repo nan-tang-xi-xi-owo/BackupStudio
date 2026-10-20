@@ -243,19 +243,35 @@ def time_str() -> str:
 def _wake_existing() -> None:
     """尝试把已运行实例的窗口调到前台。"""
     try:
+        import getpass
+
         from PySide6.QtNetwork import QLocalSocket
 
+        try:
+            user = getpass.getuser()
+        except Exception:  # noqa: BLE001 - 无控制台等环境下可能失败
+            user = "user"
         sock = QLocalSocket()
-        sock.connectToServer(f"backupstudio-{os.getlogin() if hasattr(os, 'getlogin') else 'user'}")
+        sock.connectToServer(f"backupstudio-{user}")
         if sock.waitForConnected(300):
             sock.write(b"show")
             sock.flush()
             sock.waitForBytesWritten(300)
             sock.disconnectFromServer()
         else:
-            from PySide6.QtWidgets import QMessageBox
+            # 注意：这里仍处于「GUI 应用对象创建之前」（见 main() 调用处），
+            # 一旦使用 Qt 弹窗组件会触发 Qt qFatal 硬崩溃
+            # （Windows 退出码 0xC0000409，Python 层不可捕获）。
+            # 因此提示必须走系统原生通道。
+            msg = "程序已在运行，请在系统托盘找到它。"
+            if sys.platform == "win32":
+                import ctypes
 
-            QMessageBox.information(None, APP_NAME_ZH, "程序已在运行，请在系统托盘找到它。")
+                ctypes.windll.user32.MessageBoxW(0, msg, APP_NAME_ZH, 0x40)
+            else:
+                write_emergency(f"{APP_NAME_ZH}：{msg}")
+                if sys.stderr is not None:
+                    print(f"{APP_NAME_ZH}：{msg}", file=sys.stderr)
     except Exception:  # noqa: BLE001
         pass
 
@@ -276,7 +292,9 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("gui", help="打开图形界面")
     _sp = sub.add_parser("start", help="在后台启动图形界面（用于开机自启）")
     _sp.add_argument("--minimized", action="store_true", help="启动后不显示主窗口，只驻留托盘")
-    sub.add_parser("tray", help="以托盘模式启动（不显示主窗口）")
+    _tp = sub.add_parser("tray", help="以托盘模式启动（不显示主窗口）")
+    # tray 本来就是最小化启动；--minimized 仅用于兼容旧版写入注册表/plist/desktop 的自启命令
+    _tp.add_argument("--minimized", action="store_true", help="兼容旧版自启动项（无操作：tray 本来就最小化启动）")
 
     task = sub.add_parser("task", help="管理备份任务（list / add / rm / enable）")
     tsub = task.add_subparsers(dest="action")
