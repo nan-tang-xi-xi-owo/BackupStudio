@@ -400,14 +400,16 @@ def save_json_atomic(path: Path | str, data: Any) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         last_exc: OSError | None = None
-        for attempt in range(4):  # 首次 + 3 次重试
+        delay = 0.02
+        for attempt in range(12):  # 首次 + 11 次重试（指数退避，吸收 CI/杀软下的高竞争）
             try:
                 os.replace(tmp, path)
                 return
             except OSError as exc:  # Windows 瞬态占用：短暂退避后重试
                 last_exc = exc
-                if attempt < 3:
-                    time.sleep(0.05)
+                if attempt < 11:
+                    time.sleep(delay)
+                    delay = min(delay * 1.7, 0.5)
         raise last_exc if last_exc is not None else OSError(f"无法写入 {path}")
     except BaseException:
         with contextlib.suppress(OSError):
