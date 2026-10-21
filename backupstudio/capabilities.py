@@ -146,7 +146,7 @@ def _tar_backend() -> tuple[str, bool]:
         import subprocess
 
         out = subprocess.run(
-            [exe, "--version"], capture_output=True, timeout=5,
+            [exe, "--version"], capture_output=True, timeout=5, stdin=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0,
         ).stdout.decode("utf-8", "replace").lower()
     except Exception:
@@ -228,18 +228,27 @@ def package_hint(requirement: str) -> str:
 
 
 def format_capabilities(force: bool = True) -> dict[str, dict]:
-    """返回每种格式的可用性、分卷、密码与缺失项说明。"""
+    """返回每种格式的可用性、分卷、密码与缺失项说明。
+
+    ``force`` 语义（审查 P0-13）：
+    * True （默认，引擎/CLI 视角）：允许把"可用但需强制"的格式计为可用；
+    * False（GUI 展示视角）：如实反映"不勾强制压缩时能否直接成功"，
+      并在 entry 上附加 ``usable_with_force`` 与 ``needs_force`` 供界面三态展示。
+    """
     report = environment_report()
     seven_full = bool(report["seven_zip"]) and report["seven_zip_full"]
     seven_any = bool(report["seven_zip"])
     rar_ok = bool(report["rar"]) and report["rar_can_write"]
     codecs = report["codecs"]
     tar_ok = bool(report["tar"])
+    force_path_zip = seven_any or _py7zr_available()  # rar 强制降级为 ZIP 容器的前提
 
     result: dict[str, dict] = {}
     for fmt, base in _BASELINE.items():
         entry: dict = {
             "available": True,
+            "usable_with_force": True,
+            "needs_force": False,
             "reason": "",
             "warnings": [],
             "missing": [],
@@ -259,6 +268,8 @@ def format_capabilities(force: bool = True) -> dict[str, dict]:
                     import py7zr  # noqa: F401, PLC0415
 
                     entry["available"] = force
+                    entry["usable_with_force"] = True
+                    entry["needs_force"] = not force
                     entry["engine_version"] = "py7zr（内置）"
                     if not force:
                         entry["reason"] = "仅安装内置 py7zr；未安装 7-Zip，需启用「强制压缩」"
@@ -268,7 +279,9 @@ def format_capabilities(force: bool = True) -> dict[str, dict]:
             if fmt == "zip" and not seven_any:
                 entry["engine"] = "python-zipfile"
         elif fmt == "rar":
-            entry["available"] = rar_ok or (force and (seven_any or _py7zr_available()))
+            entry["available"] = rar_ok or (force and force_path_zip)
+            entry["usable_with_force"] = force_path_zip
+            entry["needs_force"] = (not rar_ok) and force_path_zip
             if not rar_ok:
                 if report["rar"] and not report["rar_can_write"]:
                     entry["reason"] = "检测到 RAR，但当前是未注册试用版：只能解压，不能创建压缩包"
@@ -276,15 +289,17 @@ def format_capabilities(force: bool = True) -> dict[str, dict]:
                     entry["reason"] = "RAR 不可用"
                 else:
                     entry["reason"] = "未安装 WinRAR / RAR（专有软件）"
-                if force and (seven_any or _py7zr_available()):
+                if force and force_path_zip:
                     entry["reason"] += "；将强制使用 ZIP 容器（扩展名为 .rar）"
             entry["engine"] = report["rar"] or ""
             entry["engine_version"] = report["rar_version"]
         else:
-            entry["available"] = tar_ok and codecs.get(codec, False)
+            # plain tar 无编解码器（codec == ""）——只需 tar 后端本身可用
+            codec_ok = (not codec) or codecs.get(codec, False)
+            entry["available"] = tar_ok and codec_ok
             if not tar_ok:
                 entry["reason"] = "系统中未找到 tar"
-            elif not codecs.get(codec, False):
+            elif not codec_ok:
                 entry["reason"] = f"当前 tar 后端不支持 {codec} 压缩"
             entry["engine"] = report["tar"] or ""
             entry["engine_version"] = "GNU tar" if report["gnu_tar"] else "bsdtar"
@@ -358,6 +373,9 @@ def format_status_line(fmt: str, entry: dict) -> str:
         if fmt == "7z" and not entry.get("engine"):
             return "可用（内置 py7zr）"
         return "可用"
+    # 三态展示（审查 P0-13）：不勾强制不可用、但强制可降级 → 明确引导
+    if entry.get("needs_force") or entry.get("usable_with_force"):
+        return f"需要勾选「强制压缩」— {entry['reason']}"
     return f"不可用 — {entry['reason']}"
 
 

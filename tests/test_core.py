@@ -430,5 +430,9 @@ class TestTesterFindings:
 
         result = engine.run(task, progress_cb=progress, cancel=cancel_cb)
         assert result.record.status == "skipped"
-        leftovers = [p.name for p in dest.glob("*") if p.name != "last-run.json"] if dest.exists() else []
+        # .backupstudio 是锁与清单的合法目录（非半成品残留）
+        leftovers = [
+            p.name for p in dest.glob("*")
+            if p.name not in ("last-run.json", ".backupstudio")
+        ] if dest.exists() else []
         assert not leftovers, leftovers

@@ -61,11 +61,14 @@ def _filters_for(level: int, password: str | None = None):  # noqa: ANN001
 
 
 class _Reader:
-    def __init__(self, fh, cb) -> None:  # noqa: ANN001
+    def __init__(self, fh, cb, cancel=None) -> None:  # noqa: ANN001
         self.fh = fh
         self.cb = cb
+        self.cancel = cancel
 
     def read(self, n: int = -1) -> bytes:
+        if self.cancel is not None and self.cancel():
+            raise _Cancelled()
         data = self.fh.read(n if n and n > 0 else (1 << 20))
         if data:
             self.cb(len(data))
@@ -125,6 +128,10 @@ class Py7zrCompressor:
     # ---- 流管理 -------------------------------------------------------
     def set_cancel(self, cancel) -> None:  # noqa: ANN001
         self._cancel = cancel
+
+    def _check(self) -> None:
+        if self._cancel is not None and self._cancel():
+            raise _Cancelled()
 
     @property
     def warnings(self) -> list[str]:
@@ -207,15 +214,27 @@ class Py7zrCompressor:
             return 0
         st = src.stat()
         if self._zip is not None:
+            self._check()
             with open(src, "rb") as fh, self._zip.open(self._zip_info(arcname, mtime or st.st_mtime, False), "w") as out:
-                shutil.copyfileobj(fh, out, 1 << 20)
-            self.progress.add(st.st_size)
+                while True:
+                    self._check()
+                    chunk = fh.read(1 << 20)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    self.progress.add(len(chunk))
             return st.st_size
-        self._ensure_stream(st.st_size)
-        ti = self._ti(arcname, mtime or st.st_mtime, st.st_size)
-        ti.mode = st.st_mode & 0o7777 or 0o644
-        with open(src, "rb") as fh:
-            self._tar.addfile(ti, _Reader(fh, self.progress.add))
+        # 先开文件后写头（与 archives.TarStreamCompressor 同因）：open 失败时
+        # 头已写出会让暂存 tar 流永久错位，后续分段解包全部损坏。
+        fh = open(src, "rb")
+        try:
+            st = os.fstat(fh.fileno())
+            self._ensure_stream(st.st_size)
+            ti = self._ti(arcname, mtime or st.st_mtime, st.st_size)
+            ti.mode = st.st_mode & 0o7777 or 0o644
+            self._tar.addfile(ti, _Reader(fh, self.progress.add, self._cancel))
+        finally:
+            fh.close()
         self._stream_bytes += st.st_size + 1024
         return st.st_size
 

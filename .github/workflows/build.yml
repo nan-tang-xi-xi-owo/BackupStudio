@@ -41,9 +41,9 @@ jobs:
       - name: pytest（无 7z 环境——模拟纯净安装机器）
         shell: pwsh
         run: |
-          Rename-Item tools/win32/7z tools/win32/_7z_off
+          Rename-Item -Path tools/win32/7z -NewName _7z_off
           python -m pytest tests -q
-          Rename-Item tools/win32/_7z_off tools/win32/7z
+          Rename-Item -Path tools/win32/_7z_off -NewName 7z
 
   windows:
     name: Windows exe / 安装包

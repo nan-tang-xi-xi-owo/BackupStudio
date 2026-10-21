@@ -50,7 +50,7 @@ from ..config import (
     SourceConfig,
 )
 from ..engine import archive_path
-from ..util import normalize_path
+from ..util import is_path_inside, normalize_path
 from .appstate import AppState
 from .widgets import Badge, Card, CollapsibleSection, Combo, PathEdit, Switch, muted, title_label
 
@@ -70,7 +70,7 @@ class TaskDialog(QDialog):
         self._original = task
         self._task = BackupTask.from_dict(task.to_dict()) if task else BackupTask(name="")
         self._dark = state.palette.dark
-        self._caps = format_capabilities()
+        self._caps = format_capabilities(force=False)  # 如实展示（审查 P0-13）
         self._env = environment_report()
         # 用户意图保真：capability 变化触发的"程序性取消勾选"不得洗白已保存的字段。
         # _initial_* 记录任务原有值；_user_touched_* 只在用户手动切换开关时置位。
@@ -628,12 +628,21 @@ class TaskDialog(QDialog):
         self.ret_action.addItem("移动到回收目录", "move")
         self.ret_action.currentIndexChanged.connect(self._on_ret_action)
         rf.addRow("过期处理", self.ret_action)
-        self.ret_dir = PathEdit(mode="dir", placeholder="回收目录", caption="选择回收目录")
+        self.ret_dir = PathEdit(mode="dir", placeholder="回收目录（留空 = 备份目录下的回收站）", caption="选择回收目录")
         rf.addRow("回收目录", self.ret_dir)
         self.ret_dir.setVisible(False)
         ret.add(self.ret_widget)
         self.ret_widget.setVisible(False)
         self.ret_enabled.toggled.connect(self.ret_widget.setVisible)
+        # 保留预览（审查 E1-1.8/D-r5）：保存前就能看到"将清理 N 份（X GB）"
+        self.ret_preview = muted("")
+        ret.add(self.ret_preview)
+        for sig in (
+            self.ret_count.valueChanged, self.ret_days.valueChanged,
+            self.ret_gb.valueChanged, self.ret_action.currentIndexChanged,
+        ):
+            sig.connect(self._update_retention_preview)
+        self.ret_enabled.toggled.connect(self._update_retention_preview)
         lay.addWidget(ret)
 
         notif = Card()
@@ -653,6 +662,42 @@ class TaskDialog(QDialog):
 
     def _on_ret_action(self) -> None:
         self.ret_dir.setVisible(self.ret_action.currentData() == "move")
+
+    def _update_retention_preview(self, *_args) -> None:
+        """dry-run 保留策略，显示"将清理 N 份（X GB）"（审查 E1-1.8/D-r5）。"""
+        if not self.ret_enabled.isChecked():
+            self.ret_preview.setText("")
+            return
+        dest = normalize_path(self.dest_path.path())
+        if not dest or not Path(dest).is_dir():
+            self.ret_preview.setText("保留预览：备份位置尚不存在，暂无历史备份可评估")
+            return
+        try:
+            from ..config import RetentionPolicy
+            from ..engine import TaskEngine
+            from ..util import human_size
+
+            probe = BackupTask.from_dict(self._task.to_dict())
+            probe.destination = dest
+            probe.options.fmt = self.fmt_combo.currentData() or probe.options.fmt
+            probe.retention = RetentionPolicy(
+                enabled=True,
+                keep_last=self.ret_count.value(),
+                keep_days=self.ret_days.value(),
+                max_total_gb=self.ret_gb.value(),
+                on_cleanup=self.ret_action.currentData() or "move",
+            )
+            will_process = TaskEngine().preview_retention(probe)
+            if not will_process:
+                self.ret_preview.setText("保留预览：按当前规则，现有备份都不会被清理")
+                return
+            total = sum(Path(f).stat().st_size for f in will_process if Path(f).is_file())
+            action = "移入回收站" if probe.retention.on_cleanup == "move" else "直接删除"
+            self.ret_preview.setText(
+                f"保留预览：将{action} {len(will_process)} 份旧备份（共 {human_size(total)}）"
+            )
+        except Exception as exc:  # noqa: BLE001 - 预览失败不阻塞保存
+            self.ret_preview.setText(f"保留预览不可用：{exc}")
 
     # ------------------------------------------------------------------
     # 载入 / 保存
@@ -961,13 +1006,20 @@ class TaskDialog(QDialog):
             keep_last=self.ret_count.value(),
             keep_days=self.ret_days.value(),
             max_total_gb=self.ret_gb.value(),
-            on_cleanup=self.ret_action.currentData() or "delete",
+            on_cleanup=self.ret_action.currentData() or "move",
             cleanup_dir=normalize_path(self.ret_dir.edit.text()) if self.ret_enabled.isChecked() else "",
         )
-        if retention.enabled and retention.on_cleanup == "move" and not retention.cleanup_dir:
-            QMessageBox.warning(self, "缺少回收目录", "选择「移动到回收目录」时必须设置回收目录。")
-            self.tabs.setCurrentIndex(2)
-            return None
+        # 路径校验（审查 E1-1.8）：回收目录不得位于任何来源文件夹内部——
+        # 否则"="把旧备份挪回被备份的目录里"，下次备份又把它打包进去（无限套娃）。
+        if retention.enabled and retention.cleanup_dir and retention.on_cleanup == "move":
+            for sc in self._task.sources:
+                if sc.path and is_path_inside(retention.cleanup_dir, sc.path):
+                    QMessageBox.warning(
+                        self, "回收目录位置无效",
+                        "回收目录不能位于备份来源文件夹内部（否则旧备份会被再次打包）。请换一个目录。",
+                    )
+                    self.tabs.setCurrentIndex(2)
+                    return None
 
         notify = []
         if self.notif_success.isChecked():

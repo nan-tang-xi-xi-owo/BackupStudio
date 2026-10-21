@@ -162,7 +162,7 @@ class EnvironmentPage(QWidget):
 
     def rescan(self, quiet: bool = False) -> None:
         reset_cache()
-        caps = format_capabilities()
+        caps = format_capabilities(force=False)  # 如实展示：不勾强制时的可用性（审查 P0-13）
         self._caps = caps
         env = environment_report()
         info = get_platform_info()

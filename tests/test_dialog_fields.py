@@ -161,3 +161,117 @@ class TestDialogFieldPreservation:
         files = got.sources[0].files
         assert sorted(files) == ["a.txt", "b.bin"], files
         assert len(files) == len(set(files))
+
+
+class TestRetentionDialog:
+    def _run_two_backups(self, tmp_path):
+        """真实跑两次备份（写 committed 清单）——旧包才有资格参与保留淘汰。"""
+        import time as _time
+
+        from backupstudio.config import ArchiveOptions, BackupTask, SourceConfig
+        from backupstudio.engine import TaskEngine
+
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("x", encoding="utf-8")
+        dest = tmp_path / "dest"
+        engine = TaskEngine()
+        for i in range(2):
+            t = BackupTask(
+                name=f"t{i}",
+                sources=[SourceConfig(path=str(src))],
+                destination=str(dest),
+                options=ArchiveOptions(fmt="zip", force=True),
+            )
+            rec = engine.run(t).record
+            assert rec.status == "success", rec.errors
+            _time.sleep(1.05)  # 文件名模板秒级去重
+        return src, dest
+
+    def test_preview_counts_old_backups(self, qapp, tmp_path, monkeypatch):
+        """保留预览（审查 E1-1.8/D-r5）：显示将清理份数与大小。"""
+        from backupstudio.config import ArchiveOptions, BackupTask, RetentionPolicy, SourceConfig
+
+        src, dest = self._run_two_backups(tmp_path)
+        task = BackupTask(
+            name="p",
+            sources=[SourceConfig(path=str(src))],
+            destination=str(dest),
+            options=ArchiveOptions(fmt="zip", force=True),
+            retention=RetentionPolicy(enabled=True, keep_last=1, keep_days=3650, on_cleanup="move"),
+        )
+        dlg = _dialog(qapp, task)
+        dlg._update_retention_preview()
+        text = dlg.ret_preview.text()
+        assert "1 份" in text, text  # keep_last=1 → 1 份旧包将被处理
+        dlg.ret_action.select_data("delete")
+        dlg._update_retention_preview()
+        assert "直接删除" in dlg.ret_preview.text()
+
+    def test_cleanup_dir_inside_source_rejected(self, qapp, tmp_path, monkeypatch):
+        """回收目录位于来源内 → 保存被拒绝（验收：保存即报错）。"""
+        from PySide6.QtWidgets import QMessageBox
+
+        from backupstudio.config import ArchiveOptions, BackupTask, RetentionPolicy, SourceConfig
+
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("x", encoding="utf-8")
+        task = BackupTask(
+            name="p",
+            sources=[SourceConfig(path=str(src))],
+            destination=str(tmp_path / "dest"),
+            options=ArchiveOptions(fmt="zip", force=True),
+            retention=RetentionPolicy(enabled=True, keep_last=3, on_cleanup="move"),
+        )
+        shown: list[str] = []
+        monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: shown.append(a[2] if len(a) > 2 else ""))
+        dlg = _dialog(qapp, task)
+        dlg.ret_action.select_data("move")
+        dlg.ret_dir.edit.setText(str(src / "trash"))
+        assert dlg._collect() is None, "来源内的回收目录必须阻断保存"
+        assert any("来源" in s for s in shown), shown
+
+    def test_empty_cleanup_dir_allowed_uses_trash_default(self, qapp, tmp_path, monkeypatch):
+        """回收目录留空（合法）：保存成功，运行期默认挪到 .backupstudio/trash。"""
+        from backupstudio.config import ArchiveOptions, BackupTask, RetentionPolicy, SourceConfig
+
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("x", encoding="utf-8")
+        task = BackupTask(
+            name="p",
+            sources=[SourceConfig(path=str(src))],
+            destination=str(tmp_path / "dest"),
+            options=ArchiveOptions(fmt="zip", force=True),
+            retention=RetentionPolicy(enabled=True, keep_last=3, on_cleanup="move"),
+        )
+        dlg = _dialog(qapp, task)
+        dlg.ret_action.select_data("move")
+        dlg.ret_dir.edit.setText("")
+        got = dlg._collect()
+        assert got is not None, "留空回收目录不应阻断保存（运行期有 trash 默认）"
+        assert got.retention.on_cleanup == "move"
+
+    def test_engine_move_falls_back_to_trash(self, tmp_path):
+        """引擎侧回归：cleanup_dir 留空 → 移动到 <dest>/.backupstudio/trash/<date>/（绝不删除）。"""
+        from backupstudio.config import ArchiveOptions, BackupTask, RetentionPolicy, SourceConfig
+        from backupstudio.engine import apply_retention
+
+        src, dest = self._run_two_backups(tmp_path)
+        before = sorted(p.name for p in dest.glob("*.zip"))
+        assert len(before) == 2, before
+        task = BackupTask(
+            name="p",
+            sources=[SourceConfig(path=str(src))],
+            destination=str(dest),
+            options=ArchiveOptions(fmt="zip", force=True),
+            retention=RetentionPolicy(enabled=True, keep_last=1, keep_days=3650, on_cleanup="move"),
+        )
+        handled = apply_retention(task)
+        assert handled, "keep_last=1 应淘汰 1 份旧包"
+        remaining = sorted(p.name for p in dest.glob("*.zip"))
+        assert len(remaining) == 1 and remaining[0] == before[-1], f"应只留最新一份：{remaining}"
+        trash_root = dest / ".backupstudio" / "trash"
+        moved = list(trash_root.rglob(before[0]))
+        assert moved, f"旧包应在回收站而非被删除：{list(trash_root.rglob('*'))}"

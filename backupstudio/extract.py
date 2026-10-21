@@ -24,6 +24,22 @@ class ExtractionError(RuntimeError):
     pass
 
 
+# 解压防护上限（审查 R1-N7：zip 炸弹实测 981× 无阻拦）
+_MAX_EXPANSION_RATIO = 1000  # 解压总量 / 压缩包大小 上限
+_MAX_TOTAL_BYTES = 100 * 1024**3  # 绝对上限 100 GiB
+_MAX_ENTRIES = 500_000
+
+
+def _check_bomb(archive_size: int, entry_count: int, unpacked: int) -> None:
+    if entry_count > _MAX_ENTRIES:
+        raise ExtractionError(f"疑似压缩炸弹：条目数 {entry_count} 超限，已中止")
+    limit = min(_MAX_TOTAL_BYTES, max(archive_size, 1) * _MAX_EXPANSION_RATIO)
+    if unpacked > limit:
+        raise ExtractionError(
+            f"疑似压缩炸弹：解压总量 {unpacked // (1024**2)} MB 超过上限，已中止"
+        )
+
+
 def _is_within(base: Path, target: Path) -> bool:
     try:
         target.resolve().relative_to(base.resolve())
@@ -40,7 +56,9 @@ def _safe_zip_name(name: str) -> str:
 
 
 def _run(argv: list[str], timeout: int = 3600) -> tuple[int, str]:
-    kwargs: dict = {"capture_output": True, "timeout": timeout}
+    # stdin 隔离：7za 在无密码读加密归档时会等待交互输入（实测挂起至 timeout——
+    # 审查 T8）；DEVNULL 让它立即失败（rc=255）。
+    kwargs: dict = {"capture_output": True, "timeout": timeout, "stdin": subprocess.DEVNULL}
     if sys.platform == "win32":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
@@ -51,9 +69,27 @@ def _run(argv: list[str], timeout: int = 3600) -> tuple[int, str]:
     return proc.returncode, out.strip()[-800:]
 
 
-def _extract_zip(archive: Path, target: Path) -> None:
+def _extract_zip(archive: Path, target: Path, password: str | None = None) -> None:
+    """ZIP 解压。有密码时优先 7-Zip（AES 支持），退化到 zipfile 的 ZipCrypto。"""
+    try:
+        archive_size = archive.stat().st_size
+    except OSError:
+        archive_size = 0
+    if password:
+        exe = find_7z()
+        if exe:
+            argv = [exe, "x", "-y", f"-o{target}", str(archive)]
+            argv.insert(3, f"-p{password}")
+            code, out = _run(argv)
+            if code != 0:
+                raise ExtractionError(f"7-Zip 解压加密 ZIP 失败（退出码 {code}）：{out}")
+            return
     with zipfile.ZipFile(archive) as zf:
-        for info in zf.infolist():
+        infos = zf.infolist()
+        declared_total = sum(i.file_size for i in infos)
+        _check_bomb(archive_size, len(infos), declared_total)
+        unpacked = 0
+        for info in infos:
             dest = target / _safe_zip_name(info.filename)
             if not _is_within(target, dest):
                 raise ExtractionError(f"压缩包内包含不安全路径，已拒绝解压：{info.filename}")
@@ -61,8 +97,21 @@ def _extract_zip(archive: Path, target: Path) -> None:
                 dest.mkdir(parents=True, exist_ok=True)
                 continue
             dest.parent.mkdir(parents=True, exist_ok=True)
-            with zf.open(info) as src, open(dest, "wb") as out:
-                shutil.copyfileobj(src, out, 1 << 20)
+            try:
+                src_fh = zf.open(info, pwd=password.encode("utf-8") if password else None)
+            except RuntimeError as exc:
+                # AES 条目：zipfile 不支持（NotImplementedError/RuntimeError）
+                raise ExtractionError(
+                    f"无法解压加密条目（{info.filename}）：AES ZIP 需要安装 7-Zip（{exc}）"
+                ) from exc
+            with src_fh, open(dest, "wb") as out:
+                while True:
+                    chunk = src_fh.read(1 << 20)
+                    if not chunk:
+                        break
+                    unpacked += len(chunk)
+                    _check_bomb(archive_size, len(infos), unpacked)
+                    out.write(chunk)
 
 
 def _extract_tar(archive: Path, target: Path) -> None:
@@ -77,6 +126,11 @@ def _extract_tar(archive: Path, target: Path) -> None:
                 if not _is_within(target, link_target):
                     raise ExtractionError(f"压缩包内包含指向外部的链接，已拒绝解压：{m.name} -> {m.linkname}")
             members.append(m)
+        try:
+            archive_size = archive.stat().st_size
+        except OSError:
+            archive_size = 0
+        _check_bomb(archive_size, len(members), sum(m.size for m in members if m.isfile()))
         # Python 3.12+ 支持 filter；3.14+ 默认 data 过滤器，这里显式指定更稳妥
         try:
             tf.extractall(target, members=members, filter="data")  # type: ignore[arg-type]
@@ -176,7 +230,7 @@ def extract_archive(archive: Path, target: Path, password: str | None = None) ->
         staging = Path(tempfile.mkdtemp(prefix="bs-extract-", dir=str(target)))
         try:
             if name.endswith(".zip"):
-                _extract_zip(archive, staging)
+                _extract_zip(archive, staging, password)
                 kind = "zip"
             elif name.endswith(".tar.zst"):
                 kind = _extract_zst_to_dir(archive, staging)

@@ -120,7 +120,7 @@ def _show_fatal(title: str, message: str, details: str = "") -> None:
 def run_gui(start_minimized: bool = False, open_new: bool = False) -> int:
     """启动 Qt 界面（含托盘）；任何异常都记日志并弹窗，绝不静默退出。"""
     gui_log = write_emergency(
-        f"--- {__version__} GUI 启动 {os.getpid()} 参数={sys.argv[1:]} frozen={getattr(sys, 'frozen', False)}",
+        f"--- {__version__} GUI 启动 {os.getpid()} 参数={_mask_argv(sys.argv[1:])} frozen={getattr(sys, 'frozen', False)}",
         filename="startup.log",
     )
     try:
@@ -548,7 +548,11 @@ def _cmd_task(store, args) -> int:  # noqa: ANN001
             return 1
         import json
 
-        print(json.dumps(t.to_dict(), ensure_ascii=False, indent=2))
+        data = t.to_dict()
+        if data.get("options", {}).get("password"):
+            # 密码不回显（审查 P0-14）；需要密码请用「导出任务（含密码）」
+            data["options"]["password"] = "***（已隐藏；如需包含密码请用导出功能）"
+        print(json.dumps(data, ensure_ascii=False, indent=2))
         return 0
     if args.action == "add":
         days = [int(x) for x in args.days.split(",") if x.strip().isdigit()]
@@ -692,6 +696,27 @@ def _make_streams_utf8_safe() -> None:
             pass
 
 
+def _mask_argv(argv: list[str]) -> list[str]:
+    """日志脱敏：--password / --encrypt 等敏感参数值一律替换（审查 P0-14）。"""
+    out: list[str] = []
+    hide_next = False
+    for a in argv:
+        if hide_next:
+            out.append("***")
+            hide_next = False
+            continue
+        low = a.lower()
+        if low in ("--password", "--pass", "-p"):
+            out.append(a)
+            hide_next = True
+            continue
+        if low.startswith("--password=") or low.startswith("--pass="):
+            out.append(a.split("=", 1)[0] + "=***")
+            continue
+        out.append(a)
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     _make_streams_utf8_safe()
@@ -703,7 +728,7 @@ def main(argv: list[str] | None = None) -> int:
         return daemon_main(rest)
     try:
         _setup_logging("--verbose" in argv or "-v" in argv)
-        log.info("启动 %s %s（frozen=%s）参数=%s", APP_NAME, __version__, getattr(sys, "frozen", False), argv)
+        log.info("启动 %s %s（frozen=%s）参数=%s", APP_NAME, __version__, getattr(sys, "frozen", False), _mask_argv(argv))
         try:
             return _cli(argv)
         except KeyboardInterrupt:

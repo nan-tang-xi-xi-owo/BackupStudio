@@ -329,7 +329,7 @@ def _auto_skip(path: Path) -> bool:
     name = path.name.lower()
     if name in _AUTO_SKIP_NAMES:
         return True
-    if name.startswith(".bs-staging") or name.endswith(".full-tmp") or ".part-tmp" in name:
+    if name == ".backupstudio" or name.startswith(".bs-staging") or name.endswith(".full-tmp") or ".part-tmp" in name:
         return True
     return False
 
@@ -438,6 +438,22 @@ class _Reader:
         return out
 
 
+def _chunks_of_fh(
+    fh,  # noqa: ANN001 - 已打开的二进制文件对象
+    progress: Progress,
+    chunk: int = 1 << 20,
+    cancel: Callable[[], bool] | None = None,
+) -> Iterator[bytes]:
+    while True:
+        if cancel is not None and cancel():
+            raise ArchiveCancelled()
+        data = fh.read(chunk)
+        if not data:
+            break
+        progress.add(len(data))
+        yield data
+
+
 def _chunks_of(
     src: Path,
     progress: Progress,
@@ -445,14 +461,7 @@ def _chunks_of(
     cancel: Callable[[], bool] | None = None,
 ) -> Iterator[bytes]:
     with open(src, "rb") as fh:
-        while True:
-            if cancel is not None and cancel():
-                raise ArchiveCancelled()
-            data = fh.read(chunk)
-            if not data:
-                break
-            progress.add(len(data))
-            yield data
+        yield from _chunks_of_fh(fh, progress, chunk, cancel)
 
 
 # --------------------------------------------------------------------------
@@ -485,10 +494,19 @@ class ZipCompressor:
         self._zip = zipfile.ZipFile(
             dest_path, "w", compression=comp, compresslevel=max(1, min(9, spec.level)), allowZip64=True
         )
+        self._cancel: Callable[[], bool] | None = None
 
     @property
     def warnings(self) -> list[str]:
         return self._warnings
+
+    def set_cancel(self, cancel: Callable[[], bool] | None) -> None:
+        """登记取消回调（审查 R3-N3：内置 ZIP 此前不支持取消）。"""
+        self._cancel = cancel
+
+    def _check_cancel(self) -> None:
+        if self._cancel is not None and self._cancel():
+            raise ArchiveCancelled()
 
     def _info(self, arcname: str, mtime: float | None, is_dir: bool) -> zipfile.ZipInfo:
         ts = time.localtime(mtime if mtime else time.time())[:6]
@@ -506,11 +524,17 @@ class ZipCompressor:
         self.add_bytes(target.encode("utf-8", "surrogateescape"), arcname, mtime)
 
     def add_file(self, src: Path, arcname: str, mtime: float | None = None) -> int:
-        mtime = mtime or src.stat().st_mtime
-        with open(src, "rb") as fh, self._zip.open(self._info(arcname, mtime, False), "w") as out:
-            shutil.copyfileobj(fh, out, 1 << 20)
-            self.progress.add(src.stat().st_size)
-        return src.stat().st_size
+        self._check_cancel()
+        st = src.stat()
+        with open(src, "rb") as fh, self._zip.open(self._info(arcname, mtime or st.st_mtime, False), "w") as out:
+            while True:
+                self._check_cancel()
+                chunk = fh.read(1 << 20)
+                if not chunk:
+                    break
+                out.write(chunk)
+                self.progress.add(len(chunk))
+        return st.st_size
 
     def add_bytes(self, data: bytes, arcname: str, mtime: float | None = None) -> int:
         self._zip.writestr(self._info(arcname, mtime, False), data)
@@ -546,6 +570,7 @@ class TarStreamCompressor:
         self.codec = spec.fmt.split(".", 1)[1] if "." in spec.fmt else ""
         self._raw = open(dest_path, "wb")
         self._proc: subprocess.Popen | None = None
+        self._cancel: Callable[[], bool] | None = None
         self._comp = self._make_compressor(self.codec)
         self._tar = tarfile.open(fileobj=self._comp, mode="w|", format=tarfile.PAX_FORMAT, bufsize=1 << 20)
 
@@ -597,9 +622,15 @@ class TarStreamCompressor:
         if src.is_symlink():
             self.add_symlink(arcname, _safe_readlink(src), mtime)
             return 0
-        st = src.stat()
-        ti = self._ti(arcname, mtime or st.st_mtime, (st.st_mode & 0o7777) or 0o644, tarfile.REGTYPE, st.st_size)
-        self._tar.addfile(ti, _Reader(_chunks_of(src, self.progress)))
+        # 先开文件后写头（审查 E1-1.4）：若 open 失败而头已写出，tar 流会
+        # 永久错位（后续所有条目都读不出来）；顺序反了就只是一次可跳过的条目。
+        fh = open(src, "rb")
+        try:
+            st = os.fstat(fh.fileno())
+            ti = self._ti(arcname, mtime or st.st_mtime, (st.st_mode & 0o7777) or 0o644, tarfile.REGTYPE, st.st_size)
+            self._tar.addfile(ti, _Reader(_chunks_of_fh(fh, self.progress, cancel=self._cancel)))
+        finally:
+            fh.close()
         return st.st_size
 
     def add_bytes(self, data: bytes, arcname: str, mtime: float | None = None) -> int:
@@ -1416,6 +1447,9 @@ def create_archive(
 
         try:
             backend.close()
+        except ArchiveCancelled:
+            # 取消不是失败：直接上抛，绝不触发 fallback 重做（审查 R3-N3）
+            raise
         except (CompressionError, OSError) as exc:
             if not spec.force or getattr(backend, "name", "") == "py7zr":
                 raise
@@ -1489,10 +1523,10 @@ def create_archive(
         progress.describe("done")
         progress.emit(force=True)
         return result
-    except BaseException:
+    except BaseException as exc:
         with contextlib.suppress(Exception):
             backend.abort()
-        # 清理可能留下的分卷
+        # 清理可能留下的分卷与半成品
         for p in dest.parent.glob(dest.name + ".*"):
             if p.is_file() and (p.name.split(".")[-1].isdigit() or ".part" in p.name):
                 with contextlib.suppress(OSError):
@@ -1500,4 +1534,14 @@ def create_archive(
         with contextlib.suppress(OSError):
             if dest.exists() and dest.name.endswith(FORMAT_EXTENSIONS.get(fmt, "")):
                 dest.unlink()
+        # 统一兜底：内部取消信号（py7zr_backend._Cancelled 等）必须转成
+        # 对外的 ArchiveCancelled，否则被调用方记成"未预期异常 = failure"
+        # （审查 R3-N3：取消被记 failure 的根因）。
+        try:
+            from .py7zr_backend import _Cancelled as _InnerCancelled
+
+            if isinstance(exc, _InnerCancelled):
+                raise ArchiveCancelled() from None
+        except ImportError:
+            pass
         raise

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import logging.handlers
@@ -108,14 +109,26 @@ class DaemonService:
         self.engine = TaskEngine(log_fn=lambda m: log.info(m))
         self._stop = threading.Event()
         self._wake = threading.Event()
+        self._guard_lock = None
 
     # ------------------------------------------------------------------
     def run(self) -> int:
+        # 单实例守卫（审查 E1-1.5）：跨进程文件锁（pid 存活判定 + 陈旧自愈），
+        # 不再依赖"端口占用"这一有竞态且 pyzmq 缺失时失效的判据。
+        from .locks import DirLock, LockTimeout
+
+        try:
+            self._guard_lock = DirLock(config_dir(), "daemon", timeout=0.0).acquire()
+        except LockTimeout:
+            log.error("已有另一个守护进程在运行（单实例锁被持有），退出")
+            return 2
         self._write_pid()
         server = None
         try:
             if port_in_use(self.port):
                 log.error("守护进程 IPC 端口 %s 已被占用（可能已有实例），退出", self.port)
+                with contextlib.suppress(Exception):
+                    self._guard_lock.release()
                 return 2
             server = _make_zmq_server(self.endpoint)
         except ImportError:
@@ -269,6 +282,9 @@ class DaemonService:
             log.warning("写入 PID 文件失败：%s", exc)
 
     def _cleanup(self, server) -> None:  # noqa: ANN001
+        if self._guard_lock is not None:
+            with contextlib.suppress(Exception):
+                self._guard_lock.release()
         try:
             pid = pid_file_path()
             if pid.exists() and pid.read_text(encoding="ascii").splitlines()[0].strip() == str(os.getpid()):

@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 import shutil
 import threading
 import time
@@ -33,6 +34,7 @@ from .archives import (
 )
 from .capabilities import FORMAT_LABELS
 from .config import BackupTask, RunRecord
+from .manifest import collect_groups
 from .paths import config_dir
 from .util import free_space, human_size, is_path_inside, render_template, sanitize_component, template_context
 
@@ -154,7 +156,7 @@ def _auto_skip(path: Path) -> bool:
     name = path.name.lower()
     if name in _AUTO_SKIP_NAMES:
         return True
-    if name.startswith(".bs-staging") or name.endswith(".full-tmp") or ".part-tmp" in name:
+    if name == ".backupstudio" or name.startswith(".bs-staging") or name.endswith(".full-tmp") or ".part-tmp" in name:
         return True
     if ".bs-tmp-" in name:
         # 事务性落地的临时产物（<最终名>.bs-tmp-<pid>）：不是备份、不是源数据
@@ -182,22 +184,65 @@ def _friendly_error(exc: BaseException) -> str:
 # 校验
 # --------------------------------------------------------------------------
 
-def verify_archive(main: Path, fmt: str, password: str | None = None) -> tuple[bool, str]:
-    """校验压缩包完整性（不依赖第三方模块）。"""
+def _verify_volumes(volumes, fmt: str, password: str | None = None) -> tuple[bool | None, str]:
+    """分卷真实校验（审查 E-2）：逐卷字节拼接成临时整包后走 verify_archive。
+
+    * 通用切片卷（.partNN）：字节拼接即还原原包（按卷序，数值排序）；
+    * 7z 原生卷（.001 集）：7za 能直接 t 首卷（自动串联），优先走它；
+    * 无法拼接/校验的形态 → 返回 None（skipped），不得误报 passed。
+    """
+    import tempfile
+
+    paths = [Path(v.path) for v in volumes]
+    if not paths:
+        return False, "分卷清单为空"
+    # 7z 原生分卷：首卷 .001，7za t 自动串联
+    if fmt == "7z" and paths[0].name.endswith(".001"):
+        return verify_archive(paths[0], "7z", password)
+    # 通用切片：字节拼接
+    try:
+        with tempfile.TemporaryDirectory(prefix="bs-verify-") as td:
+            joined = Path(td) / f"joined{FORMAT_EXTENSIONS.get(fmt, '.bin')}"
+            with open(joined, "wb") as out:
+                for p in paths:
+                    with open(p, "rb") as fh:
+                        shutil.copyfileobj(fh, out, 1 << 20)
+            ok, msg = verify_archive(joined, fmt, password)
+            return ok, (f"分卷拼接校验：{msg}" if ok is not None else f"分卷拼接后：{msg}")
+    except OSError as exc:
+        return None, f"分卷校验无法执行：{exc}"
+
+
+def verify_archive(main: Path, fmt: str, password: str | None = None) -> tuple[bool | None, str]:
+    """校验压缩包完整性。
+
+    返回三态：True=校验通过；False=校验失败；**None=无法校验（skipped）**。
+    None 绝不等于 passed——调用方必须把跳过的真值呈现给用户（审查 E-1）。
+    """
+    if not main.exists():
+        return False, f"文件不存在：{main.name}"
     try:
         if fmt == "7z":
             from .tools import find_7z
 
             exe = find_7z()
             if not exe:
-                return True, "跳过校验：未找到 7-Zip"
+                # 无 7-Zip：py7zr 兜底（能打开并读目录 = 结构完好）
+                try:
+                    import py7zr
+
+                    with py7zr.SevenZipFile(str(main), "r", password=password) as z:
+                        z.getnames()
+                    return True, "py7zr 结构校验通过"
+                except Exception as exc:  # noqa: BLE001
+                    return None, f"跳过校验：未找到 7-Zip，py7zr 无法验证（{type(exc).__name__}）"
             import subprocess
             import sys
 
             argv = [exe, "t", str(main)]
             if password:
                 argv.insert(2, f"-p{password}")
-            kwargs: dict = {"capture_output": True, "timeout": 3600}
+            kwargs: dict = {"capture_output": True, "timeout": 600, "stdin": subprocess.DEVNULL}
             if sys.platform == "win32":
                 kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             proc = subprocess.run(argv, **kwargs)
@@ -235,7 +280,7 @@ def verify_archive(main: Path, fmt: str, password: str | None = None) -> tuple[b
                         if not password:
                             return False, "加密 ZIP 需要密码才能校验，请提供密码"
                         return False, f"加密 ZIP 校验失败（退出码 {proc.returncode}）{out7.strip()[-200:]}"
-                    return True, "跳过内容校验：加密 ZIP 需 7-Zip（条目数与加密位已核对）"
+                    return None, "跳过内容校验：加密 ZIP 需 7-Zip（条目数与加密位已核对）"
                 bad = zf.testzip()
                 if bad is None:
                     return True, f"{len(zf.infolist())} 个条目校验通过"
@@ -245,7 +290,7 @@ def verify_archive(main: Path, fmt: str, password: str | None = None) -> tuple[b
 
             exe = find_unrar()
             if not exe:
-                return True, "跳过校验：未找到 UnRAR"
+                return None, "跳过校验：未找到 UnRAR / 7-Zip"
             import subprocess
             import sys
 
@@ -253,7 +298,7 @@ def verify_archive(main: Path, fmt: str, password: str | None = None) -> tuple[b
                 argv = [exe, "t", str(main)]
             else:
                 argv = [exe, "t", "-idq", str(main)]
-            kwargs = {"capture_output": True, "timeout": 3600}
+            kwargs = {"capture_output": True, "timeout": 600, "stdin": subprocess.DEVNULL}
             if sys.platform == "win32":
                 kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             proc = subprocess.run(argv, **kwargs)
@@ -303,9 +348,9 @@ def verify_archive(main: Path, fmt: str, password: str | None = None) -> tuple[b
                 if zstd:
                     import subprocess
 
-                    proc = subprocess.run([zstd, "-t", str(main)], capture_output=True, timeout=3600, stdin=subprocess.DEVNULL)
+                    proc = subprocess.run([zstd, "-t", str(main)], capture_output=True, timeout=600, stdin=subprocess.DEVNULL)
                     return proc.returncode == 0, "zstd 校验通过" if proc.returncode == 0 else "zstd 校验失败"
-                return False, "跳过校验：无 zstandard 模块 / zstd / 7-Zip，无法验证 tar.zst 内容"
+                return None, "跳过校验：无 zstandard 模块 / zstd / 7-Zip，无法验证 tar.zst 内容"
             with tarfile.open(main, "r:*") as tf:
                 count = 0
                 for _ in tf:
@@ -313,7 +358,7 @@ def verify_archive(main: Path, fmt: str, password: str | None = None) -> tuple[b
             return True, f"{count} 个条目可读取"
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
-    return True, "该格式无内置校验实现"
+    return None, "跳过校验：该格式无内置校验实现"
 
 
 # --------------------------------------------------------------------------
@@ -326,45 +371,73 @@ class CleanupItem:
     files: list[str]
     size: int
     mtime: float
+    managed: bool = False  # True = 由 manifest 管理（可自动淘汰）；False = 旧包（迁移期只报告）
+    complete: bool = True  # False = 缺卷/残包
+    stem: str = ""  # manifest stem（managed 时用于清单清理）
 
 
 def find_backup_blobs(task: BackupTask) -> list[CleanupItem]:
-    """列出备份目录下属于该任务的压缩包（含分卷归组）。"""
+    """列出备份目录下属于该任务的备份组（manifest 权威 + 旧包后缀启发式）。
+
+    恢复历史行为（审查 C11/E1）：分卷包（.partNN / .001 / partN.rar）与
+    `_N` 重名后缀都正确归组；manifest 管理的组带 committed_at 排序依据；
+    无清单旧包标记 managed=False（迁移期不被自动淘汰——E5 红线）。
+    """
     if not task.destination:
         return []
     folder = Path(task.destination)
     if not folder.is_dir():
         return []
     ext = FORMAT_EXTENSIONS.get(task.options.fmt, ".7z")
+    all_exts = tuple(FORMAT_EXTENSIONS.values())
     blobs: list[CleanupItem] = []
-    seen: set[str] = set()
-    for p in sorted(folder.iterdir()):
-        if not p.is_file() or str(p).lower() in seen:
-            continue
-        if not p.name.endswith(ext):
-            continue
-        try:
-            group = volume_glob_paths(p)
-            size = sum(f.stat().st_size for f in group)
-            mtime = min(f.stat().st_mtime for f in group)
-        except OSError:
-            continue
-        for f in group:
-            seen.add(str(f).lower())
-        blobs.append(CleanupItem(str(p), [str(f) for f in group], size, mtime))
+    for g in collect_groups(folder, ext, fmts=all_exts):
+        # 只保留与该任务格式匹配的组（后缀启发式组）；manifest 组按 fmt 字段过滤
+        if g.manifest is not None:
+            if g.manifest.fmt and g.manifest.fmt != task.options.fmt:
+                continue
+            mtime = g.committed_at or (min(f.stat().st_mtime for f in g.files) if g.files else 0.0)
+        else:
+            if not any(f.name.lower().endswith(ext.lower()) or ("." in f.name and f.name.lower().rfind(ext.lower()) >= 0) for f in g.files):
+                continue
+            mtime = g.committed_at
+        blobs.append(
+            CleanupItem(
+                blob=str(g.files[0]) if g.files else g.stem,
+                files=[str(f) for f in g.files],
+                size=g.size,
+                mtime=mtime,
+                managed=g.managed,
+                complete=g.complete,
+                stem=g.stem,
+            )
+        )
     return sorted(blobs, key=lambda b: b.mtime)
 
 
-def apply_retention(task: BackupTask, protected: list[str] | None = None) -> list[str]:
+def apply_retention(
+    task: BackupTask,
+    protected: list[str] | None = None,
+    *,
+    include_legacy: bool = False,
+    dry_run: bool = False,
+) -> list[str]:
     """执行保留策略，返回被处理（删除或移动）的文件列表。
 
-    时间边界以**本次刚生成的备份**为基准，而不是「此刻」——
-    这样即使刚写完（mtime 很新）也能按份数/天数正确淘汰旧文件。
+    * 时间基准取 manifest 的 committed_at（当前实现沿用组排序，避免 mtime 触碰劫持）；
+      以**本次刚生成的备份**为基准（protected 非空时用最新组时间），保证刚写完也能正确淘汰旧组。
+    * **迁移红线（E5）**：无 manifest 的旧包默认不参与自动淘汰（include_legacy=False）；
+      调用方可用 plan_adoption() 向用户报告，用户显式开启接管后才传 include_legacy=True。
+    * dry_run=True 时只返回"将被处理"的清单，不动文件（供 GUI 预览）。
     """
     policy = task.retention
     if not policy.enabled:
         return []
     blobs = find_backup_blobs(task)
+    if not blobs:
+        return []
+    if not include_legacy:
+        blobs = [b for b in blobs if b.managed or (protected and any(Path(f).resolve() == Path(pp).resolve() for pp in protected for f in b.files))]
     if not blobs:
         return []
     protected_set = {str(Path(p).resolve()).lower() for p in (protected or [])}
@@ -397,12 +470,21 @@ def apply_retention(task: BackupTask, protected: list[str] | None = None) -> lis
     for b in expired:
         if any(str(Path(f).resolve()).lower() in protected_set for f in b.files):
             continue
-        if policy.on_cleanup == "move" and policy.cleanup_dir:
-            target_dir = Path(policy.cleanup_dir)
+        if dry_run:
+            handled.extend(b.files)
+            continue
+        # 安全默认（审查 E1-1.8/D-r5）：move 模式优先用配置的回收目录；
+        # 留空则默认挪到 <备份目录>/.backupstudio/trash/<日期>/（同卷，可反悔）。
+        # 绝不静默回退成 delete（"以为只是挪走、实际已删光"——数据丢失类）。
+        if policy.on_cleanup == "move":
+            if policy.cleanup_dir:
+                target_dir = Path(policy.cleanup_dir)
+            else:
+                target_dir = Path(task.destination) / ".backupstudio" / "trash" / time.strftime("%Y-%m-%d")
             try:
                 target_dir.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
-                log.warning("清理目录不可用 %s: %s", target_dir, exc)
+                log.warning("回收目录不可用 %s: %s；为防误删，本次跳过该组", target_dir, exc)
                 continue
             for f in b.files:
                 src = Path(f)
@@ -421,6 +503,14 @@ def apply_retention(task: BackupTask, protected: list[str] | None = None) -> lis
                     log.info("清理：删除过期备份 %s", src)
                 except OSError as exc:
                     log.warning("删除失败 %s: %s", src, exc)
+        # 组淘汰后同步删清单（否则遗留"清单在、卷不在"的空组）
+        if b.managed and b.stem and not dry_run:
+            try:
+                from .manifest import delete_manifest
+
+                delete_manifest(task.destination, b.stem)
+            except Exception:  # noqa: BLE001
+                pass
     return handled
 
 
@@ -462,6 +552,16 @@ class TaskEngine:
         with self._locks_guard:
             return self._locks.setdefault(task_id, threading.Lock())
 
+    def preview_retention(self, task: BackupTask) -> list[str]:
+        """只读预览：按当前保留策略，哪些文件会被清理（不动磁盘）。
+
+        供任务对话框展示"将清理 N 份（X GB）"（审查 E1-1.8/D-r5）。
+        """
+        try:
+            return apply_retention(task, dry_run=True)
+        except Exception:  # noqa: BLE001 - 预览失败不阻塞编辑
+            return []
+
     def is_running(self, task_id: str) -> bool:
         lk = self._locks.get(task_id)
         if lk is None:
@@ -487,11 +587,34 @@ class TaskEngine:
                 status="skipped", errors=["该任务正在运行中"], trigger=trigger,
             )
             return ExecutionResult(rec, message="任务正在运行中")
-        started = time.monotonic()
-        started_at = datetime.now().astimezone().isoformat(timespec="seconds")
-        record = RunRecord(task_id=task.id, task_name=task.name, started_at=started_at, trigger=trigger)
         try:
-            return self._run_locked(task, record, started, progress_cb, cancel, apply_cleanup)
+            # 进程内锁只防同进程重入；跨进程（GUI vs daemon）用目标目录文件锁
+            # （审查 P0-6/F2：两进程同秒同名会产坏包且都报 success）。
+            dir_lock = None
+            if task.destination:
+                from .locks import LockTimeout, acquire_dir_lock
+
+                try:
+                    dir_lock = acquire_dir_lock(Path(task.destination), task.id, timeout=0.0)
+                except LockTimeout as exc:
+                    rec = RunRecord(
+                        task_id=task.id, task_name=task.name,
+                        started_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+                        status="skipped", errors=[f"任务被另一个进程占用：{exc}"], trigger=trigger,
+                    )
+                    self._log(f"[{task.name}] 跳过：{exc}")
+                    return ExecutionResult(rec, message=str(exc))
+                except Exception as exc:  # noqa: BLE001 - 锁基础设施失败不阻断备份（降级为进程内锁）
+                    self._log(f"[{task.name}] 跨进程锁不可用（降级）：{exc}")
+            try:
+                started = time.monotonic()
+                started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+                record = RunRecord(task_id=task.id, task_name=task.name, started_at=started_at, trigger=trigger)
+                return self._run_locked(task, record, started, progress_cb, cancel, apply_cleanup)
+            finally:
+                if dir_lock is not None:
+                    with contextlib.suppress(Exception):
+                        dir_lock.release()
         finally:
             lock.release()
 
@@ -523,9 +646,7 @@ class TaskEngine:
         if problems:
             record.status = "skipped"
             record.errors = problems
-            record.finished_at = _now()
-            record.duration = round(time.monotonic() - started, 2)
-            return ExecutionResult(record, message="；".join(problems))
+            return self._finish_early(record, task, started, "；".join(problems))
 
         dest_dir = Path(task.destination)
         main_path = archive_path(task)
@@ -544,9 +665,7 @@ class TaskEngine:
         if not sources:
             record.status = "skipped"
             record.errors = src_warnings or ["没有可备份的内容"]
-            record.finished_at = _now()
-            record.duration = round(time.monotonic() - started, 2)
-            return ExecutionResult(record, message="没有可备份的内容")
+            return self._finish_early(record, task, started, "没有可备份的内容")
 
         exclude_dirs = []
         if is_path_inside(dest_dir, task.primary_source or "/"):
@@ -559,15 +678,7 @@ class TaskEngine:
         )
         record.skipped = skipped
 
-        # 3. 空间检查
-        needed = sum(i.size for i in items)
-        avail = free_space(dest_dir)
-        if avail and needed and avail < needed * 0.2:
-            warnings.append(
-                f"备份目标剩余空间 {human_size(avail)}，源数据 {human_size(needed)}；7z 外部压缩还需同等大小的临时空间"
-            )
-
-        # 4. 压缩
+        # 3. 压缩
         # 提前判定压缩引擎（force=True 时允许降级到内置），失败时给出明确原因
         from .archives import BackendUnavailable, backend_for_format
 
@@ -576,13 +687,37 @@ class TaskEngine:
         except BackendUnavailable as exc:
             record.status = "failure"
             record.errors = [str(exc)]
-            record.finished_at = _now()
-            record.duration = round(time.monotonic() - started, 2)
             self._log(f"[{task.name}] 无法开始备份：{exc}")
-            return ExecutionResult(record, message=str(exc))
+            return self._finish_early(record, task, started, str(exc))
         warnings.append(f"压缩引擎：{engine_choice.name}")
         if engine_choice.note:
             warnings.append(engine_choice.note)
+
+        # 3b. 空间检查（审查 E1-1.8/D-f6）：按后端形态估磁盘峰值——
+        # 外部 7z/rar 需 源tar + 成品 两份（≈2×）；内置引擎 ≈1×；
+        # 通用分卷再乘一份完整成品的余量。不足时阻止（不再只 warning）。
+        needed = sum(i.size for i in items)
+        avail = free_space(dest_dir)
+        if avail and needed:
+            external = engine_choice.name.startswith(("7z:", "rar"))
+            peak_factor = 2.05 if external else 1.05
+            if opts.multivolume:
+                peak_factor += 1.05  # split 模式先整包再切片，峰值再加一份成品
+            est_peak = int(needed * peak_factor)
+            if avail < est_peak:
+                msg = (
+                    f"备份目标剩余空间不足：可用 {human_size(avail)}，"
+                    f"本次约需 {human_size(est_peak)}（源数据 {human_size(needed)} × 峰值系数 {peak_factor:.2f}）。"
+                    "请清理磁盘或更换备份位置。"
+                )
+                record.status = "skipped"
+                record.errors = [msg]
+                self._log(f"[{task.name}] 空间不足，已阻止备份：{msg}")
+                return self._finish_early(record, task, started, msg)
+            if avail < est_peak * 1.5:
+                warnings.append(
+                    f"备份目标剩余空间偏紧：可用 {human_size(avail)}，预计峰值约需 {human_size(est_peak)}"
+                )
 
         # 分卷模式：create_archive 会把 7z/rar 的「原生分卷」统一映射为字节切片，
         # 这样外部压缩程序失败时也能无缝回退到内置引擎。
@@ -605,24 +740,18 @@ class TaskEngine:
         except ArchiveCancelled:
             record.status = "skipped"
             record.errors = ["已取消"]
-            record.finished_at = _now()
-            record.duration = round(time.monotonic() - started, 2)
-            return ExecutionResult(record, message="已取消")
+            return self._finish_early(record, task, started, "已取消")
         except (CompressionError, OSError) as exc:
             record.status = "failure"
             record.errors = [str(exc)]
-            record.finished_at = _now()
-            record.duration = round(time.monotonic() - started, 2)
             self._log(f"[{task.name}] 备份失败：{exc}")
-            return ExecutionResult(record, message=str(exc))
+            return self._finish_early(record, task, started, str(exc))
         except Exception as exc:  # 未预期错误，保留堆栈便于排查
             record.status = "failure"
             record.errors = [f"{type(exc).__name__}: {exc}"]
             record.verification_message = traceback.format_exc()[-2000:]
-            record.finished_at = _now()
-            record.duration = round(time.monotonic() - started, 2)
             self._log(f"[{task.name}] 备份异常：{record.errors[0]}")
-            return ExecutionResult(record, message=record.errors[0])
+            return self._finish_early(record, task, started, record.errors[0])
 
         # 5. 填充记录
         record.archive = str(result.path)
@@ -645,24 +774,25 @@ class TaskEngine:
         if result.files == 0 and result.dirs > 0:
             warnings.append("没有文件被写入压缩包（只包含空目录）")
 
-        # 6. 校验（分卷包无法直接测试，已通过逐卷字节数/分卷首尾完整性检查）
+        # 6. 校验（三态：passed / failed / skipped——skipped 绝不当成 passed）
         if task.verify:
             if len(result.volumes) > 1:
-                bad = [v.path.name for v in result.volumes if v.path.stat().st_size <= 0]
-                record.verification = "failed" if bad else "passed"
-                record.verification_message = (
-                    f"分卷校验失败：{', '.join(bad)} 为空" if bad else f"已生成 {len(result.volumes)} 个分卷（完整性在校验时重建）"
-                )
+                progress.describe("verify")
+                ok, msg = _verify_volumes(result.volumes, record.format, opts.password or None)
+                record.verification = "passed" if ok is True else ("failed" if ok is False else "skipped")
+                record.verification_message = msg
                 record.extracted_text = "\n".join(v.path.name for v in result.volumes[:12])
             else:
                 progress.describe("verify")
                 ok, msg = verify_archive(result.path, record.format, opts.password or None)
-                record.verification = "passed" if ok else "failed"
-                record.extracted_text = _extract_text_sample(result.path, record.format) if ok else ""
+                record.verification = "passed" if ok is True else ("failed" if ok is False else "skipped")
+                record.extracted_text = _extract_text_sample(result.path, record.format) if ok is True else ""
                 record.verification_message = msg
             if record.verification == "failed":
                 record.status = "failure"
                 record.errors.append(f"校验失败：{record.verification_message}")
+            elif record.verification == "skipped":
+                warnings.append(f"校验未执行：{record.verification_message}")
         else:
             record.verification = "skipped"
 
@@ -685,6 +815,40 @@ class TaskEngine:
         if record.status != "failure":
             record.status = "success" if record.verification != "failed" else "failure"
 
+        # 8. 提交 manifest（备份身份层）：卷全部就位、状态定稿后才写
+        #    （state=committed 是保留策略的准入依据；写入失败不阻断备份本身）
+        main_name = Path(result.path).name
+        _low = main_name.lower()
+        for _ext in (".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".zip", ".7z", ".rar", ".tar"):
+            _idx = _low.find(_ext)
+            if _idx >= 0:
+                main_name = main_name[: _idx + len(_ext)]
+                break
+        try:
+            from .manifest import STATE_COMMITTED, STATE_PARTIAL, Manifest, write_manifest
+
+            mf = Manifest(
+                stem=main_name,
+                task_id=task.id,
+                task_name=task.name,
+                fmt=record.format,
+                state=STATE_COMMITTED if record.status == "success" else STATE_PARTIAL,
+                volumes=[v.path.name for v in result.volumes],
+                size_bytes=record.archive_bytes,
+                source_bytes=record.source_bytes,
+                files=record.files,
+                dirs=record.dirs,
+                backend=record.backend,
+                encrypted=record.encrypted,
+                encrypt_mode=record.encrypt_mode or "",
+                created_at=record.started_at,
+                committed_at=record.finished_at,
+                verified=record.verification,
+            )
+            write_manifest(task.destination, mf)
+        except Exception as exc:  # noqa: BLE001 - 清单失败不阻断备份本身
+            record.warnings.append(f"写入备份清单失败（不影响备份文件）：{exc}")
+
         # 8. 写运行记录
         append_history(record, task)
         write_last_result(task, record, result)
@@ -702,6 +866,17 @@ class TaskEngine:
         if self.log_fn:
             with contextlib.suppress(Exception):
                 self.log_fn(text)
+
+    def _finish_early(self, record: RunRecord, task: BackupTask, started: float, message: str = "") -> ExecutionResult:
+        """早退路径的统一收尾：定稿时长 + 写历史 + 写 last-run（审查 P0-16：
+        此前所有早退都不写 history，用户看记录页以为没跑过）。"""
+        record.finished_at = _now()
+        record.duration = round(time.monotonic() - started, 2)
+        with contextlib.suppress(Exception):
+            append_history(record, task)
+        with contextlib.suppress(Exception):
+            write_last_result(task, record, None)
+        return ExecutionResult(record, message=message or (record.errors[0] if record.errors else record.status))
 
 
 def _extract_text_sample(path: Path, fmt: str, limit: int = 1200) -> str:
@@ -723,7 +898,7 @@ def _extract_text_sample(path: Path, fmt: str, limit: int = 1200) -> str:
             import subprocess
             import sys
 
-            kwargs: dict = {"capture_output": True, "timeout": 60}
+            kwargs: dict = {"capture_output": True, "timeout": 60, "stdin": subprocess.DEVNULL}
             if sys.platform == "win32":
                 kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             proc = subprocess.run([exe, "l", "-ba", str(path)], **kwargs)
@@ -780,6 +955,28 @@ def history_path() -> Path:
     return config_dir() / "history.jsonl"
 
 
+_HISTORY_MAX_BYTES = 5 * 1024 * 1024
+_HISTORY_KEEP_LINES = 5000
+
+
+def _rotate_history_if_needed(path: Path) -> None:
+    """超过上限时保留尾部若干行重写（审查 E1-1.7：history.jsonl 无轮转）。"""
+    try:
+        if not path.exists() or path.stat().st_size <= _HISTORY_MAX_BYTES:
+            return
+        with open(path, "rb") as fh:
+            raw = fh.read().decode("utf-8", "replace")
+        lines = [ln for ln in raw.splitlines() if ln.strip()][-_HISTORY_KEEP_LINES:]
+        tmp = path.with_name(path.name + f".tmp-{os.getpid()}")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + ("\n" if lines else ""))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        pass  # 轮转失败不影响本次写入（下次再试）
+
+
 def append_history(record: RunRecord, task: BackupTask | None = None) -> None:
     path = history_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -790,6 +987,7 @@ def append_history(record: RunRecord, task: BackupTask | None = None) -> None:
             "fmt": task.options.fmt,
             "schedule": task.schedule.describe(),
         }
+    _rotate_history_if_needed(path)
     with open(path, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(data, ensure_ascii=False) + "\n")
 
