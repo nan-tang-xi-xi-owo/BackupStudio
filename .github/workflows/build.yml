@@ -122,7 +122,7 @@ jobs:
 
   macos-x64:
     name: macOS x64 dmg
-    runs-on: macos-13
+    runs-on: macos-15-intel
     needs: test
     steps:
       - uses: actions/checkout@v4
@@ -186,7 +186,7 @@ jobs:
     runs-on: ubuntu-22.04
     needs: test
     container:
-      image: bilelmoussaoui/flatpak-github-actions:kde-6.8
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-24.08
       options: --privileged
     steps:
       - uses: actions/checkout@v4

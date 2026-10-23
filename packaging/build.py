@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import shutil
 import subprocess
@@ -28,6 +29,12 @@ ROOT = Path(__file__).resolve().parent.parent
 DIST = ROOT / "dist"
 BUILD = ROOT / "build" / "pyinstaller"
 APP_NAME = "BackupStudio"
+
+# Windows 控制台默认 GBK：脚本里的 ✓/✗ 等符号会直接抛 UnicodeEncodeError
+# 把构建打成"失败"（CI 实测）。统一改为 UTF-8 + 容错替换。
+for _stream in (sys.stdout, sys.stderr):
+    with contextlib.suppress(Exception):
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
 
 
 def _tool_dir() -> Path | None:
