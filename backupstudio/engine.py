@@ -11,13 +11,14 @@ import json
 import logging
 import os
 import shutil
+import sys
 import threading
 import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 from . import __version__
 from .archives import (
@@ -184,6 +185,20 @@ def _friendly_error(exc: BaseException) -> str:
 # 校验
 # --------------------------------------------------------------------------
 
+def _with_scc_utf8(argv: list[str]) -> list[str]:
+    """给 7-Zip 系可执行文件插入 `-sccUTF-8`（子命令之后、其它参数之前）。
+
+    中文 Windows 上 7za 的错误输出默认是 GBK，而本模块按 UTF-8 解码 → 校验失败时
+    用户看到的是乱码（审查 W-A3-2 / M2b）。实测 `-sccUTF-8` 后 7za 全量输出 UTF-8，
+    现有解码原样正确。UnRAR 等不支持该开关，按可执行文件名排除；重复调用幂等。
+    """
+    if not (sys.platform == "win32" and len(argv) >= 2):
+        return argv
+    if "-sccUTF-8" in argv or not Path(argv[0]).name.lower().startswith("7z"):
+        return argv
+    return [argv[0], argv[1], "-sccUTF-8", *argv[2:]]
+
+
 def _verify_volumes(volumes, fmt: str, password: str | None = None) -> tuple[bool | None, str]:
     """分卷真实校验（审查 E-2）：逐卷字节拼接成临时整包后走 verify_archive。
 
@@ -239,7 +254,7 @@ def verify_archive(main: Path, fmt: str, password: str | None = None) -> tuple[b
             import subprocess
             import sys
 
-            argv = [exe, "t", str(main)]
+            argv = _with_scc_utf8([exe, "t", str(main)])
             if password:
                 argv.insert(2, f"-p{password}")
             kwargs: dict = {"capture_output": True, "timeout": 600, "stdin": subprocess.DEVNULL}
@@ -270,6 +285,7 @@ def verify_archive(main: Path, fmt: str, password: str | None = None) -> tuple[b
                         argv = [seven, "t", str(main)]
                         if password:
                             argv.insert(2, f"-p{password}")
+                        argv = _with_scc_utf8(argv)
                         kwargs: dict = {"capture_output": True, "timeout": 600, "stdin": subprocess.DEVNULL}
                         if _sys.platform == "win32":
                             kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -295,7 +311,7 @@ def verify_archive(main: Path, fmt: str, password: str | None = None) -> tuple[b
             import sys
 
             if Path(exe).name.lower().startswith("7z"):
-                argv = [exe, "t", str(main)]
+                argv = _with_scc_utf8([exe, "t", str(main)])
             else:
                 argv = [exe, "t", "-idq", str(main)]
             kwargs = {"capture_output": True, "timeout": 600, "stdin": subprocess.DEVNULL}
@@ -339,7 +355,7 @@ def verify_archive(main: Path, fmt: str, password: str | None = None) -> tuple[b
                     kwargs: dict = {"capture_output": True, "timeout": 3600, "stdin": subprocess.DEVNULL}
                     if sys.platform == "win32":
                         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                    proc = subprocess.run([seven, "t", str(main)], **kwargs)
+                    proc = subprocess.run(_with_scc_utf8([seven, "t", str(main)]), **kwargs)
                     out = (proc.stdout or b"").decode("utf-8", "replace")
                     if proc.returncode == 0:
                         return True, "7-Zip 测试通过"
@@ -351,11 +367,32 @@ def verify_archive(main: Path, fmt: str, password: str | None = None) -> tuple[b
                     proc = subprocess.run([zstd, "-t", str(main)], capture_output=True, timeout=600, stdin=subprocess.DEVNULL)
                     return proc.returncode == 0, "zstd 校验通过" if proc.returncode == 0 else "zstd 校验失败"
                 return None, "跳过校验：无 zstandard 模块 / zstd / 7-Zip，无法验证 tar.zst 内容"
+            # tar 系校验必须同时满足两件事，缺一即产生"翻字节仍通过"的假阴性（审查 M18）：
+            # ① 容器完整性：把压缩流独立解压到 EOF（gzip/bz2/xz 的 CRC 在流尾才校验；
+            #    tarfile 流式读到结束标记即停，不会触发它）；
+            # ② 成员内容：逐个读出（裸 tar 无校验和，此项对内容损坏无效——依赖 manifest 逐文件 hash）。
+            import gzip as _gzip
+            import bz2 as _bz2
+            import lzma as _lzma
+
+            _container = {"tar.gz": _gzip, "tgz": _gzip, "tar.bz2": _bz2, "tbz2": _bz2,
+                          "tar.xz": _lzma, "txz": _lzma}
+            if fmt in _container:
+                mod = _container[fmt]
+                with open(main, "rb") as fh:
+                    with mod.open(fh, "rb") as gz:
+                        while gz.read(1 << 20):
+                            pass
             with tarfile.open(main, "r:*") as tf:
                 count = 0
-                for _ in tf:
+                for m in tf:
                     count += 1
-            return True, f"{count} 个条目可读取"
+                    if m.isfile():
+                        f = tf.extractfile(m)
+                        if f is not None:
+                            while f.read(1 << 20):
+                                pass
+            return True, f"{count} 个条目校验通过（内容已读透）"
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
     return None, "跳过校验：该格式无内置校验实现"
@@ -377,11 +414,16 @@ class CleanupItem:
 
 
 def find_backup_blobs(task: BackupTask) -> list[CleanupItem]:
-    """列出备份目录下属于该任务的备份组（manifest 权威 + 旧包后缀启发式）。
+    """列出备份目录下**属于该任务**的备份组（manifest 权威 + 旧包后缀启发式）。
 
     恢复历史行为（审查 C11/E1）：分卷包（.partNN / .001 / partN.rar）与
     `_N` 重名后缀都正确归组；manifest 管理的组带 committed_at 排序依据；
     无清单旧包标记 managed=False（迁移期不被自动淘汰——E5 红线）。
+
+    任务归属过滤（审查 M10/W-A1-1，数据丢失级）：多任务共享同一目录时，
+    候选集必须限定为本任务的产物——manifest 组按 task_id 判定，无清单旧包
+    按归档名前缀（任务名 sanitize 后）判定。否则 A 任务的保留策略会删除
+    B/C 任务的备份（实测 3 任务各 keep_last=2 交错 6 轮 → 共只剩 2 份）。
     """
     if not task.destination:
         return []
@@ -390,15 +432,28 @@ def find_backup_blobs(task: BackupTask) -> list[CleanupItem]:
         return []
     ext = FORMAT_EXTENSIONS.get(task.options.fmt, ".7z")
     all_exts = tuple(FORMAT_EXTENSIONS.values())
+    from .util import sanitize_component
+
+    task_prefix = sanitize_component(task.name or "").lower()
     blobs: list[CleanupItem] = []
     for g in collect_groups(folder, ext, fmts=all_exts):
         # 只保留与该任务格式匹配的组（后缀启发式组）；manifest 组按 fmt 字段过滤
         if g.manifest is not None:
             if g.manifest.fmt and g.manifest.fmt != task.options.fmt:
                 continue
+            # manifest 带 task_id：有值时以它为准；无值（历史 manifest）退回名前缀
+            if g.manifest.task_id:
+                if g.manifest.task_id != task.id:
+                    continue
+            elif not _group_belongs_to_name(g, task_prefix):
+                continue
             mtime = g.committed_at or (min(f.stat().st_mtime for f in g.files) if g.files else 0.0)
         else:
             if not any(f.name.lower().endswith(ext.lower()) or ("." in f.name and f.name.lower().rfind(ext.lower()) >= 0) for f in g.files):
+                continue
+            # 无清单旧包：按归档名前缀归属（`{name}_{datetime}` 模板保证前缀可判；
+            # 同秒重名的 `_N` 后缀与分卷 `.partNN` 都在前缀之后，天然满足）
+            if task_prefix and not _group_belongs_to_name(g, task_prefix):
                 continue
             mtime = g.committed_at
         blobs.append(
@@ -413,6 +468,27 @@ def find_backup_blobs(task: BackupTask) -> list[CleanupItem]:
             )
         )
     return sorted(blobs, key=lambda b: b.mtime)
+
+
+def _group_belongs_to_name(g, task_prefix: str) -> bool:
+    """归档组是否属于该任务（按主文件名前缀判断）。
+
+    前缀匹配用组内文件的主名（collect_groups 已去掉分卷/重名后缀）；任务名
+    互为前缀（Task / TaskA）时要求前缀后紧跟分隔符 `_`，避免 Task 任务误认领
+    TaskA_2026… 的包。
+    """
+    if not task_prefix:
+        return True
+    for f in g.files:
+        base = f.name.lower()
+        for e in (".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".zip", ".7z", ".rar", ".tar"):
+            i = base.find(e)
+            if i >= 0:
+                base = base[:i]
+                break
+        if base == task_prefix or (base.startswith(task_prefix) and base[len(task_prefix) : len(task_prefix) + 1] == "_"):
+            return True
+    return False
 
 
 def apply_retention(
@@ -438,6 +514,34 @@ def apply_retention(
         return []
     if not include_legacy:
         blobs = [b for b in blobs if b.managed or (protected and any(Path(f).resolve() == Path(pp).resolve() for pp in protected for f in b.files))]
+    # 本轮新组占位（审查 M11 / W-A1 推荐方案，S2）：
+    # apply_retention（engine 步骤 7）先于写 manifest（步骤 8），7z 原生分卷的本轮新卷
+    # 名为 `X.7z.001`，既无清单、又不被 collect_groups 的后缀启发式 `_matches` 识别
+    # （它只认 endswith(ext) / ".part" 规则）→ 本轮这一组对 find_backup_blobs **完全不可见**。
+    # 于是 keep_last 比较用的是"上一轮为止的组数"，每轮淘汰一组后稳态仍比配置多留 1 组
+    # （实测 keep_last=1 → 长期 2 组；一般化 keep_last=N → N+1 组）。
+    # 修法：protected 非空、且其文件**不属于任何已见组**时，把本轮新卷合成一个虚拟组
+    # 并入 blobs **参与计数**——它是最新的一组，protected_set 会让删除环节跳过它（不会被删），
+    # 但它照样占掉 keep_last 的一个配额，差一即消除。
+    if protected:
+        seen: set[str] = {str(Path(f).resolve()).lower() for b in blobs for f in b.files}
+        if not any(str(Path(p).resolve()).lower() in seen for p in protected):
+            size = 0
+            for p in protected:
+                with contextlib.suppress(OSError):
+                    size += Path(p).stat().st_size
+            blobs.append(
+                CleanupItem(
+                    blob=str(protected[0]),
+                    files=[str(p) for p in protected],
+                    size=size,
+                    mtime=time.time(),
+                    managed=True,  # 本轮刚产出的托管组（清单稍后写入）——只为计数
+                    complete=True,
+                    stem="",  # 无清单：删除环节本就会跳过，且不会去 delete_manifest
+                )
+            )
+            blobs.sort(key=lambda b: b.mtime)
     if not blobs:
         return []
     protected_set = {str(Path(p).resolve()).lower() for p in (protected or [])}
@@ -512,6 +616,162 @@ def apply_retention(
             except Exception:  # noqa: BLE001
                 pass
     return handled
+
+
+# --------------------------------------------------------------------------
+# 崩溃残包清扫（审查 M23 / commit 1a20688 声称但未实现的 E1 建议）
+# --------------------------------------------------------------------------
+
+#: 事务临时产物的名字标记（archives.py：`<最终名>.bs-tmp-<pid>`）
+TMP_MARK = ".bs-tmp-"
+#: 同卷暂存目录前缀（staging.make_staging_dir：`bs-stage-<随机>`）
+STAGE_PREFIX = "bs-stage-"
+#: 残包年龄闸门：超过这个时长才承认"制造它的进程已经死了"（防误删刚写出的活体）
+ORPHAN_GRACE_SECONDS = 300.0
+#: 无法判定 pid 生死时的兜底年龄（跨机/网络盘、pid 复用等场景）
+ORPHAN_MAX_AGE_SECONDS = 24 * 3600
+
+
+def _tail_pid(text: str, marker: str) -> int | None:
+    """从名字里 marker 之后的尾缀提取 pid（取第一段连续数字）；异常值一律 None。"""
+    idx = text.rfind(marker)
+    if idx < 0:
+        return None
+    tail = text[idx + len(marker) :]
+    digits = ""
+    for ch in tail:
+        if ch.isdigit():
+            digits += ch
+        elif digits:
+            break
+    if not digits or len(digits) > 10:  # 超过 10 位不是合法 pid（Windows pid < 2^31）
+        return None
+    try:
+        return int(digits)
+    except ValueError:  # pragma: no cover
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    """pid 是否存活；判不了时**保守返回 True**（宁可不删）。"""
+    if pid <= 0:
+        return False
+    try:
+        import psutil  # type: ignore[import-not-found]
+
+        return bool(psutil.pid_exists(pid))
+    except ImportError:  # pragma: no cover
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    except Exception:  # psutil 对超范围 pid 会抛 OverflowError 等 → 当作存活
+        return True
+
+
+def _sweep_targets(folder: Path) -> list[Path]:
+    """一个 destination 需要清扫的目录集合。
+
+    `staging.staging_parent` 的落点顺序是：目标目录 → 目标目录的 `.bs-staging` 子目录
+    → 系统临时目录，因此 `bs-stage-*` 与 `.bs-tmp-*` 可能同时出现在三处；只扫目标目录
+    会漏掉崩溃时最常见的 `.bs-staging/`。系统临时目录是全机共享的，**不整目录扫**
+    （那里可能有别的程序的同名前缀文件），只按本产品实际用过的两种前缀精确点名。
+    """
+    targets = [folder]
+    sub = folder / ".bs-staging"
+    if sub.is_dir():
+        targets.append(sub)
+    return targets
+
+
+def sweep_orphans(destinations: Iterable[Path | str]) -> list[Path]:
+    """清扫崩溃残包（审查 M23，S2）：目标目录里永不被清理的两类遗留。
+
+    * `<最终名>.bs-tmp-<pid>`：外部 7z/rar 后端的**事务性临时产物**（校验通过才
+      os.replace 成最终名）。进程被 SIGKILL/断电打断 → 残包以整包体积留在目录里，
+      既不是备份也不是源数据（_auto_skip 已忽略它），**永远无人清理**。
+    * `bs-stage-*`：同卷暂存目录（staging.make_staging_dir 用 mkdtemp 创建），正常路径
+      由 shutil.rmtree 回收；崩溃后整个目录（含 staging.tar、解包副本）残留。
+      落点包括目标目录、目标目录的 `.bs-staging/` 子目录，以及（前两者不可写时）
+      系统临时目录——三处都扫。
+
+    安全三原则（绝不误删有用的东西）：
+    1. **只按名字标记动手**：名字含 `.bs-tmp-` 的文件，或目录名以 `bs-stage-` 开头。
+       其它一切（归档本体、manifests/、last-run.json、用户文件）碰都不碰。
+    2. **只删确定已死的**：尾缀 pid 可解析且**不在本机存活**、且年龄 > 5 分钟；
+       或年龄 > 24 小时（覆盖 pid 无法解析/跨机写入/pid 复用的场景）。
+       自己的 pid 一律视为活；判不了生死就交给 24h 闸门。
+    3. **失败不抛**：任何单个 OSError 只记日志继续；调用方（GUI/守护进程启动）另有
+       try/except 兜底，清扫绝不能阻塞启动。
+
+    返回被删除的路径（便于测试与日志）。
+    """
+    removed: list[Path] = []
+    seen: set[str] = set()
+    my_pid = os.getpid()
+    folders: list[tuple[Path, bool]] = []  # (目录, 是否"只扫 bs-stage-* 目录")
+    for raw in destinations or []:
+        if not raw:
+            continue
+        try:
+            folder = Path(raw)
+        except TypeError:
+            continue
+        if not folder.is_dir():
+            continue
+        for f in _sweep_targets(folder):
+            key = str(f).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            folders.append((f, False))
+    # 系统临时目录：mkdtemp 的兜底落点（staging_parent 前两者都不可写时）。
+    # 这里**只点名 bs-stage-\* 目录**——`.bs-tmp-<pid>` 永远写在备份目录里
+    # （archives.py 用 dest.with_name 生成），系统 temp 里同名文件属于别的程序，不能碰。
+    sys_tmp: Path | None = None
+    with contextlib.suppress(Exception):
+        import tempfile
+
+        sys_tmp = Path(tempfile.gettempdir())
+        key = str(sys_tmp).lower()
+        if folders and sys_tmp.is_dir() and key not in seen:
+            seen.add(key)
+            folders.append((sys_tmp, True))
+    for folder, stage_only in folders:
+        try:
+            entries = list(folder.iterdir())
+        except OSError as exc:
+            log.debug("残包清扫：无法读取目录 %s：%s", folder, exc)
+            continue
+        for entry in entries:
+            name = entry.name
+            is_stage = entry.is_dir() and name.startswith(STAGE_PREFIX)
+            is_tmp = (not stage_only) and (TMP_MARK in name)
+            if not (is_tmp or is_stage):
+                continue  # 原则 1：不在两类标记内的一律不动
+            try:
+                age = max(0.0, time.time() - entry.stat().st_mtime)
+            except OSError:
+                continue
+            # 只有 `.bs-tmp-<pid>` 尾巴上是真 pid（archives.py 显式写 os.getpid()）；
+            # mkdtemp 的 `bs-stage-<随机>` 尾巴是随机字符，**绝不能当 pid 用**（否则会
+            # 把别的进程正在写的暂存目录判成死锁而删掉）→ 暂存目录只走 24h 年龄闸门。
+            pid = _tail_pid(name, TMP_MARK) if is_tmp else None
+            dead_pid = pid is not None and pid != my_pid and not _pid_alive(pid)
+            if not ((dead_pid and age > ORPHAN_GRACE_SECONDS) or age > ORPHAN_MAX_AGE_SECONDS):
+                continue  # 原则 2：还可能是活的，或没到兜底年龄
+            try:
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry)
+                else:
+                    entry.unlink()
+                removed.append(entry)
+                log.info("清扫崩溃残包：%s（%s，年龄 %.0f 分钟）", entry,
+                         "持有者 pid 已死" if dead_pid else "超 24 小时", age / 60)
+            except OSError as exc:
+                log.warning("清扫崩溃残包失败 %s：%s", entry, exc)
+    return removed
 
 
 # --------------------------------------------------------------------------
@@ -796,8 +1056,18 @@ class TaskEngine:
         else:
             record.verification = "skipped"
 
+        record.finished_at = _now()
+        record.duration = round(time.monotonic() - started, 2)
+        if record.status != "failure":
+            record.status = "success" if record.verification != "failed" else "failure"
+
         # 7. 保留策略（只用「是否刚生成」作保护，旧的同名包照常淘汰）
-        if apply_cleanup and task.retention.enabled:
+        #    仅在**本轮成功**时执行（审查 W-A1-4 c9，数据丢失级）：
+        #    校验失败/取消/跳过时若照常清理，本轮坏包会以 protected 身份占住
+        #    keep_last 配额，把上一轮已 committed 的好包挤掉——keep_last=1 的
+        #    用户一次校验失败就丢光最后一份可恢复备份。坏包不配占配额。
+        #    注：本块必须位于 status 定稿之后（原位置早于赋值，判定恒假）。
+        if apply_cleanup and task.retention.enabled and record.status == "success":
             try:
                 protected = [str(v.path) for v in result.volumes]
                 record.cleaned = apply_retention(task, protected=protected)
@@ -808,27 +1078,29 @@ class TaskEngine:
                     )
             except Exception as exc:
                 warnings.append(f"清理过期备份失败：{exc}")
+        elif apply_cleanup and task.retention.enabled:
+            self._log(
+                f"[{task.name}] 本轮状态为 {record.status}，已跳过保留策略清理"
+                "（失败产物不挤占好包配额）"
+            )
 
+        # 汇总告警（放在保留策略之后：清理失败产生的告警也要收进去）
         record.warnings = warnings
-        record.finished_at = _now()
-        record.duration = round(time.monotonic() - started, 2)
-        if record.status != "failure":
-            record.status = "success" if record.verification != "failed" else "failure"
 
         # 8. 提交 manifest（备份身份层）：卷全部就位、状态定稿后才写
         #    （state=committed 是保留策略的准入依据；写入失败不阻断备份本身）
-        main_name = Path(result.path).name
-        _low = main_name.lower()
-        for _ext in (".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".zip", ".7z", ".rar", ".tar"):
-            _idx = _low.find(_ext)
-            if _idx >= 0:
-                main_name = main_name[: _idx + len(_ext)]
-                break
+        #
+        #    stem 直接取后端正向给出的 result.stem（由 dest 推导）。
+        #    旧实现在这里用 `str.find(ext)` 从产物名**反推**主名：任务名本身含扩展名
+        #    （任务名 `foo.zip` → 产物 `foo.zip_20261023_042116.zip`）时命中的是**第一个**
+        #    `.zip`，stem 被截成 `foo.zip` → 该任务所有备份写同一个 `<stem>.json`，
+        #    后一轮覆盖前一轮清单（实测：2 产物 1 清单）。审查 W-A2-2（S1）。
+        manifest_stem = result.stem or Path(result.path).name
         try:
             from .manifest import STATE_COMMITTED, STATE_PARTIAL, Manifest, write_manifest
 
             mf = Manifest(
-                stem=main_name,
+                stem=manifest_stem,
                 task_id=task.id,
                 task_name=task.name,
                 fmt=record.format,
@@ -847,7 +1119,14 @@ class TaskEngine:
             )
             write_manifest(task.destination, mf)
         except Exception as exc:  # noqa: BLE001 - 清单失败不阻断备份本身
-            record.warnings.append(f"写入备份清单失败（不影响备份文件）：{exc}")
+            # 审查 W-A2-4（S3）：文案必须可行动——清单失败意味着该包从此刻起是
+            # "无清单遗留"：保留策略视其为未托管旧包（迁移红线），**永远不会自动清理它**，
+            # 只报告不删除。旧文案"不影响备份文件"让用户以为无关紧要、一次都难察觉。
+            record.warnings.append(
+                f"写入备份清单失败（不影响备份文件本身）：{exc}。"
+                "该备份将以无清单形态存在，保留策略不会自动清理它——"
+                "重启程序后请在本目录核对，必要时手动删除或重新备份覆盖。"
+            )
 
         # 8. 写运行记录
         append_history(record, task)
@@ -901,7 +1180,7 @@ def _extract_text_sample(path: Path, fmt: str, limit: int = 1200) -> str:
             kwargs: dict = {"capture_output": True, "timeout": 60, "stdin": subprocess.DEVNULL}
             if sys.platform == "win32":
                 kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            proc = subprocess.run([exe, "l", "-ba", str(path)], **kwargs)
+            proc = subprocess.run(_with_scc_utf8([exe, "l", "-ba", str(path)]), **kwargs)
             text = (proc.stdout or b"").decode("utf-8", "replace")
             lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
             return "\n".join(lines[:8])[:limit]

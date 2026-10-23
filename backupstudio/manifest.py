@@ -139,14 +139,32 @@ def write_manifest(destination: Path | str, manifest: Manifest) -> Path:
 
 
 def read_manifest(path: Path) -> Manifest | None:
-    """读单份清单；损坏返回 None（由调用方决定提示）。"""
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except FileNotFoundError:
-        return None
-    except (OSError, json.JSONDecodeError) as exc:
-        log.warning("清单读取失败 %s：%s", path, exc)
+    """读单份清单；损坏返回 None（由调用方决定提示）。
+
+    **PermissionError 短暂重试**（审查 W-A2-3，S3）：Windows 上 `os.replace` 发布新清单
+    的瞬间、或杀软/索引器持有句柄时，读者会撞 `PermissionError`（实测并发读 31% 为
+    PermissionError → 返回 None）。清单"读成 None"不是无害的：该组在 collect_groups 里
+    降级为"无清单旧包"（managed=False）→ 保留策略本轮不认它、keep_last 计数少一组
+    （多留一份）。故对权限类瞬态错误重试 3 次（间隔 20ms）再放弃。
+    JSONDecodeError/结构无效是**确定性**损坏，不重试。
+    """
+    last_exc: OSError | None = None
+    for attempt in range(3):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            break
+        except FileNotFoundError:
+            return None
+        except PermissionError as exc:  # 瞬态：写者正在 replace / 句柄被占
+            last_exc = exc
+            time.sleep(0.02)
+            continue
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning("清单读取失败 %s：%s", path, exc)
+            return None
+    else:
+        log.warning("清单读取失败（权限重试 3 次仍不可读）%s：%s", path, last_exc)
         return None
     if not isinstance(data, dict):
         return None
@@ -283,13 +301,30 @@ def collect_groups(destination: Path | str, fmt_ext: str, *, fmts: Iterable[str]
 
 
 def _stem_of(name: str, exts: tuple[str, ...]) -> str:
-    """从文件名提取主名（去掉分卷后缀）。"""
-    low = name
+    """从文件名提取主名（去掉**尾部**分卷后缀，保留容器扩展名）。
+
+    审查 W-A2-2 的同类缺陷：旧实现用 `str.find(ext)` **首匹配**扩展名，任务名本身含
+    扩展名时（任务名 `foo.zip` → 产物 `foo.zip_20260101_120000.zip`）会把主名截成
+    `foo.zip`，于是**同任务的不同备份被并成一个启发式组**——该组一旦参与淘汰就是整组
+    删除（显式接管 include_legacy=True 时会连带删掉有清单的好包）。
+    新规则：先去掉**尾部**卷序号（`.001` / `.part01`），再按**最后一个**扩展名切；
+    得到的主名与 archives.product_stem(dest.name) 一致（native 分卷
+    `X.7z.001` → `X.7z`；split 分卷 `X.tar.gz.part01` → `X.tar.gz`），
+    因此启发式组能与 manifest 组正确对表，不再跨备份误并。
+    """
+    base = name
+    low = base.lower()
+    for sep in (".part", "."):
+        idx = low.rfind(sep)
+        if idx > 0 and low[idx + len(sep) :].isdigit():
+            base = base[:idx]
+            low = base.lower()
+            break
     for e in sorted(exts, key=len, reverse=True):
-        idx = low.lower().find(e.lower())
+        idx = low.rfind(e.lower())
         if idx >= 0:
-            return low[: idx + len(e)]
-    return name
+            return base[: idx + len(e)]
+    return base
 
 
 def _parse_ts(text: str) -> float:
