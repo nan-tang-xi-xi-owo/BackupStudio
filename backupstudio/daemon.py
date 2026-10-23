@@ -150,6 +150,16 @@ class DaemonService:
 
         log.info("守护进程启动 pid=%s 版本=%s 数据目录=%s", os.getpid(), __version__, config_dir())
         log.info("命令行：%s", sys.argv)
+        # ---- 崩溃残包清扫（审查 M23）：对本配置所有任务的备份目录各扫一次，
+        #      清掉崩溃/强杀留下的 .bs-tmp-* 与 bs-stage-*。失败绝不阻塞启动。
+        try:
+            from .engine import sweep_orphans
+
+            gone = sweep_orphans([t.destination for t in self.store.list_tasks()])
+            if gone:
+                log.info("启动清扫：移除 %d 个崩溃残包：%s", len(gone), ", ".join(p.name for p in gone[:8]))
+        except Exception:  # noqa: BLE001
+            log.debug("启动清扫崩溃残包失败（忽略）", exc_info=True)
         ipc_thread = None
         if server is not None:
             ipc_thread = threading.Thread(target=self._ipc_loop, args=(server,), daemon=True, name="bs-ipc")
@@ -173,15 +183,11 @@ class DaemonService:
         self._wake.set()
 
     def _tick(self) -> None:
-        # 重新读取配置（GUI 保存后守护进程自动生效）
-        try:
-            mtime = self.store.path.stat().st_mtime if self.store.path.exists() else 0
-        except OSError:
-            mtime = 0
-        if mtime != getattr(self, "_config_mtime", None):
-            self._config_mtime = mtime
-            self.store = TaskStore(self.store.path)
-            log.info("已加载配置：%d 个任务", len(self.store.list_tasks()))
+        # 重新读取配置（GUI/CLI 保存后守护进程自动生效）。
+        # 改为"三方合并式重载"：保留内存里尚未落盘的改动（例如回写失败后的
+        # last_run 兜底更新），同时吸收外部新增/修改的任务。
+        if self.store.reload_if_changed():
+            log.info("已同步配置：%d 个任务", len(self.store.list_tasks()))
         now = datetime.now()
         for task in self.store.list_tasks():
             if not task.enabled or task.schedule.type == "manual":
@@ -230,30 +236,73 @@ class DaemonService:
                 if not sock.poll(500):
                     continue
                 raw = sock.recv()
-                try:
-                    req = json.loads(raw.decode("utf-8"))
-                except Exception:
-                    req = {}
-                reply = self._handle(req)
+            except Exception as exc:  # noqa: BLE001
+                if self._stop.is_set():
+                    break
+                log.debug("IPC 收包异常：%s", exc)
+                time.sleep(0.2)
+                continue
+            # 已经收下一个请求：此后**必须**回一次包，否则 REP 状态机停在
+            # "已收未回"，该插座永久楔死（W-A5-1 实测：之后所有 ping/stop 无应答）。
+            # _reply 自身保证返回 dict，不抛异常。
+            try:
+                reply = self._reply(raw)
+            except Exception as exc:  # noqa: BLE001 - 兜底，仍要回包
+                log.exception("IPC 生成回复异常")
+                reply = {"ok": False, "error": f"内部错误：{type(exc).__name__}"}
+            try:
                 sock.send(json.dumps(reply, ensure_ascii=False).encode("utf-8"))
             except Exception as exc:  # noqa: BLE001
                 if self._stop.is_set():
                     break
-                log.debug("IPC 处理异常：%s", exc)
-                time.sleep(0.2)
+                # 回包失败（进程退出/插座损坏）→ 重建，避免留下"已收未回"的死插座
+                log.warning("IPC 回包失败（%s），重建插座", exc)
+                try:
+                    ctx.close(0)
+                except Exception:
+                    pass
+                try:
+                    ctx, sock = _make_zmq_server(self.endpoint)
+                except Exception as exc2:  # noqa: BLE001
+                    log.error("IPC 插座重建失败：%s", exc2)
+                    break
         try:
             sock.close(0)
             ctx.term()
         except Exception:
             pass
 
+    def _reply(self, raw) -> dict:  # noqa: ANN001
+        """把原始字节变成回复字典：任何畸形载荷都得到结构化错误回复，绝不抛出。"""
+        try:
+            data = json.loads(bytes(raw).decode("utf-8"))
+        except Exception:  # noqa: BLE001 - 非法 JSON（无法解码/语法错）
+            return {"ok": False, "error": "畸形请求：不是合法 JSON"}
+        if not isinstance(data, dict):
+            # json.loads("[]") / b'"hi"' / b"123" 都会成功但不是对象 ——
+            # 旧实现在此 data.get(...) → AttributeError → 该轮无 send → 插座永久楔死
+            return {"ok": False, "error": "畸形请求：期望 JSON 对象"}
+        try:
+            return self._handle(data)
+        except Exception as exc:  # noqa: BLE001 - 处理异常也要回包
+            log.exception("IPC 处理命令失败")
+            return {"ok": False, "error": f"处理失败：{type(exc).__name__}"}
+
     def _handle(self, req: dict) -> dict:
+        # 入参必须是 dict：调用方（_reply）已校验，这里再兜一层防御直接调用者
+        # （审查 W-A5-1：非 dict 载荷曾让 cmd 未定义/AttributeError 楔死插座）。
+        if not isinstance(req, dict):
+            return {"ok": False, "error": f"畸形请求：期望 JSON 对象，实得 {type(req).__name__}"}
         cmd = req.get("cmd", "status")
+        if not isinstance(cmd, str):
+            return {"ok": False, "error": "畸形请求：cmd 必须是字符串"}
         if cmd == "status":
             return daemon_snapshot(self.store, self.engine)
         if cmd == "run":
             tid = req.get("task_id")
-            task = self.store.get(tid) if tid else None
+            if not isinstance(tid, str):
+                return {"ok": False, "error": "畸形请求：task_id 必须是字符串"}
+            task = self.store.get(tid)
             if task is None:
                 return {"ok": False, "error": "任务不存在"}
             if self.engine.is_running(tid):
@@ -261,9 +310,10 @@ class DaemonService:
             threading.Thread(target=self._execute, args=(task,), daemon=True).start()
             return {"ok": True}
         if cmd == "reload":
-            self._config_mtime = None
+            # 立即合并磁盘改动（原先只是把 mtime 缓存清空等下一 tick，最长滞后 15s）
+            self.store.reload_if_changed()
             self._wake.set()
-            return {"ok": True}
+            return {"ok": True, "tasks": len(self.store.list_tasks())}
         if cmd == "stop":
             self._stop.set()
             self._wake.set()
