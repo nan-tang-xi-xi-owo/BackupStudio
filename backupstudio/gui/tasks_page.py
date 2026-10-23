@@ -40,6 +40,38 @@ STATUS_MAP = {
     "": ("未运行过", "muted"),
 }
 
+# 「改用内置引擎重试」弹窗的判定关键词（审查 W-A7-1 / W-A7-3）。
+# 只有命中 _FORCE_RETRY_HINTS（外部压缩程序写不出包、或缺少外部程序，内置引擎确实能补位）
+# 才提示；命中 _FORCE_RETRY_EXCLUDES（密码/参数/格式类，内置引擎同样无解）则一律不提示。
+# 旧判据里的 "7-Zip" 子串过宽——密码类失败的 errors 也含它，于是把用户引向
+# 「目标目录被限制」的错误归因，并且强制重试必然再失败、再弹窗（实测 2 分钟 467 次）。
+_FORCE_RETRY_HINTS = (
+    "拒绝访问",
+    "没有写入权限",
+    "未能写入压缩包",
+    "无法写入压缩包",
+    "无法写入目标文件",
+    "分卷失败",
+    "分卷无效",
+    "未找到 7-zip",
+    "缺少 7-zip",
+    "cannot open",
+    "access is denied",
+    "permission denied",
+)
+_FORCE_RETRY_EXCLUDES = (
+    "参数错误",
+    "密码",
+    "password",
+    "passwordrequired",
+    "不支持加密",
+    "ascii",
+    "不支持的格式",
+    "不支持压缩格式",
+    "加密方式",
+    "尚未实现",
+)
+
 
 class TaskItemWidget(QWidget):
     """列表中的任务条目。"""
@@ -89,6 +121,9 @@ class TasksPage(QWidget):
         self._items: dict[str, TaskItemWidget] = {}
         self._current_id: str = ""
         self._progress: dict[str, dict] = {}
+        # 已问过「改用内置引擎重试」的任务：本轮 GUI 会话每个任务最多问一次
+        # （审查 W-A7-1：强制重试仍失败会再次弹窗，形成无限循环）
+        self._force_offered: set[str] = set()
 
         root = QVBoxLayout(self)
         root.setContentsMargins(26, 22, 26, 22)
@@ -458,15 +493,72 @@ class TasksPage(QWidget):
         self._update_buttons()
         self._maybe_offer_force_retry(result)
 
+    @staticmethod
+    def _forced_this_run(result) -> bool:
+        """本轮记录是否已经用内置引擎（强制模式）跑过。"""
+        rec = result.record
+        if getattr(rec, "forced", False):
+            return True
+        backend = str(getattr(rec, "backend", "") or "")
+        return backend.startswith(("py7zr", "zipfile", "python-", "builtin")) or "内置" in backend
+
+    def _builtin_can_do_it(self, task: BackupTask) -> bool:
+        """该任务改用内置/强制引擎后是否真能产出（且密码受支持）。
+
+        与任务对话框同一来源（capabilities 表），因此 force=True 的
+        ``available`` 恰好等于「勾上强制压缩后这条路走得通」：
+        * 缺 7-Zip 的 7z：有 py7zr 才 True（无 py7zr 时弹了也没用）；
+        * tar.xz 缺 xz 编解码器：False（内置引擎同样产不出）；
+        * 带密码的 ZIP：内置 zipfile 对加密是 fail-closed 拒绝（archives.py
+          ``PasswordRequired``），GPG 加密引擎尚未实现——两者重试必然再失败。
+        探测异常时保守返回 False（宁可不弹，也不制造无效重试）。
+        """
+        opts = task.options
+        if opts.password and (opts.fmt == "zip" or (opts.encrypt_mode or "") == "gpg"):
+            return False
+        try:
+            from ..capabilities import format_capabilities
+
+            entry = format_capabilities(force=True).get(opts.fmt)
+            if not entry or not entry.get("available", False):
+                return False
+            if opts.password:
+                pw = (entry.get("password") or {}).get(opts.encrypt_mode or "")
+                # 未声明的加密方式（如 zip 的非 ASCII 密码限制）= 内置引擎同样无解
+                return bool(pw and pw.get("available", False))
+            return True
+        except Exception:
+            log.debug("内置引擎能力判定失败", exc_info=True)
+            return False
+
     def _maybe_offer_force_retry(self, result) -> None:  # noqa: ANN001
-        task = self.state.get(result.record.task_id)
+        tid = result.record.task_id
+        if tid in self._force_offered:
+            # 一次性 guard：本会话已问过就不再问，彻底断掉弹窗循环
+            return
+        task = self.state.get(tid)
         if task is None or result.record.status != "failure" or task.options.force:
             return
-        errors = "".join(result.record.errors or [result.message])
-        hint = ("7-Zip" in errors or "cannot open" in errors or "拒绝访问" in errors
-                or "未能生成" in errors or "有效压缩包" in errors)
-        if not hint:
+        if self._forced_this_run(result):
+            # 强制重试的结果本身又失败：不再第二次询问
+            self._force_offered.add(tid)
             return
+        errors = "\n".join(str(x) for x in (result.record.errors or [result.message]))
+        low = errors.lower()
+        # 密码/参数/格式类错误：内置引擎同样做不到（或错误与引擎无关），不弹
+        if any(k in low for k in _FORCE_RETRY_EXCLUDES):
+            return
+        # 7-Zip 通用失败（退出码 2 + System ERROR）里没有权限字样时，
+        # 多半是密码编码/参数问题——强制重试无益（审查 W-A7-1 的 M2 场景）
+        if "system error" in low and "拒绝访问" not in errors and "access is denied" not in low:
+            return
+        if not any(k in low for k in _FORCE_RETRY_HINTS):
+            return
+        if not self._builtin_can_do_it(task):
+            # 判定为「内置引擎也办不到」：记住结论，避免定时任务反复触发时重复探测
+            self._force_offered.add(tid)
+            return
+        self._force_offered.add(tid)  # 弹窗前置位：模态期间的再次完成信号也不会重复问
         ret = QMessageBox.question(
             self,
             "压缩程序无法写入",
@@ -540,6 +632,8 @@ class TasksPage(QWidget):
             updated = dlg.result_task()
             if updated is not None:
                 self.state.save_task(updated)
+                # 用户改了配置（格式/密码/强制等），旧的「内置引擎办不到」结论已失效
+                self._force_offered.discard(updated.id)
                 self._show_task(updated.id)
 
     def duplicate_current(self) -> None:
@@ -568,6 +662,7 @@ class TasksPage(QWidget):
         )
         if ret == QMessageBox.StandardButton.Yes:
             self.state.delete_task(tid)
+            self._force_offered.discard(tid)  # 任务消失，guard 不留残留
             self._current_id = ""
             self.refresh()
 
@@ -584,6 +679,10 @@ class TasksPage(QWidget):
         if not self.state.run_task(tid, trigger="manual"):
             QMessageBox.information(self, "提示", "该任务正在运行中。")
             return
+        # 用户主动点的「立即备份」：允许重新询问一次内置引擎重试。
+        # 注意只能在这条按钮路径上重置——force_retry 走的是 state.run_task，
+        # 若在 _on_run_started 里重置，强制重试失败后会立刻再弹（W-A7-1 的循环）。
+        self._force_offered.discard(tid)
         self._on_run_started(tid)
 
     def stop_current(self) -> None:
