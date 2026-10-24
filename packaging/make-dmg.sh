@@ -23,7 +23,8 @@ APP="$ROOT/dist/BackupStudio.app"
 # B7：产物名必须带架构后缀 —— 否则 arm64 与 x64 两个 job 都产出
 # `BackupStudio-<version>.dmg`，release job 用 `merge-multiple: true` 下载
 # 到同一目录时后到的会覆盖先到的，用户只能拿到其中一种架构。
-ARCH="$(uname -m)"
+# 注意：这里**不要**再写 `ARCH="$(uname -m)"` —— 那会覆盖上面 case 的归一化，
+# 让 Intel 机器产出 `-x86_64.dmg` 而非文档承诺的 `-x64.dmg`。
 DMG="$ROOT/dist/BackupStudio-${VERSION}-${ARCH}.dmg"
 STAGE="$ROOT/build/dmg-stage"
 
