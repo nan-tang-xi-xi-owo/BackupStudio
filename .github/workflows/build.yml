@@ -161,11 +161,11 @@ jobs:
           }
           "py.typed OK"
 
-                    # R-fix4 门禁③：真跑一次备份（不是只看 --version）。
-          # 要点（CI run #30 踩过的坑）：
-          #   1) windowed exe 的 $LASTEXITCODE 不可靠（本机实测为空），改用**产物断言**判成败；
-          #   2) 路径一律用 Join-Path 生成绝对路径，避免 $PWD 拼接混用斜杠；
-          #   3) 先建目录、再赋 env，确保子进程能看到。
+                              # R-fix4 门禁③：真跑一次备份（不是只看 --version）。
+          # 两个关键坑（都会被 CI 放大成本地看不出的失败）：
+          #   1) `--windowed` 打包的 exe 属于 GUI 子系统，PowerShell 用 `&` 调用**不等待**
+          #      → 断言时文件还没写出来。必须用 Start-Process -Wait -PassThru。
+          #   2) windowed exe 的 $LASTEXITCODE 不可靠，改用 Start-Process 返回的 ExitCode。
           $work = (Get-Location).Path
           $cfgD = Join-Path $work "smoke-cfg"
           $srcD = Join-Path $work "smoke-src"
@@ -174,27 +174,39 @@ jobs:
           New-Item -ItemType Directory -Force $cfgD, $srcD, $dstD | Out-Null
           Set-Content (Join-Path $srcD "hello.txt") "windows smoke"
           $env:BACKUPSTUDIO_CONFIG_DIR = $cfgD
+          $exePath = Join-Path $work "dist\BackupStudio\BackupStudio.exe"
           "配置目录：$env:BACKUPSTUDIO_CONFIG_DIR"
           "输入目录：$srcD"
           "输出目录：$dstD"
 
-          ./dist/BackupStudio/BackupStudio.exe task add --name smoke --source $srcD --dest $dstD --format zip
+          function Invoke-Cli {
+            param([string[]]$Arguments)
+            $p = Start-Process -FilePath $exePath -ArgumentList $Arguments -Wait -PassThru -NoNewWindow `
+                 -RedirectStandardOutput "$work\cli-out.txt" -RedirectStandardError "$work\cli-err.txt"
+            $stdout = if (Test-Path "$work\cli-out.txt") { Get-Content "$work\cli-out.txt" -Raw } else { "" }
+            $stderr = if (Test-Path "$work\cli-err.txt") { Get-Content "$work\cli-err.txt" -Raw } else { "" }
+            if ($stdout) { $stdout.TrimEnd() }
+            if ($stderr) { $stderr.TrimEnd() }
+            return $p.ExitCode
+          }
+
+          $rc = Invoke-Cli @("task", "add", "--name", "smoke", "--source", $srcD, "--dest", $dstD, "--format", "zip")
+          "task add 退出码：$rc"
           $tasksFile = Join-Path $cfgD "tasks.json"
           if (-not (Test-Path $tasksFile)) {
             "配置目录内容："
             Get-ChildItem $cfgD -Recurse -ErrorAction SilentlyContinue | ForEach-Object { "  " + $_.FullName }
-            throw "task add 未写入 tasks.json：$tasksFile"
+            throw "task add 未写入 tasks.json：$tasksFile（rc=$rc）"
           }
           "tasks.json 已写入：" + (Get-Item $tasksFile).Length + " B"
 
-          ./dist/BackupStudio/BackupStudio.exe run --all
+          $rc2 = Invoke-Cli @("run", "--all")
+          "run --all 退出码：$rc2"
           $zip = @(Get-ChildItem $dstD -Filter *.zip -ErrorAction SilentlyContinue)
           if ($zip.Count -lt 1) {
             "输出目录内容："
             Get-ChildItem $dstD -ErrorAction SilentlyContinue | ForEach-Object { "  " + $_.Name }
-            "配置目录内容："
-            Get-ChildItem $cfgD -Recurse -ErrorAction SilentlyContinue | ForEach-Object { "  " + $_.FullName }
-            throw "备份未产出 zip：$dstD"
+            throw "备份未产出 zip：$dstD（rc=$rc2）"
           }
           "真跑备份 OK：" + $zip[0].Name + " (" + $zip[0].Length + " B)"
       - uses: actions/upload-artifact@v4
