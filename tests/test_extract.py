@@ -1,4 +1,4 @@
-"""extract.py 加固回归（审查 R6-A5 / T8 / R1-N7）。"""
+﻿"""extract.py 加固回归（审查 R6-A5 / T8 / R1-N7）。"""
 
 from __future__ import annotations
 
@@ -206,6 +206,174 @@ class TestBombGuardDoesNotSelfHarm:
         monkeypatch.delenv(ex.ENV_MAX_UNPACKED_BYTES)
         ok2, msg2 = ex.extract_archive(arc, tmp_path / "ok7z")
         assert ok2, f"正常 7z 被误拦：{msg2}"
+
+
+class TestRarBombPrecheck:
+    """P1 回归：rar 预检此前形同虚设（用 7z 的 ``-slt``/``-ba`` 参数去打 UnRAR）。
+
+    UnRAR 不认 ``-slt``/``-ba``，返回非 0 且输出 ``Unknown option: ba`` →
+    ``_declared_unpacked_7z`` 返回 None → ``_check_external_bomb`` 静默放行。
+    """
+
+    def test_declared_unpacked_unrar_parses_lt(self, tmp_path):
+        """``_declared_unpacked_unrar`` 必须能从 ``unrar lt`` 读出真实大小。"""
+        from backupstudio import extract as ex
+        from backupstudio.tools import find_rar, find_unrar
+
+        unrar, rar = find_unrar(), find_rar()
+        if not unrar or not rar:
+            pytest.skip("本机无 UnRAR/Rar")
+
+        payload = tmp_path / "zeros.bin"
+        payload.write_bytes(b"\x00" * (2 * 1024 * 1024))
+        arc = tmp_path / "t.rar"
+        r = subprocess.run([rar, "a", "-idq", "-m3", "-y", str(arc), str(payload)],
+                           capture_output=True, stdin=subprocess.DEVNULL, timeout=300)
+        if r.returncode != 0 or not arc.exists():
+            pytest.skip(f"本机 Rar 无法建包：{(r.stdout or b'')[-160:]!r}")
+
+        # 旧函数（7z 参数）读不出来 —— 证明"形同虚设"的根因
+        assert ex._declared_unpacked_7z(unrar, arc, None) is None
+        # 新函数能读
+        got = ex._declared_unpacked_unrar(unrar, arc, None)
+        assert got == 2 * 1024 * 1024, f"应读出 2 MiB，实际 {got}"
+
+    def test_rar_bomb_is_blocked(self, tmp_path, monkeypatch):
+        """上限压到 1 MiB 时 rar 炸弹必须被拒。"""
+        from backupstudio import extract as ex
+        from backupstudio.extract import extract_archive
+        from backupstudio.tools import find_rar, find_unrar
+
+        unrar, rar = find_unrar(), find_rar()
+        if not unrar or not rar:
+            pytest.skip("本机无 UnRAR/Rar")
+
+        payload = tmp_path / "zeros.bin"
+        payload.write_bytes(b"\x00" * (4 * 1024 * 1024))
+        arc = tmp_path / "bomb.rar"
+        r = subprocess.run([rar, "a", "-idq", "-m3", "-y", str(arc), str(payload)],
+                           capture_output=True, stdin=subprocess.DEVNULL, timeout=300)
+        if r.returncode != 0 or not arc.exists():
+            pytest.skip(f"本机 Rar 无法建包：{(r.stdout or b'')[-160:]!r}")
+
+        monkeypatch.setenv(ex.ENV_MAX_UNPACKED_BYTES, str(1024 * 1024))
+        ok, msg = extract_archive(arc, tmp_path / "blocked")
+        assert ok is False, f"rar 炸弹未被拦：{msg}"
+        assert "炸弹" in msg or "超过上限" in msg, msg
+
+        # 放宽后必须能解（证明不是"一律拒绝"）
+        monkeypatch.delenv(ex.ENV_MAX_UNPACKED_BYTES)
+        ok2, msg2 = extract_archive(arc, tmp_path / "ok")
+        assert ok2, f"普通 rar 被误拦：{msg2}"
+        got = list((tmp_path / "ok").rglob("*.bin"))
+        assert got and got[0].stat().st_size == 4 * 1024 * 1024
+
+    def test_unreadable_precheck_refuses_instead_of_passing(self, tmp_path):
+        """预检读不出来时**拒绝放行**（旧实现静默 return 放行 = 防护形同虚设）。"""
+        from backupstudio import extract as ex
+
+        arc = tmp_path / "x.rar"
+        arc.write_bytes(b"Rar!\x1a\x07\x00" + b"\x00" * 100)
+        with pytest.raises(ex.ExtractionError) as ei:
+            ex._check_external_bomb(str(tmp_path / "no-such-unrar.exe"), arc, None, unrar=True)
+        assert "无法预读" in str(ei.value), str(ei.value)
+
+
+class TestUnprotectedPaths:
+    """P1 回归：两条零防护的外部解压路径（AES 加密 ZIP / tar.zst 7z 回退）。"""
+
+    def test_encrypted_zip_bomb_blocked(self, tmp_path, monkeypatch):
+        """AES 加密 ZIP 炸弹：``_extract_zip`` 的 password→7z 分支此前完全不检查。"""
+        from backupstudio import extract as ex
+        from backupstudio.extract import extract_archive
+        from backupstudio.tools import find_7z
+
+        seven = find_7z()
+        if not seven:
+            pytest.skip("本机无 7-Zip")
+
+        payload = tmp_path / "zeros.bin"
+        payload.write_bytes(b"\x00" * (8 * 1024 * 1024))
+        arc = tmp_path / "bomb-enc.zip"
+        r = subprocess.run(
+            [seven, "a", "-tzip", "-ppw", "-mem=AES256", "-mx9", str(arc), str(payload)],
+            capture_output=True, stdin=subprocess.DEVNULL, timeout=300,
+        )
+        if r.returncode != 0 or not arc.exists():
+            pytest.skip(f"本机 7-Zip 无法建加密包：{(r.stdout or b'')[-160:]!r}")
+
+        monkeypatch.setenv(ex.ENV_MAX_UNPACKED_BYTES, str(1024 * 1024))
+        ok, msg = extract_archive(arc, tmp_path / "blocked", password="pw")
+        assert ok is False, f"加密 ZIP 炸弹未被拦：{msg}"
+        wrote = sum(f.stat().st_size for f in (tmp_path / "blocked").rglob("*") if f.is_file())
+        assert wrote == 0, f"炸弹被拦前已写入 {wrote} 字节"
+
+        monkeypatch.delenv(ex.ENV_MAX_UNPACKED_BYTES)
+        ok2, msg2 = extract_archive(arc, tmp_path / "ok", password="pw")
+        assert ok2, f"放宽后加密 ZIP 应能解：{msg2}"
+
+    def test_tar_zst_bomb_blocked(self, tmp_path, monkeypatch):
+        """tar.zst 炸弹：7z 回退路径此前完全不检查（且 7z 读不出内层大小）。"""
+        import io
+        import tarfile
+
+        zstandard = pytest.importorskip("zstandard")
+        from backupstudio import extract as ex
+
+        payload = tmp_path / "zeros.bin"
+        payload.write_bytes(b"\x00" * (8 * 1024 * 1024))
+        tar_path = tmp_path / "bomb.tar"
+        with tarfile.open(tar_path, "w") as tf:
+            data = payload.read_bytes()
+            ti = tarfile.TarInfo("zeros.bin")
+            ti.size = len(data)
+            tf.addfile(ti, io.BytesIO(data))
+        arc = tmp_path / "bomb.tar.zst"
+        with open(tar_path, "rb") as src, open(arc, "wb") as dst:
+            zstandard.ZstdCompressor(level=9).copy_stream(src, dst)
+
+        monkeypatch.setenv(ex.ENV_MAX_UNPACKED_BYTES, str(1024 * 1024))
+        ok, msg = ex.extract_archive(arc, tmp_path / "blocked")
+        assert ok is False, f"tar.zst 炸弹未被拦：{msg}"
+        wrote = sum(f.stat().st_size for f in (tmp_path / "blocked").rglob("*") if f.is_file())
+        assert wrote == 0, f"炸弹被拦前已写入 {wrote} 字节"
+
+        monkeypatch.delenv(ex.ENV_MAX_UNPACKED_BYTES)
+        ok2, msg2 = ex.extract_archive(arc, tmp_path / "ok")
+        assert ok2, f"放宽后 tar.zst 应能解：{msg2}"
+        got = list((tmp_path / "ok").rglob("*.bin"))
+        assert got and got[0].stat().st_size == 8 * 1024 * 1024
+
+    def test_tar_zst_sevenzip_fallback_bomb_blocked(self, tmp_path, monkeypatch):
+        """把 zstandard 摘掉 → 强制走 7z ``e -so`` 流式回退，同样必须被拦。"""
+        import io
+        import tarfile
+
+        zstandard = pytest.importorskip("zstandard")
+        from backupstudio import extract as ex
+
+        payload = tmp_path / "zeros.bin"
+        payload.write_bytes(b"\x00" * (8 * 1024 * 1024))
+        tar_path = tmp_path / "bomb.tar"
+        with tarfile.open(tar_path, "w") as tf:
+            data = payload.read_bytes()
+            ti = tarfile.TarInfo("zeros.bin")
+            ti.size = len(data)
+            tf.addfile(ti, io.BytesIO(data))
+        arc = tmp_path / "bomb.tar.zst"
+        with open(tar_path, "rb") as src, open(arc, "wb") as dst:
+            zstandard.ZstdCompressor(level=9).copy_stream(src, dst)
+
+        saved = sys.modules.pop("zstandard", None)
+        try:
+            monkeypatch.setenv(ex.ENV_MAX_UNPACKED_BYTES, str(1024 * 1024))
+            ok, msg = ex.extract_archive(arc, tmp_path / "blocked")
+            assert ok is False, f"7z 回退路径炸弹未被拦：{msg}"
+            wrote = sum(f.stat().st_size for f in (tmp_path / "blocked").rglob("*") if f.is_file())
+            assert wrote == 0, f"炸弹被拦前已写入 {wrote} 字节"
+        finally:
+            if saved is not None:
+                sys.modules["zstandard"] = saved
 
 
 class TestBuiltinZipActuallyCompresses:
