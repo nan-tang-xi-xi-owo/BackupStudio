@@ -148,6 +148,10 @@ class VolumeInfo:
 class ArchiveResult:
     path: Path
     fmt: str
+    # 产物**真实容器格式**。通常等于 ``fmt``，但强制模式降级时可能不同：
+    # 用户选 RAR 而无 RAR 引擎 → 产物是 ZIP 容器（扩展名仍是 .rar）。
+    # 校验/解压必须按真实容器走，否则 `unrar t` 打 ZIP 会报退出码 13。
+    container_fmt: str = ""
     volumes: list[VolumeInfo] = field(default_factory=list)
     files: int = 0
     dirs: int = 0
@@ -724,6 +728,9 @@ class ExternalCompressor:
     """所有依赖外部可执行文件的压缩后端基类。"""
 
     def __init__(self, dest_path: Path, spec: ArchiveSpec, progress: Progress) -> None:
+        # 统一解析成绝对路径：本类会把子进程 cwd 切到别处（见 _popen/_pack_from），
+        # 相对路径在子进程里会指向错误位置（审查 D：产物被写进 src_dir 内部）。
+        dest_path = Path(dest_path).resolve()
         self.dest = dest_path
         self.spec = spec
         self.progress = progress
@@ -804,9 +811,16 @@ class ExternalCompressor:
         return unpacked
 
     def _pack_from(self, src_dir: Path, out_path: Path, *, extra_args: list[str] | None = None) -> None:
-        """从解包目录打包到 out_path（cwd=源目录保证归档内路径与 arcname 一致）。"""
+        """从解包目录打包到 out_path（cwd=源目录保证归档内路径与 arcname 一致）。
+
+        **必须 resolve()**：这里把 ``cwd`` 设成 ``src_dir``，7z 会以该 cwd 解析相对路径。
+        若 ``out_path`` 是相对路径，产物会写进 ``src_dir`` **内部**，随后 ``_commit()``
+        在最终路径上找不到文件 → 抛 CompressionError → 上层 ``force`` 回退到内置引擎，
+        但记录里的 ``backend`` 仍写 ``7z:7za.exe``（账实不符，审查 D）。
+        """
         if self._cancel is not None and self._cancel():
             raise ArchiveCancelled()
+        out_path = Path(out_path).resolve()
         argv = [self.exe, "a", *self._args(), *(extra_args or []), str(out_path), "."]
         self._run(argv, cwd=src_dir)
 
@@ -1369,6 +1383,20 @@ def create_archive(
     fallback_notes: list[str] = []
     factory = choice.factory
 
+    def _sniff_container(path: Path) -> str:
+        """按文件头判断真实容器（ZIP 是 ``PK\\x03\\x04`` / ``PK\\x05\\x06``）。
+
+        只用于 ZIP 判定；非 ZIP 的交给 ``fmt`` 本身。
+        这样 ``.rar`` 扩展名 + ZIP 内容（强制降级）也能被正确识别，
+        校验就不会拿 ``unrar t`` 去打一个 ZIP（那必然报退出码 13）。
+        """
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(4)
+        except OSError:
+            return ""
+        return "zip" if head[:2] == b"PK" else ""
+
     def _fallback(exc: BaseException, mode_value: str | None):
         """强制模式下外部程序失败：换内置引擎（返回新的 backend）。
 
@@ -1521,6 +1549,10 @@ def create_archive(
         for w in getattr(backend, "warnings", []):
             if w not in result.notes:
                 result.notes.append(w)
+        # 真实容器格式以**产物字节**为准（最可靠的账实相符）：强制模式可能把 RAR
+        # 请求降级成 ZIP 容器（rar-as-zip-forced / rar-as-zipfile-forced），而前者的
+        # backend.name 仍是 "7z:7za.exe"，靠名字区分不出来；嗅探 magic 一定对。
+        result.container_fmt = _sniff_container(result.path) or fmt
         result.skipped = 0
         result.elapsed = time.monotonic() - started
         progress.describe("done")

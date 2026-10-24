@@ -816,8 +816,12 @@ class TaskEngine:
             record.errors = problems
             return self._finish_early(record, task, started, "；".join(problems))
 
-        dest_dir = Path(task.destination)
+        # 备份目录解析成绝对路径（审查 D）：dest 在下文的 `cwd=src_dir` 子进程里会被
+        # 重新解释成 src_dir 内部的相对位置，产物与 record.archive 就此分叉。
+        dest_dir = Path(task.destination).resolve()
         main_path = archive_path(task)
+        if not main_path.is_absolute():
+            main_path = dest_dir / main_path.name
         # 同秒重名：追加序号
         counter = 1
         base_main = main_path
@@ -949,18 +953,22 @@ class TaskEngine:
         _write_manifest_stage(task, record, result, _manifest_stem, "committing")
 
         # 6. 校验（三态：passed / failed / skipped——skipped 绝不当成 passed）
+        # 按**真实容器格式**校验：强制模式下 RAR 请求可能降级成 ZIP 容器
+        # （见 create_archive 的 container_fmt），此时用 unrar t 打 ZIP 必然报
+        # "退出码 13"，把好好的备份误判成损坏（也是"账实相符"的一部分）。
+        verify_fmt = getattr(result, "container_fmt", "") or record.format
         if task.verify:
             if len(result.volumes) > 1:
                 progress.describe("verify")
-                ok, msg = _verify_volumes(result.volumes, record.format, opts.password or None)
+                ok, msg = _verify_volumes(result.volumes, verify_fmt, opts.password or None)
                 record.verification = "passed" if ok is True else ("failed" if ok is False else "skipped")
                 record.verification_message = msg
                 record.extracted_text = "\n".join(v.path.name for v in result.volumes[:12])
             else:
                 progress.describe("verify")
-                ok, msg = verify_archive(result.path, record.format, opts.password or None)
+                ok, msg = verify_archive(result.path, verify_fmt, opts.password or None)
                 record.verification = "passed" if ok is True else ("failed" if ok is False else "skipped")
-                record.extracted_text = _extract_text_sample(result.path, record.format) if ok is True else ""
+                record.extracted_text = _extract_text_sample(result.path, verify_fmt) if ok is True else ""
                 record.verification_message = msg
             if record.verification == "failed":
                 record.status = "failure"

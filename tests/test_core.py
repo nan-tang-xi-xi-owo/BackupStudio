@@ -1,4 +1,4 @@
-"""pytest 用例：调度、配置、引擎、压缩后端（不依赖 GUI）。"""
+﻿"""pytest 用例：调度、配置、引擎、压缩后端（不依赖 GUI）。"""
 
 from __future__ import annotations
 
@@ -436,3 +436,30 @@ class TestTesterFindings:
             if p.name not in ("last-run.json", ".backupstudio")
         ] if dest.exists() else []
         assert not leftovers, leftovers
+
+    def test_forced_rar_fallback_verifies_as_zip_container(self, sample_tree, tmp_path, tmp_config):
+        """强制 RAR 降级产物是 **ZIP 容器**（扩展名 .rar），校验必须按真实容器走。
+
+        背景：``find_unrar()`` 修好之后（此前它找不到随包的 ``tools/win32/rar/UnRAR.exe``），
+        校验会拿 ``unrar t`` 去打这个 ZIP 文件 → "RAR 测试失败（退出码 13）"，
+        把好好的备份判成损坏。``ArchiveResult.container_fmt`` 负责账实相符。
+        """
+        from backupstudio.archives import rar_available
+        from backupstudio.engine import TaskEngine
+
+        if rar_available():
+            pytest.skip("本机 RAR 可创建压缩包（走原生路径，不涉及降级）")
+
+        dest = tmp_path / "rarzip"
+        result = TaskEngine().run(_make_task("rar", dest, sample_tree, force=True))
+        rec = result.record
+        assert rec.status == "success", rec.errors
+        assert rec.verification == "passed", rec.verification_message
+
+        # 产物确实是 ZIP 容器（magic PK），但扩展名保持 .rar
+        arc = Path(rec.archive)
+        assert arc.suffix.lower() == ".rar", arc
+        assert arc.read_bytes()[:2] == b"PK", "强制 RAR 降级应产出 ZIP 容器"
+        # 真实容器格式如实记录
+        assert result.result is not None
+        assert result.result.container_fmt == "zip", result.result.container_fmt
