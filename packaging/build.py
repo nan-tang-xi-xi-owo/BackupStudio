@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import shutil
 import subprocess
@@ -28,6 +29,24 @@ ROOT = Path(__file__).resolve().parent.parent
 DIST = ROOT / "dist"
 BUILD = ROOT / "build" / "pyinstaller"
 APP_NAME = "BackupStudio"
+
+# Windows 控制台默认 GBK：脚本里的 ✓/✗ 等符号会直接抛 UnicodeEncodeError
+# 把构建打成"失败"（CI 实测）。统一改为 UTF-8 + 容错替换。
+for _stream in (sys.stdout, sys.stderr):
+    with contextlib.suppress(Exception):
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+
+
+def _project_version() -> str:
+    """读取版本号（不 import 包：本脚本运行时 sys.path 不含项目根）。"""
+    import re
+
+    try:
+        text = (ROOT / "backupstudio" / "__init__.py").read_text(encoding="utf-8")
+    except OSError:
+        return "unknown"
+    m = re.search(r'__version__\s*=\s*"([^"]+)"', text)
+    return m.group(1) if m else "unknown"
 
 
 def _tool_dir() -> Path | None:
@@ -163,7 +182,7 @@ def _post_build() -> None:
     readme = target / "README.md"
     if readme.exists():
         (target / "使用说明.txt").write_text(
-            "BackupStudio 备份工坊 1.0.0\n\n"
+            f"BackupStudio 备份工坊 {_project_version()}\n\n"
             "1. 双击 BackupStudio.exe 启动，右下角托盘会出现图标。\n"
             "2. 点「新建任务」选择要备份的文件夹、备份位置、压缩格式（可选密码/分卷）。\n"
             "3. 「计划与保留」里设置自动备份时间，并可自动清理旧备份。\n"

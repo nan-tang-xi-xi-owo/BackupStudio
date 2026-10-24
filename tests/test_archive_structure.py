@@ -105,3 +105,43 @@ class TestArchiveStructure:
             and (".bs-tmp-" in p.name or "bs-stage-" in p.name or "bs-py7zr-" in p.name)
         ]
         assert not leftovers, leftovers
+
+    def test_tar_open_failure_does_not_corrupt_stream(self, sample_tree, tmp_path):
+        """tar 错位回归（审查 E1-1.4）：一个文件 open 失败不得弄坏整个归档。
+
+        旧实现先写头（声明 size）再在生成器里 open 文件——open 失败时流里
+        留着一个"永远没有数据"的头，后续所有条目错位不可读（实测复现：
+        失败条目之后的成员全部消失）。修复后（先 open 后写头 + fstat）
+        该文件只是被记入 errors，其余条目完好。
+
+        用目录制造"stat 成功、open 失败"：旧顺序会写出头再炸，新顺序在
+        写头之前就炸——两种顺序在断言上完全可区分。
+        """
+        import tarfile
+
+        from backupstudio.archives import ArchiveSpec, Progress, TarStreamCompressor
+
+        good1 = tmp_path / "1.bin"
+        good1.write_bytes(b"A" * 4096)
+        bad_dir = tmp_path / "2bad"  # 目录：stat 成功、open 抛 OSError
+        bad_dir.mkdir()
+        good3 = tmp_path / "3.bin"
+        good3.write_bytes(b"C" * 4096)
+        out = tmp_path / "out.tar"
+
+        spec = ArchiveSpec(dest_path=out, fmt="tar")
+        comp = TarStreamCompressor(out, spec, Progress())
+        comp.add_file(good1, "1.bin")
+        try:
+            comp.add_file(bad_dir, "2bad")
+            raise AssertionError("目录作为文件打包应当抛 OSError")
+        except OSError:
+            pass  # 调用方（create_archive）会捕获并记为条目错误
+        comp.add_file(good3, "3.bin")
+        comp.close()
+
+        with tarfile.open(out) as tf:
+            names = tf.getnames()
+            assert names == ["1.bin", "3.bin"], f"tar 流错位：{names}"
+            with tf.extractfile("3.bin") as fh:
+                assert fh.read() == b"C" * 4096, "3.bin 内容损坏（流错位）"

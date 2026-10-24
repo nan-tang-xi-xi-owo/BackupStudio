@@ -15,6 +15,13 @@ APPDIR="$ROOT/build/AppDir"
 TOOLS="$ROOT/build/appimage-tools"
 OUT="$ROOT/dist/BackupStudio-${VERSION}-${ARCH}.AppImage"
 
+# ---------------------------------------------------------------- 版本锁定
+# 审查 R-5：原先固定取 releases/download/continuous（每天漂移），同一个
+# commit 在不同日子会打出不同 AppImage。现锁定到 release tag，可用环境变量
+# APPIMAGETOOL_VERSION 覆盖。
+APPIMAGETOOL_VERSION="${APPIMAGETOOL_VERSION:-1.9.1}"
+APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-${ARCH}.AppImage"
+
 echo "==> 打包 $VERSION ($ARCH)"
 
 if [[ ! -d "$ROOT/dist/BackupStudio" ]]; then
@@ -46,11 +53,16 @@ cp "$ROOT/packaging/icon.png" "$APPDIR/.DirIcon"
 # ---------------------------------------------------------------- appimagetool
 mkdir -p "$TOOLS"
 if [[ ! -x "$TOOLS/appimagetool" ]]; then
-  echo "==> 下载 appimagetool"
-  curl -L --fail -o "$TOOLS/appimagetool" \
-    "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${ARCH}.AppImage"
+  echo "==> 下载 appimagetool ${APPIMAGETOOL_VERSION}"
+  curl -L --fail --retry 3 --retry-delay 2 -o "$TOOLS/appimagetool" "$APPIMAGETOOL_URL"
   chmod +x "$TOOLS/appimagetool"
 fi
+
+# 校验：下载/缓存命中后都跑一次 --version，既证明二进制可执行，
+# 也把实际版本打进日志（trace 用）。注意 release 产物自报的是 git hash
+# 而非 tag（"appimagetool, 1-alpha (git version <hash>)"），因此这里不做
+# 字符串断言；锁定效果来自上面的 URL。
+"$TOOLS/appimagetool" --version
 
 echo "==> 生成 AppImage"
 ARCH="$ARCH" APPIMAGE_EXTRACT_AND_RUN=1 "$TOOLS/appimagetool" --no-appstream "$APPDIR" "$OUT"

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 在 macOS 上打包：生成 dist/BackupStudio.app 以及 dmgs/BackupStudio-<version>.dmg
+# 在 macOS 上打包：生成 dist/BackupStudio.app 以及 dist/BackupStudio-<version>-<arch>.dmg
+# 其中 <arch> 由 uname -m 归一化而来：arm64 / x64
 #
 # 前置：
 #   - 已执行 python packaging/build.py（生成 dist/BackupStudio.app）
@@ -12,8 +13,14 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="$("${PYTHON:-python3}" -c 'import sys; sys.path.insert(0, "'"$ROOT"'"); import backupstudio; print(backupstudio.__version__)')"
+# 架构后缀：arm64/aarch64 → arm64，x86_64 → x64（保证两个 macOS job 的产物不重名）
+ARCH="$(uname -m)"
+case "$ARCH" in
+  arm64|aarch64) ARCH=arm64 ;;
+  x86_64) ARCH=x64 ;;
+esac
 APP="$ROOT/dist/BackupStudio.app"
-DMG="$ROOT/dist/BackupStudio-${VERSION}.dmg"
+DMG="$ROOT/dist/BackupStudio-${VERSION}-${ARCH}.dmg"
 STAGE="$ROOT/build/dmg-stage"
 
 if [[ ! -d "$APP" ]]; then
@@ -47,7 +54,17 @@ BackupStudio（备份工坊）
 EOF
 
 echo "==> 生成 DMG"
-hdiutil create -volname "BackupStudio" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+# hdiutil 偶发 "Resource busy"：多为残留挂载点或 Spotlight 索引占用。
+# 先卸载与本卷同名的残留挂载，失败则退避重试（CI 上实测出现过一次）。
+for _ in 1 2 3; do
+  if hdiutil create -volname "BackupStudio" -srcfolder "$STAGE" -ov -format UDZO "$DMG"; then
+    break
+  fi
+  echo "==> hdiutil 失败，清理残留挂载后重试（第 $_ 次）" >&2
+  hdiutil detach "/Volumes/BackupStudio" -force 2>/dev/null || true
+  sleep 3
+done
+[[ -f "$DMG" ]] || { echo "DMG 创建失败：$DMG" >&2; exit 1; }
 
 if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
   codesign --force --timestamp --sign "$CODESIGN_IDENTITY" "$DMG"

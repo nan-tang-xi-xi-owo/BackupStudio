@@ -289,14 +289,90 @@ class TestEngine:
 
         dest = tmp_path / "ret"
         engine = TaskEngine()
+        # 必须复用**同一个 task 对象（同一个 task.id）**连跑：这才是"同一任务保留最新
+        # N 份"的产品语义（任务存在 tasks.json 里，id 固定）。
+        # 反例：每轮 _make_task(...) 新建对象 → id 是 default_factory=_new_id，每轮都不同；
+        # M10 修复后保留策略按 task_id 认领备份组，不同 id 之间不得互相淘汰
+        # （否则 A 任务的 keep_last 会删掉 B 任务的包 = 数据丢失）。
+        # 用不同 id 构造本用例，测到的是"跨任务互删"这一 bug 行为，而非单任务保留。
+        task = _make_task("zip", dest, sample_tree, force=True)
+        task.retention = RetentionPolicy(enabled=True, keep_last=2)
+        # 让文件名模板含秒，避免重名
+        task.options.filename_template = "{name}_{datetime}"
         for _ in range(4):
-            task = _make_task("zip", dest, sample_tree, force=True)
-            task.retention = RetentionPolicy(enabled=True, keep_last=2)
-            # 让文件名模板含秒，避免重名
-            task.options.filename_template = "{name}_{datetime}"
-            engine.run(task)
+            result = engine.run(task)
+            assert result.record.status == "success", result.record.errors
             time.sleep(1.05)
-        assert len(list(dest.glob("*.zip"))) == 2
+        zips = sorted(dest.glob("*.zip"))
+        assert len(zips) == 2, zips
+        # 淘汰的是最旧两轮：留下的文件名应排在最后
+        assert zips[-1].stat().st_mtime >= zips[-2].stat().st_mtime
+
+    def test_retention_isolated_across_tasks(self, sample_tree, tmp_path, tmp_config):
+        """M10 回归锁（数据丢失级）：不同任务共享同一备份目录时，保留策略互不越界。
+
+        真实场景：任务 A/B/C 都备份到同一个移动硬盘目录，各自 keep_last=2。
+        修复前 find_backup_blobs 不按 task_id 过滤 → 交错跑 6 轮后总共只剩 2 份，
+        B/C 的可用备份被 A 的策略删光。
+        """
+        from backupstudio.config import RetentionPolicy
+        from backupstudio.engine import TaskEngine
+
+        dest = tmp_path / "shared"
+        engine = TaskEngine()
+        names = ("m10a", "m10b", "m10c")
+        tasks = []
+        for name in names:
+            t = _make_task("zip", dest, sample_tree, force=True)
+            t.name = name
+            t.options.filename_template = "{name}_{datetime}"
+            t.retention = RetentionPolicy(enabled=True, keep_last=2)
+            tasks.append(t)
+        # 交错跑两轮（6 次备份）
+        for _round in range(2):
+            for t in tasks:
+                assert engine.run(t).record.status == "success"
+                time.sleep(1.05)
+        remaining = sorted(p.name for p in dest.glob("*.zip"))
+        by_task = {n: [p for p in remaining if p.startswith(n + "_")] for n in names}
+        # 每个任务各留 2 份（共 6 份）：谁也没被别的任务删掉，也没多留
+        assert all(len(v) == 2 for v in by_task.values()), by_task
+
+    def test_retention_skipped_when_verification_fails(self, sample_tree, tmp_path, tmp_config, monkeypatch):
+        """W-A1 回归锁（数据丢失级）：本轮校验失败时**不得**执行保留策略清理。
+
+        修复前坏包会以 protected 身份占住 keep_last 配额，把上一轮已 committed 的
+        好包挤掉——keep_last=1 的用户一次校验失败就丢光最后一份可恢复备份。
+        """
+        from backupstudio.config import RetentionPolicy
+        from backupstudio.engine import TaskEngine
+
+        dest = tmp_path / "wa1"
+        t = _make_task("zip", dest, sample_tree, force=True)
+        t.options.filename_template = "{name}_{datetime}"
+        t.retention = RetentionPolicy(enabled=True, keep_last=1, on_cleanup="delete")
+        eng = TaskEngine()
+
+        # 第一轮：verify=False，产出唯一一份"好包"
+        t.verify = False
+        good = eng.run(t).record.archive
+        assert good and Path(good).exists()
+        good_name = Path(good).name
+        time.sleep(1.05)
+
+        # 第二轮：强制校验失败（模拟压缩包损坏/读不出来）
+        import backupstudio.engine as E
+        monkeypatch.setattr(E, "verify_archive", lambda *a, **k: (False, "模拟损坏"))
+        t.verify = True
+        bad = eng.run(t).record
+        assert bad.status == "failure", (bad.status, bad.errors)
+        assert bad.verification == "failed"
+        assert bad.cleaned == [], f"失败轮次竟然执行了清理：{bad.cleaned}"
+
+        # 上一轮的好包必须还在——这是"最后一份可恢复备份"
+        assert (dest / good_name).exists(), (
+            f"W-A1 复发：校验失败把唯一的好包 {good_name} 挤掉了（剩余 {sorted(p.name for p in dest.glob('*.zip'))}）"
+        )
 
     def test_rar_unavailable_message(self, sample_tree, tmp_path, tmp_config):
         from backupstudio.archives import rar_available
@@ -430,5 +506,323 @@ class TestTesterFindings:
 
         result = engine.run(task, progress_cb=progress, cancel=cancel_cb)
         assert result.record.status == "skipped"
-        leftovers = [p.name for p in dest.glob("*") if p.name != "last-run.json"] if dest.exists() else []
+        # .backupstudio 是锁与清单的合法目录（非半成品残留）
+        leftovers = [
+            p.name for p in dest.glob("*")
+            if p.name not in ("last-run.json", ".backupstudio")
+        ] if dest.exists() else []
         assert not leftovers, leftovers
+
+
+# --------------------------------------------------------------------------
+# P1-B 修复回归（W-A2-2 stem 覆盖 / M11 keep_last 差一 / M23 崩溃残包 / W-A2-4 文案）
+# --------------------------------------------------------------------------
+
+
+class TestP1BStem:
+    """W-A2-2（S1）：manifest 的 stem 必须由后端正向给出，不得从产物名反推。"""
+
+    def test_product_stem_tail_suffix_only(self):
+        """主名推导只做**尾部**卷后缀剥离：任务名含扩展名时 stem = 完整文件名。"""
+        from backupstudio.archives import product_stem
+
+        cases = {
+            # 任务名本身含扩展名（模板 {name}_{datetime}）→ 必须整名唯一，不得截成 "foo.zip"
+            "foo.zip_20261023_042116.zip": "foo.zip_20261023_042116.zip",
+            "notes.tar.gz_20261023_042116.zip": "notes.tar.gz_20261023_042116.zip",
+            "v1.0_20261023.zip": "v1.0_20261023.zip",
+            # 常规整包：stem 就是文件名
+            "Documents_20261023_042116.zip": "Documents_20261023_042116.zip",
+            # 分卷：剥掉**尾部**卷号，主名保留容器扩展名
+            "X.zip.001": "X.zip",
+            "X.7z.012": "X.7z",
+            "X.zip.part01": "X.zip",
+            "X.tar.gz.part02": "X.tar.gz",
+        }
+        assert {k: product_stem(k) for k in cases} == cases
+
+    def test_manifest_one_per_archive_when_task_name_has_extension(self, sample_tree, tmp_path, tmp_config):
+        """复现 W-A2-2 实测场景：任务名 `foo.zip` 连跑 2 次 → 2 个独立 manifest、各 volumes=1。
+
+        修复前：engine 用 `str.find(ext)` 反推主名，命中的是任务名里的第一个 `.zip`
+        → 两轮都写 `foo.zip.json`，第二轮覆盖第一轮（实测：2 产物 1 清单）。
+        """
+        from backupstudio.config import ArchiveOptions, BackupTask, SourceConfig
+        from backupstudio.engine import TaskEngine
+        from backupstudio.manifest import load_manifests
+
+        dest = tmp_path / "stem"
+        task = BackupTask(
+            name="foo.zip",
+            sources=[SourceConfig(path=str(sample_tree))],
+            destination=str(dest),
+            options=ArchiveOptions(fmt="zip", force=True, filename_template="{name}_{datetime}"),
+        )
+        eng = TaskEngine()
+        names = []
+        for _ in range(2):
+            rec = eng.run(task).record
+            assert rec.status == "success", rec.errors
+            names.append(Path(rec.archive).name)
+            time.sleep(1.05)
+        assert len(set(names)) == 2, names
+
+        ms = load_manifests(dest)
+        assert len(ms) == 2, f"manifest 数应为 2（一包一清单），实际 {sorted(ms)}"
+        assert all(len(m.volumes) == 1 for m in ms.values()), [m.volumes for m in ms.values()]
+        # 清单键（stem）等于产物文件名本身——而不是被扩展名截断的任务名
+        assert set(ms) == set(names), f"{sorted(ms)} vs {sorted(names)}"
+        assert sorted(p.name for p in dest.glob("*.zip")) == sorted(names)
+
+    def test_manifest_write_failure_warning_is_actionable(self, sample_tree, tmp_path, tmp_config, monkeypatch):
+        """W-A2-4（S3）：清单写入失败的告警必须说清后果（无清单 → 保留策略不会自动清理）。"""
+        import backupstudio.manifest as MF
+        from backupstudio.config import ArchiveOptions, BackupTask, SourceConfig
+        from backupstudio.engine import TaskEngine
+
+        def boom(*a, **k):
+            raise PermissionError("模拟写清单失败")
+
+        monkeypatch.setattr(MF, "write_manifest", boom)
+        dest = tmp_path / "mfwarn"
+        task = BackupTask(
+            name="warn", sources=[SourceConfig(path=str(sample_tree))], destination=str(dest),
+            options=ArchiveOptions(fmt="zip", force=True),
+        )
+        rec = TaskEngine().run(task).record
+        assert rec.status == "success", rec.errors  # 备份本身不受影响（语义不变）
+        joined = " ".join(rec.warnings)
+        assert "写入备份清单失败" in joined, rec.warnings
+        assert "无清单" in joined and "不会自动清理" in joined, f"告警不可行动：{rec.warnings}"
+
+
+class TestP1BRetention:
+    """M11（S2）：本轮新组必须参与 keep_last 计数（7z 原生分卷稳态多留 1 组）。"""
+
+    def test_protected_group_counts_toward_keep_last(self, tmp_path):
+        """合成"上一轮已提交 + 本轮新卷无清单"场景：keep_last=1 → 只剩 1 组。
+
+        修复前：`.001` 命名的本轮新组既没有 manifest（保留策略早于清单提交）、又不被
+        collect_groups 的后缀启发式识别 → blobs 少算一组 → `len(blobs) > keep_last`
+        不成立 → 旧组留着，稳态 2 组。
+        """
+        from datetime import datetime, timedelta
+
+        from backupstudio.config import ArchiveOptions, BackupTask, RetentionPolicy, SourceConfig
+        from backupstudio.engine import apply_retention
+        from backupstudio.manifest import STATE_COMMITTED, Manifest, load_manifests, write_manifest
+
+        dest = tmp_path / "m11"
+        dest.mkdir()
+        # 上一轮：committed manifest 组（native 分卷 3 卷）
+        old_vols = ["nv_old.7z.001", "nv_old.7z.002", "nv_old.7z.003"]
+        old_ts = (datetime.now().astimezone() - timedelta(days=3)).isoformat(timespec="seconds")
+        for n in old_vols:
+            p = dest / n
+            p.write_bytes(b"a" * 64)
+        write_manifest(
+            dest,
+            Manifest(stem="nv_old.7z", task_id="m11-task", task_name="nv", fmt="7z",
+                     state=STATE_COMMITTED, volumes=old_vols, committed_at=old_ts),
+        )
+        # 本轮新组：文件已就位，manifest 还没写（引擎此刻尚未进入步骤 8）
+        new_vols = ["nv_new.7z.001", "nv_new.7z.002"]
+        for n in new_vols:
+            (dest / n).write_bytes(b"b" * 64)
+
+        t = BackupTask(
+            name="nv", sources=[SourceConfig(str(tmp_path / "src"))], destination=str(dest),
+            options=ArchiveOptions(fmt="7z", force=True, filename_template="{name}_{datetime}"),
+        )
+        t.id = "m11-task"
+        t.retention = RetentionPolicy(enabled=True, keep_last=1, on_cleanup="delete")
+
+        handled = apply_retention(t, protected=[str(dest / n) for n in new_vols])
+        handled_names = {Path(h).name for h in handled}
+        assert handled_names == set(old_vols), f"旧组应整组淘汰（本轮新组占配额）：{handled}"
+        for n in old_vols:
+            assert not (dest / n).exists(), n
+        for n in new_vols:
+            assert (dest / n).exists(), f"protected 的新卷被删了：{n}"
+        # 清单同步清掉，不留"清单在、卷不在"的空组
+        assert load_manifests(dest) == {}
+
+    def test_keep_last_one_end_to_end_three_rounds(self, tmp_path):
+        """端到端稳态：keep_last=1 连跑 3 轮 → 目录里只剩 1 组（修复不得反向多删）。
+
+        合成用例证明"差一被消除"，本用例证明"没改成多删一组"：protected 自身必须存活。
+        """
+        from backupstudio.config import ArchiveOptions, BackupTask, RetentionPolicy, SourceConfig
+        from backupstudio.engine import TaskEngine
+
+        src = tmp_path / "data"
+        src.mkdir()
+        (src / "a.bin").write_bytes(os.urandom(40 * 1024))
+        dest = tmp_path / "m11e2e"
+        t = BackupTask(
+            name="e2e", sources=[SourceConfig(path=str(src))], destination=str(dest),
+            options=ArchiveOptions(fmt="zip", force=True, filename_template="{name}_{datetime}"),
+        )
+        t.retention = RetentionPolicy(enabled=True, keep_last=1, on_cleanup="delete")
+        eng = TaskEngine()
+        for i in range(3):
+            rec = eng.run(t).record
+            assert rec.status == "success", rec.errors
+            time.sleep(1.05)
+        zips = sorted(p.name for p in dest.glob("*.zip"))
+        assert len(zips) == 1, f"keep_last=1 稳态应只剩 1 组：{zips}"
+
+    def test_protected_already_visible_group_not_double_counted(self, tmp_path):
+        """同一组已在 blobs 里可见时，不得重复计数导致多删一组。"""
+        from backupstudio.config import ArchiveOptions, BackupTask, RetentionPolicy, SourceConfig
+        from backupstudio.engine import apply_retention
+
+        dest = tmp_path / "m11b"
+        dest.mkdir()
+        old = time.time() - 3 * 86400
+        for n in ("keep_a.zip", "keep_b.zip"):
+            p = dest / n
+            p.write_bytes(b"PK\x03\x04" + b"x" * 64)
+            os.utime(p, (old, old))
+        t = BackupTask(
+            name="keep", sources=[SourceConfig(str(tmp_path))], destination=str(dest),
+            options=ArchiveOptions(fmt="zip", force=True),
+        )
+        t.retention = RetentionPolicy(enabled=True, keep_last=2, on_cleanup="delete")
+        # protected 指向其中一包所属的组（无清单旧包路径）：include_legacy=False → 不淘汰
+        handled = apply_retention(t, protected=[str(dest / "keep_a.zip")])
+        assert handled == [], f"候选只有 2 组、keep_last=2，不该删任何东西：{handled}"
+        assert (dest / "keep_a.zip").exists() and (dest / "keep_b.zip").exists()
+
+
+class TestP1BSweepOrphans:
+    """M23（S2）：`.bs-tmp-*` 与 `bs-stage-*` 崩溃残留的启动清扫。"""
+
+    def test_sweep_removes_dead_pid_only(self, tmp_path):
+        import backupstudio.engine as E
+        from backupstudio.engine import sweep_orphans
+
+        import psutil
+
+        dest = tmp_path / "bak"
+        dest.mkdir()
+        # ① 死 pid 的残包：动态找一个"当前确实不存在"的 pid（固定值有极低概率撞上活进程，
+        #    撞上就会让用例随机失败——实证优先，不靠猜）
+        dead_pid = 999999
+        for cand in (999999, 999998, 888888, 777777, 400000, 300000):
+            if not psutil.pid_exists(cand):
+                dead_pid = cand
+                break
+        dead = dest / f"T.zip.bs-tmp-{dead_pid}"
+        dead.write_bytes(b"x" * 128)
+        old = time.time() - 600  # 已过 5 分钟闸门
+        os.utime(dead, (old, old))
+        # ② 本进程 pid 的活体残包：绝不能删（正在写的备份）
+        alive = dest / f"T2.zip{E.TMP_MARK}{os.getpid()}"
+        alive.write_bytes(b"y" * 128)
+        # ③ 归档本体 / 清单目录 / 用户文件：一个都不许碰
+        archive = dest / "good.zip"
+        archive.write_bytes(b"PK\x03\x04" + b"z" * 128)
+        mdir = dest / ".backupstudio" / "manifests"
+        mdir.mkdir(parents=True)
+        (mdir / "good.zip.json").write_text('{"stem": "good.zip"}', encoding="utf-8")
+        other = dest / "readme.txt"
+        other.write_text("keep me", encoding="utf-8")
+
+        removed = sweep_orphans([dest])
+        assert [p.name for p in removed] == [dead.name], removed
+        assert not dead.exists()
+        assert alive.exists(), "活 pid 的临时产物被删（会毁掉正在进行的备份）"
+        assert archive.exists() and other.exists() and (mdir / "good.zip.json").exists()
+
+    def test_sweep_stage_dirs_by_age(self, tmp_path):
+        from backupstudio.engine import sweep_orphans
+
+        dest = tmp_path / "bak2"
+        dest.mkdir()
+        fresh_stage = dest / "bs-stage-fresh01"
+        fresh_stage.mkdir()
+        (fresh_stage / "staging.tar").write_bytes(b"x" * 32)
+        old_stage = dest / "bs-stage-old99"
+        old_stage.mkdir()
+        (old_stage / "staging.tar").write_bytes(b"y" * 32)
+        very_old = time.time() - 25 * 3600
+        os.utime(old_stage, (very_old, very_old))
+
+        removed = sweep_orphans([dest])
+        assert [p.name for p in removed] == [old_stage.name], removed
+        assert not old_stage.exists()
+        assert dest.exists(), "备份目录本体不能被删"
+        assert fresh_stage.exists(), "未满 24h 的暂存目录不得删除（可能是别的进程正在写）"
+
+    def test_sweep_covers_bs_staging_subdir(self, tmp_path):
+        """staging_parent 的第二落点 `<dest>/.bs-staging/` 也必须扫（最常见崩溃残留处）。"""
+        from backupstudio.engine import sweep_orphans
+
+        dest = tmp_path / "bak4"
+        sub = dest / ".bs-staging"
+        sub.mkdir(parents=True)
+        old_stage = sub / "bs-stage-deadbeef"
+        old_stage.mkdir()
+        (old_stage / "staging.tar").write_bytes(b"x" * 32)
+        very_old = time.time() - 25 * 3600
+        os.utime(old_stage, (very_old, very_old))
+        # 同目录里放一个未满 24h 的：不许动
+        fresh = sub / "bs-stage-live1234"
+        fresh.mkdir()
+        (fresh / "unpacked").mkdir()
+        (fresh / "unpacked" / "f.txt").write_text("z", encoding="utf-8")
+
+        removed = sweep_orphans([dest])
+        assert [q.name for q in removed] == [old_stage.name], removed
+        assert not old_stage.exists()
+        assert fresh.exists()
+        assert (dest / ".bs-staging").exists()
+
+    def test_sweep_covers_system_temp_stage_only(self, tmp_path, monkeypatch):
+        """系统 temp（mkdtemp 的兜底落点）只清 `bs-stage-*`，不碰 `.bs-tmp-*` 命名的他人文件。"""
+        import tempfile as _tf
+
+        from backupstudio.engine import TMP_MARK, sweep_orphans
+
+        fake_tmp = tmp_path / "systmp"
+        fake_tmp.mkdir()
+        bak = tmp_path / "bak"
+        bak.mkdir()
+        stage = fake_tmp / "bs-stage-systmp01"
+        stage.mkdir()
+        (stage / "staging.tar").write_bytes(b"x" * 16)
+        os.utime(stage, (time.time() - 25 * 3600, time.time() - 25 * 3600))
+        # 别的程序在系统 temp 里的同名形态文件：必须原样保留
+        stranger = fake_tmp / f"someapp.dat{TMP_MARK}999999"
+        stranger.write_bytes(b"keep")
+        os.utime(stranger, (time.time() - 25 * 3600, time.time() - 25 * 3600))
+        monkeypatch.setattr(_tf, "gettempdir", lambda: str(fake_tmp))
+
+        removed = sweep_orphans([bak])
+        assert [q.name for q in removed] == [stage.name], removed
+        assert stranger.exists(), "系统 temp 里非本产品的文件被删了"
+
+    def test_sweep_tolerates_bad_paths(self, tmp_path):
+        """清扫必须"永不抛"：不存在的路径、空值、文件路径都不能炸启动流程。"""
+        from backupstudio.engine import sweep_orphans
+
+        f = tmp_path / "afile"
+        f.write_text("x", encoding="utf-8")
+        assert sweep_orphans([tmp_path / "nope", "", None, f]) == []
+
+    def test_sweep_never_touches_manifests_or_archives(self, tmp_path):
+        """安全边界：.backupstudio（清单/锁目录）与任何归档名都不动。"""
+        from backupstudio.engine import sweep_orphans
+
+        dest = tmp_path / "bak3"
+        (dest / ".backupstudio" / "manifests").mkdir(parents=True)
+        (dest / ".backupstudio" / "manifests" / "x.json").write_text("{}", encoding="utf-8")
+        # 故意做成"超龄 + 看起来像残包"的文件名，但不在标记内
+        for n in ("archive.zip", "foo.txt", "last-run.json", "data.7z.001"):
+            p = dest / n
+            p.write_bytes(b"x" * 16)
+            os.utime(p, (time.time() - 30 * 86400, time.time() - 30 * 86400))
+        assert sweep_orphans([dest]) == []
+        assert all((dest / n).exists() for n in ("archive.zip", "foo.txt", "last-run.json", "data.7z.001"))
+        assert (dest / ".backupstudio" / "manifests" / "x.json").exists()

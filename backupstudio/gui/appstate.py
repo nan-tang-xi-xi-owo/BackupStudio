@@ -20,6 +20,11 @@ from . import DARK, LIGHT, Palette
 
 log = logging.getLogger("backupstudio.appstate")
 
+# 外部改动探测间隔（W-A7-2：GUI 打开期间 CLI/守护进程写 tasks.json 必须被看到）
+EXTERNAL_POLL_MS = 5_000
+# 守护进程状态探测间隔（旧账 F9：界面看不到守护进程在不在跑）
+DAEMON_POLL_MS = 20_000
+
 
 class AppState(QObject):
     """GUI 全局状态。
@@ -27,6 +32,8 @@ class AppState(QObject):
     负责：
     * 加载/保存任务仓库；
     * 每 20 秒检查一次是否有任务到期（GUI 打开时也负责调度，即使守护进程没起来）；
+    * 每 5 秒探测 tasks.json 是否被外部（CLI/守护进程）改动并三方合并进内存，
+      顺带探测守护进程运行状态（W-A7-2 / F9 旧账）；
     * 暴露主题、通知设置。
     """
 
@@ -37,6 +44,8 @@ class AppState(QObject):
     notified = Signal(str, str, str)  # title, message, level
     run_started = Signal(str)
     run_finished = Signal(object)  # ExecutionResult
+    external_reloaded = Signal(object)  # dict：本次从磁盘吸收到的改动摘要
+    daemon_state_changed = Signal(object)  # dict：守护进程状态快照
 
     def __init__(self, store: TaskStore, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -46,6 +55,17 @@ class AppState(QObject):
         self._trigger_timer = QTimer(self)
         self._trigger_timer.setInterval(20_000)
         self._trigger_timer.timeout.connect(self.check_due)
+        # 外部改动探测（tasks.json 被 CLI/守护进程写过就必须重读，否则任何一次
+        # GUI 保存都会以陈旧内存全量覆写磁盘、静默抹掉外部任务）
+        self._external_timer = QTimer(self)
+        self._external_timer.setInterval(EXTERNAL_POLL_MS)
+        self._external_timer.timeout.connect(self.poll_external_changes)
+        # 守护进程状态：IPC 查询会阻塞数十~数百毫秒，放后台线程做
+        self._daemon_timer = QTimer(self)
+        self._daemon_timer.setInterval(DAEMON_POLL_MS)
+        self._daemon_timer.timeout.connect(self.poll_daemon_status)
+        self._daemon_probe_busy = threading.Lock()
+        self.daemon_info: dict = {}
         self.palette: Palette = self._resolve_palette()
         self._lock = threading.Lock()
 
@@ -106,9 +126,80 @@ class AppState(QObject):
     # ------------------------------------------------------------------
     def start_scheduler(self) -> None:
         self._trigger_timer.start()
+        self._external_timer.start()
+        self._daemon_timer.start()
+        self.poll_external_changes()
 
     def stop_scheduler(self) -> None:
         self._trigger_timer.stop()
+        self._external_timer.stop()
+        self._daemon_timer.stop()
+
+    # ------------------------------------------------------------------
+    # 外部改动 / 守护进程状态探测
+    # ------------------------------------------------------------------
+    def poll_external_changes(self) -> bool:
+        """磁盘 tasks.json 被外部改动时三方合并进内存，并通知界面刷新。
+
+        返回是否发生了合并/吸收。合并不会丢任何一方的任务（见 store._merge_locked）。
+        另外兼顾 `store.save()` 里已经吸收过的改动（改主题一类的保存会把外部任务
+        吸进内存，此时磁盘指纹已对齐、`reload_if_changed()` 返回 False，
+        但界面列表仍是陈旧快照，必须补一次刷新）。
+        """
+        changed = False
+        try:
+            reloaded = bool(self.store.reload_if_changed())
+            # 两个都要求值（不能用 or 短路）：否则标记残留会让下一次轮询多刷一遍
+            absorbed = bool(self.store.take_pending_absorb())
+            changed = reloaded or absorbed
+        except Exception:  # noqa: BLE001 - 探测失败不能拖垮界面定时器
+            log.exception("探测外部改动失败")
+            return False
+
+        if not changed:
+            return False
+        summary = {
+            "tasks": len(self.store.list_tasks()),
+            "at": datetime.now().isoformat(timespec="seconds"),
+        }
+        log.info("已吸收外部配置改动（%d 个任务）", summary["tasks"])
+        self.external_reloaded.emit(summary)
+        self.tasks_changed.emit()
+        for t in self.store.list_tasks():
+            self.task_updated.emit(t.id)
+        return True
+
+
+    def poll_daemon_status(self) -> bool:
+        """后台查询守护进程状态（IPC 阻塞，不能占 UI 线程）。
+
+        结果缓存在 self.daemon_info 并发 daemon_state_changed 信号。
+        返回是否已发起一次探测。
+        """
+        if not self._daemon_probe_busy.acquire(blocking=False):
+            return False  # 上一次探测还没回来
+
+        def _probe() -> None:
+            try:
+                from ..daemon import daemon_status
+
+                info = daemon_status(timeout_ms=600)
+            except Exception as exc:  # noqa: BLE001
+                info = {"running": False, "error": str(exc)}
+            finally:
+                self._daemon_probe_busy.release()
+            self.daemon_info = info
+            try:
+                self.daemon_state_changed.emit(info)
+            except RuntimeError:  # 界面已销毁
+                pass
+
+        threading.Thread(target=_probe, daemon=True, name="bs-daemon-probe").start()
+        return True
+
+    def daemon_running(self) -> bool:
+        """最近一次探测到的守护进程状态（未探测过则为 False）。"""
+        return bool(self.daemon_info.get("running"))
 
     def check_due(self) -> None:
         now = datetime.now()

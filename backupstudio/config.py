@@ -182,15 +182,15 @@ class RetentionPolicy:
     keep_last: int = 30
     keep_days: int = 90
     max_total_gb: float = 0.0  # 0 表示不限制
-    on_cleanup: str = "delete"  # delete | move
-    cleanup_dir: str = ""
+    on_cleanup: str = "move"  # delete | move（默认 move：先挪到回收目录，可反悔——审查 E1-1.8/D-r5）
+    cleanup_dir: str = ""  # 留空时默认移动到 <备份目录>/.backupstudio/trash/<日期>/
 
     def __post_init__(self) -> None:
         self.keep_last = max(1, int(self.keep_last or 1))
         self.keep_days = max(1, int(self.keep_days or 1))
         self.max_total_gb = max(0.0, float(self.max_total_gb or 0))
         if self.on_cleanup not in ("delete", "move"):
-            self.on_cleanup = "delete"
+            self.on_cleanup = "move"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

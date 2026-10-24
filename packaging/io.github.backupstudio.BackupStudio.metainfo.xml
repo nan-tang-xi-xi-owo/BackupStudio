@@ -23,6 +23,11 @@
   <developer_name>BackupStudio contributors</developer_name>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="1.1.0" date="2026-10-24">
+      <description>
+        <p>Trust batch: retention no longer deletes across tasks, tar-family verification detects corruption, split volumes can be restored in-app, encryption state is probed rather than assumed, and cross-process locking was hardened.</p>
+      </description>
+    </release>
     <release version="1.0.0" date="2026-10-18">
       <description>
         <p>First release: multi-format scheduled backups, tray support, cross-platform packaging.</p>

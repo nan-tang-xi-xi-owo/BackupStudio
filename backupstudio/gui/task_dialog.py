@@ -50,7 +50,7 @@ from ..config import (
     SourceConfig,
 )
 from ..engine import archive_path
-from ..util import normalize_path
+from ..util import is_path_inside, normalize_path
 from .appstate import AppState
 from .widgets import Badge, Card, CollapsibleSection, Combo, PathEdit, Switch, muted, title_label
 
@@ -70,15 +70,19 @@ class TaskDialog(QDialog):
         self._original = task
         self._task = BackupTask.from_dict(task.to_dict()) if task else BackupTask(name="")
         self._dark = state.palette.dark
-        self._caps = format_capabilities()
+        self._caps = format_capabilities(force=False)  # 如实展示（审查 P0-13）
         self._env = environment_report()
         # 用户意图保真：capability 变化触发的"程序性取消勾选"不得洗白已保存的字段。
-        # _initial_* 记录任务原有值；_user_touched_* 只在用户手动切换开关时置位。
+        # _initial_* 记录任务原有值；_user_touched_* 只在用户手动切换控件时置位。
         self._initial_password = self._task.options.password
         self._initial_multivolume = self._task.options.multivolume
+        # 加密方式同规（审查 W-A6-2A）：环境能力不足时不得静默把 aes256 换成 zipcrypto/gpg
+        # ——那会在产物里降级加密强度（zip method 99→8）或是"编辑一次必败"（tar 系 gpg）。
+        self._initial_encrypt_mode = self._task.options.encrypt_mode
         self._user_touched_pw = False
         self._user_touched_mv = False
         self._user_touched_mv_combo = False
+        self._user_touched_enc = False
         self._loading = True
         self.setWindowTitle("编辑备份任务" if task else "新建备份任务")
         self.setMinimumSize(860, 720)
@@ -405,6 +409,8 @@ class TaskDialog(QDialog):
         self.enc_combo = Combo()
         for mode in ENCRYPTION_MODES:
             self.enc_combo.addItem(ENCRYPTION_LABELS.get(mode, mode), mode)
+        # 顺序重要：先记"用户动过"，再刷新能力表——否则刷新会把用户刚选的值又换回去。
+        self.enc_combo.currentIndexChanged.connect(self._on_enc_changed)
         self.enc_combo.currentIndexChanged.connect(self._refresh_capabilities)
         pf.addRow("加密方式", self.enc_combo)
         self.enc_note = QLabel("")
@@ -490,6 +496,11 @@ class TaskDialog(QDialog):
     def _on_mv_combo_changed(self, _index: int) -> None:
         if not self._loading:
             self._user_touched_mv_combo = True
+
+    def _on_enc_changed(self, _index: int) -> None:
+        """用户换加密方式才算意图；能力刷新里的程序性选择不算（对照密码/分卷侧）。"""
+        if not self._loading:
+            self._user_touched_enc = True
 
     def _on_level_changed(self, value: int) -> None:
         self.level_label.setText(LEVEL_TEXT.get(value, str(value)))
@@ -628,12 +639,21 @@ class TaskDialog(QDialog):
         self.ret_action.addItem("移动到回收目录", "move")
         self.ret_action.currentIndexChanged.connect(self._on_ret_action)
         rf.addRow("过期处理", self.ret_action)
-        self.ret_dir = PathEdit(mode="dir", placeholder="回收目录", caption="选择回收目录")
+        self.ret_dir = PathEdit(mode="dir", placeholder="回收目录（留空 = 备份目录下的回收站）", caption="选择回收目录")
         rf.addRow("回收目录", self.ret_dir)
         self.ret_dir.setVisible(False)
         ret.add(self.ret_widget)
         self.ret_widget.setVisible(False)
         self.ret_enabled.toggled.connect(self.ret_widget.setVisible)
+        # 保留预览（审查 E1-1.8/D-r5）：保存前就能看到"将清理 N 份（X GB）"
+        self.ret_preview = muted("")
+        ret.add(self.ret_preview)
+        for sig in (
+            self.ret_count.valueChanged, self.ret_days.valueChanged,
+            self.ret_gb.valueChanged, self.ret_action.currentIndexChanged,
+        ):
+            sig.connect(self._update_retention_preview)
+        self.ret_enabled.toggled.connect(self._update_retention_preview)
         lay.addWidget(ret)
 
         notif = Card()
@@ -653,6 +673,42 @@ class TaskDialog(QDialog):
 
     def _on_ret_action(self) -> None:
         self.ret_dir.setVisible(self.ret_action.currentData() == "move")
+
+    def _update_retention_preview(self, *_args) -> None:
+        """dry-run 保留策略，显示"将清理 N 份（X GB）"（审查 E1-1.8/D-r5）。"""
+        if not self.ret_enabled.isChecked():
+            self.ret_preview.setText("")
+            return
+        dest = normalize_path(self.dest_path.path())
+        if not dest or not Path(dest).is_dir():
+            self.ret_preview.setText("保留预览：备份位置尚不存在，暂无历史备份可评估")
+            return
+        try:
+            from ..config import RetentionPolicy
+            from ..engine import TaskEngine
+            from ..util import human_size
+
+            probe = BackupTask.from_dict(self._task.to_dict())
+            probe.destination = dest
+            probe.options.fmt = self.fmt_combo.currentData() or probe.options.fmt
+            probe.retention = RetentionPolicy(
+                enabled=True,
+                keep_last=self.ret_count.value(),
+                keep_days=self.ret_days.value(),
+                max_total_gb=self.ret_gb.value(),
+                on_cleanup=self.ret_action.currentData() or "move",
+            )
+            will_process = TaskEngine().preview_retention(probe)
+            if not will_process:
+                self.ret_preview.setText("保留预览：按当前规则，现有备份都不会被清理")
+                return
+            total = sum(Path(f).stat().st_size for f in will_process if Path(f).is_file())
+            action = "移入回收站" if probe.retention.on_cleanup == "move" else "直接删除"
+            self.ret_preview.setText(
+                f"保留预览：将{action} {len(will_process)} 份旧备份（共 {human_size(total)}）"
+            )
+        except Exception as exc:  # noqa: BLE001 - 预览失败不阻塞保存
+            self.ret_preview.setText(f"保留预览不可用：{exc}")
 
     # ------------------------------------------------------------------
     # 载入 / 保存
@@ -779,25 +835,74 @@ class TaskDialog(QDialog):
             if info.get("available"):
                 pw_available.append(mode)
         current = self.enc_combo.currentData()
+        # 意图值（审查 W-A6-2A）：用户没动过加密方式下拉时，意图值恒为任务原有值，
+        # 哪怕当前环境"不可用"。此前以 currentData() 为基准 → 第一次刷新就把
+        # zip+aes256 洗成 zipcrypto（实测同一密码产物 method 99→8，加密强度静默降级），
+        # 或把 tar.gz+aes256 落到 gpg（编辑一次即运行必败）。
+        intended = current if self._user_touched_enc else self._initial_encrypt_mode
+        # 可用性不由对话框裁决：archives.create_archive 的加密前置守卫会拒绝 7z+ZipCrypto
+        # 与 *+GPG，产物加密状态另有实测回填（未加密会在结果里标注）。
+        # 对话框只负责不改写任务的安全语义。
+        if self._original is None and not self._user_touched_enc and intended not in pw_available:
+            # 新建任务没有"原有值"需要保真：回落首个可用项，并把回落结果记为基准，
+            # 保证界面显示与 _collect 写回一致。
+            intended = pw_available[0] if pw_available else intended
+            self._initial_encrypt_mode = intended
         self.enc_combo.blockSignals(True)
         self.enc_combo.clear()
         for mode in ENCRYPTION_MODES:
             info = entry.get("password", {}).get(mode, {})
             if not info:
+                # 原有加密方式压根不在该格式的能力表里（如 tar 系的 aes256、
+                # 7z 的 zipcrypto）：仍列出来并标注，保证"显示的值 == 保存的值"，
+                # 不让它退化成表内首项（那正是 aes256→zipcrypto/gpg 漂移的入口）。
+                if mode != intended:
+                    continue
+                self.enc_combo.addItem(f"{ENCRYPTION_LABELS.get(mode, mode)}（该格式不支持，已按原设置保留）", mode)
                 continue
             label = ENCRYPTION_LABELS.get(mode, mode)
             if not info.get("available"):
                 label += "（不可用）"
             self.enc_combo.addItem(label, mode)
-        self.enc_combo.select_data(current if current in pw_available else (pw_available[0] if pw_available else current))
+        if self._user_touched_enc:
+            target = current if current in pw_available else (pw_available[0] if pw_available else current)
+        else:
+            target = intended
+        self.enc_combo.select_data(target)
         self.enc_combo.blockSignals(False)
+        # 保留原设置时的提示分两类原因（容器不支持 / 环境组件不足），后果文案统一：
+        # 实测各组合结局不同——7z+ZipCrypto、*+GPG 创建前就报错；tar+aes256、
+        # rar+zipcrypto 能产出但产物未加密（结果里标「产物未加密」）。
+        # ZIP AES-256 的能力判定偏保守（7za 精简版实测也能出 method=99），
+        # 因此不断言"必然失败"，只断言"不改写设置、不会把未加密说成已加密"。
+        def _kept_mode_warning(mode: str, info: dict) -> str:
+            if self._user_touched_enc or not mode:
+                return ""
+            if not (self._initial_password or self._user_touched_pw):
+                return ""  # 任务没密码，引擎根本不会加密，不必刷屏
+            label = ENCRYPTION_LABELS.get(mode, mode)
+            if mode not in entry.get("password", {}):
+                cause = f"{FORMAT_LABELS.get(fmt, fmt)} 容器不支持{label}"
+            elif not info.get("available"):
+                cause = f"当前环境不支持{label}（{info.get('reason') or entry.get('reason') or '缺少所需组件'}）"
+            else:
+                return ""
+            return (
+                f"⚠ {cause}。已按任务原设置保留、不会自动改写加密方式；"
+                "这种配置运行时要么明确报错、要么在结果中标注「产物未加密」（不会把未加密的包当成已加密）。"
+            )
+
         if not pw_available:
             # 程序性取消勾选（不视为用户意图，字段保真由 _collect 的 _initial_* 兜底）
             prev = self.pw_enabled.blockSignals(True)
             self.pw_enabled.setChecked(False)
             self.pw_enabled.blockSignals(prev)
             self.pw_enabled.setEnabled(False)
-            self.enc_note.setText(f"当前格式暂不支持加密：{entry.get('reason', '')}")
+            warning = _kept_mode_warning(intended, entry.get("password", {}).get(intended, {}))
+            self.enc_note.setText(
+                f"当前格式暂不支持加密：{entry.get('reason', '')}"
+                + (f"\n{warning}" if warning else "")
+            )
         else:
             self.pw_enabled.setEnabled(True)
             # 能力恢复：若任务原有密码或用户曾勾选，恢复勾选（不误标为用户操作）
@@ -810,11 +915,19 @@ class TaskDialog(QDialog):
             note = info.get("note", "")
             if not info.get("safe", True):
                 note += "（⚠ 安全性较低）"
+            if not info.get("available"):
+                warning = _kept_mode_warning(mode, info)
+                if warning:
+                    note = warning + (f"\n{note}" if note else "")
             self.enc_note.setText(note)
 
         # 分卷
         modes = [m for m in MULTIVOLUME_MODES if entry.get("multivolume", {}).get(m, {}).get("available")]
         cur_mv = self.mv_combo.currentData()
+        # 意图值（审查 W-A6-2B）：用户没碰过分卷控件时，显示与保存都以任务原有值为准。
+        # 引擎 multivolume_mode_for 支持、但 capability 表未列出的存量组合（7z+split、
+        # tar 系+7z-split）不该被换成"表内首项"——那会让界面显示与实际保存/运行的配置不一致。
+        mv_touched = self._user_touched_mv or self._user_touched_mv_combo
         self.mv_combo.blockSignals(True)
         self.mv_combo.clear()
         for mode in MULTIVOLUME_MODES:
@@ -822,11 +935,23 @@ class TaskDialog(QDialog):
             if mode not in modes:
                 label += "（不可用）"
             self.mv_combo.addItem(label, mode)
-        self.mv_combo.select_data(cur_mv if cur_mv in modes else (modes[0] if modes else cur_mv))
+        if mv_touched:
+            target = cur_mv if cur_mv in modes else (modes[0] if modes else cur_mv)
+        elif self._initial_multivolume:
+            target = self._initial_multivolume
+        else:
+            # 无原有分卷配置（新建任务）：沿用"落到首个可用方式"的老行为，
+            # 避免用户随后打开分卷开关时对着一个标着不可用的默认项保存被拦。
+            target = cur_mv if cur_mv in modes else (modes[0] if modes else cur_mv)
+        self.mv_combo.select_data(target)
         self.mv_combo.blockSignals(False)
         self.mv_combo.setEnabled(bool(modes))
         if modes:
-            self.mv_note.setText(entry["multivolume"][self.mv_combo.currentData()].get("note", ""))
+            shown = self.mv_combo.currentData()
+            note = entry["multivolume"].get(shown, {}).get("note", "")
+            if shown not in modes:
+                note = f"⚠ 任务原有分卷方式在当前环境未列为可用（{fmt} + {shown}），将按原设置运行" + (f"\n{note}" if note else "")
+            self.mv_note.setText(note)
             # 能力恢复：任务原有分卷或用户曾勾选时恢复勾选（对照密码侧）
             if not self.mv_enabled.isChecked() and (self._initial_multivolume or self._user_touched_mv):
                 prev = self.mv_enabled.blockSignals(True)
@@ -913,25 +1038,39 @@ class TaskDialog(QDialog):
             force = True
             self.force_switch.setChecked(True)
 
-        # 分卷保真：用户未触碰任何分卷控件时保留原值（含引擎允许但 UI 不提供的组合，
+        # 分卷保真：用户未触碰任何分卷控件时保留原值（含引擎允许但 UI/caps 不提供的组合，
         # 如 7z+split——引擎的 multivolume_mode_for 可正确映射）；显式操作才生效。
-        if self._user_touched_mv or self._user_touched_mv_combo:
-            mv = (self.mv_combo.currentData() or "") if self.mv_enabled.isChecked() else ""
-        elif self._initial_multivolume:
-            mv = self._initial_multivolume
-        else:
-            mv = (self.mv_combo.currentData() or "") if self.mv_enabled.isChecked() else ""
-        if mv and mv not in [m for m in MULTIVOLUME_MODES if entry.get("multivolume", {}).get(m, {}).get("available")]:
+        mv_touched = self._user_touched_mv or self._user_touched_mv_combo
+        mv_from_ui = (self.mv_combo.currentData() or "") if self.mv_enabled.isChecked() else ""
+        mv = mv_from_ui if mv_touched else (self._initial_multivolume or mv_from_ui)
+        mv_available = [m for m in MULTIVOLUME_MODES if entry.get("multivolume", {}).get(m, {}).get("available")]
+        # 存量合法配置（用户没动过分卷控件、值就是任务原有值）跳过 caps 校验直接放行：
+        # 引擎侧映射本就正确（实测 7z+split / tar 系+7z-split 零操作保存后都能跑成功），
+        # 此前"分卷不可用"警告让 CLI/导入产生的这类任务在 GUI 里"看得到、改不了"
+        # （审查 W-A6-2B，本机 force=0 口径 90/192 REJECTED）。
+        mv_preserved = (not mv_touched) and bool(self._initial_multivolume) and mv == self._initial_multivolume
+        if mv and mv not in mv_available and not mv_preserved:
             if not force:
                 QMessageBox.warning(self, "分卷不可用", "所选分卷方式在当前环境不可用，请更换或启用强制压缩。")
                 self.tabs.setCurrentIndex(1)
                 return None
 
+        # 加密方式保真（审查 W-A6-2A）：与密码同规——用户没动过加密方式下拉时写回任务
+        # 原有值，绝不接受能力刷新回落来的"首个可用项"。静默把 aes256 换成 zipcrypto 是
+        # 加密强度降级（实测同一密码产物 method 99→8），换成 gpg 则让任务编辑一次必败。
+        # 能否真加密由运行期判定（前置守卫拒绝 7z+ZipCrypto / *+GPG，其余情况实测回填
+        # 加密状态），对话框不改写安全语义。
+        enc_mode = self.enc_combo.currentData() or ""
+        if not self._user_touched_enc:
+            enc_mode = self._initial_encrypt_mode
+        if not enc_mode:
+            enc_mode = "aes256"
+
         options = ArchiveOptions(
             fmt=fmt,
             level=self.level_slider.value(),
             password=password,
-            encrypt_mode=self.enc_combo.currentData() or "aes256",
+            encrypt_mode=enc_mode,
             multivolume=mv or "",
             volume_value=self.vol_value.value(),
             volume_unit=self.vol_unit.currentData() or "MB",
@@ -961,13 +1100,20 @@ class TaskDialog(QDialog):
             keep_last=self.ret_count.value(),
             keep_days=self.ret_days.value(),
             max_total_gb=self.ret_gb.value(),
-            on_cleanup=self.ret_action.currentData() or "delete",
+            on_cleanup=self.ret_action.currentData() or "move",
             cleanup_dir=normalize_path(self.ret_dir.edit.text()) if self.ret_enabled.isChecked() else "",
         )
-        if retention.enabled and retention.on_cleanup == "move" and not retention.cleanup_dir:
-            QMessageBox.warning(self, "缺少回收目录", "选择「移动到回收目录」时必须设置回收目录。")
-            self.tabs.setCurrentIndex(2)
-            return None
+        # 路径校验（审查 E1-1.8）：回收目录不得位于任何来源文件夹内部——
+        # 否则"="把旧备份挪回被备份的目录里"，下次备份又把它打包进去（无限套娃）。
+        if retention.enabled and retention.cleanup_dir and retention.on_cleanup == "move":
+            for sc in self._task.sources:
+                if sc.path and is_path_inside(retention.cleanup_dir, sc.path):
+                    QMessageBox.warning(
+                        self, "回收目录位置无效",
+                        "回收目录不能位于备份来源文件夹内部（否则旧备份会被再次打包）。请换一个目录。",
+                    )
+                    self.tabs.setCurrentIndex(2)
+                    return None
 
         notify = []
         if self.notif_success.isChecked():
@@ -980,11 +1126,15 @@ class TaskDialog(QDialog):
         import dataclasses
 
         base = self._task if self._task is not None else BackupTask()
+        # 多来源保真（审查 W-A6-2C）：本对话框只编辑第一个来源，尾部来源必须原样保留。
+        # 此前 sources=[...] 只写 sources[0]，CLI/API/导入产生的多来源任务编辑保存一次
+        # 就把第 2+ 个来源静默删除（备份范围缩小，整个目录树漏备）。
+        tail_sources = base.sources[1:] if base.sources else []
         task = dataclasses.replace(
             base,
             name=name,
             enabled=self.enabled_switch.isChecked(),
-            sources=[SourceConfig(path=src_path, mode=mode, files=files)],
+            sources=[SourceConfig(path=src_path, mode=mode, files=files), *tail_sources],
             destination=dest,
             options=options,
             schedule=schedule,
