@@ -305,14 +305,23 @@ def test_autostart_available_flag(flatpak_env):
 
 
 def test_autostart_disable_still_allowed_inside_flatpak(flatpak_env, monkeypatch):
-    """关闭自启（enabled=False）不该被拦——它只是清理，不会骗人。"""
+    """关闭自启（enabled=False）不该被拦——它只是清理，不会骗人。
+
+    该断言与宿主平台无关：``set_autostart(False)`` 会按 ``sys.platform`` 分派到
+    对应实现，若只 patch ``_set_autostart_linux``，在 Windows/macOS 上跑的 CI
+    仍会走本机分支（实测 Windows runner 上 FileNotFoundError → 误红）。
+    因此把三平台实现全部替换为桩。
+    """
     flatpak_env(SAMPLE_INFO)
     from backupstudio import autostart
 
     from backupstudio import flatpak
 
     flatpak.reset_cache()
-    monkeypatch.setattr(autostart, "_set_autostart_linux", lambda enabled: (True, "已取消开机自启动"))
+    stub = lambda enabled: (True, "已取消开机自启动")  # noqa: E731
+    for name in ("_set_autostart_linux", "_set_autostart_windows", "_set_autostart_macos"):
+        if hasattr(autostart, name):
+            monkeypatch.setattr(autostart, name, stub)
     ok, msg = autostart.set_autostart(False)
     assert ok is True, msg
 
