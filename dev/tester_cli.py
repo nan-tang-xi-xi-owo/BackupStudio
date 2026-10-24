@@ -58,6 +58,8 @@ def main() -> int:
     env = ctx["env"]
 
     # ---------- CLI 基础 ----------
+    from backupstudio import __version__ as _ver
+
     code, out, err = run(["--version"], env)
     from backupstudio import __version__ as _ver
 

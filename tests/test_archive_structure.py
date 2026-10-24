@@ -1,4 +1,4 @@
-"""归档结构回归测试：X1 修复（外部 7z 后端坏包）的关键断言。
+﻿"""归档结构回归测试：X1 修复（外部 7z 后端坏包）的关键断言。
 
 背景：此前 ExternalCompressor 把 staging.tar 直接交给 7z 打包——7z 不解
 tar，产物只有 `['staging.tar']` 一个成员（打包版用户全部坏包、CI 7 连败
@@ -145,3 +145,91 @@ class TestArchiveStructure:
             assert names == ["1.bin", "3.bin"], f"tar 流错位：{names}"
             with tf.extractfile("3.bin") as fh:
                 assert fh.read() == b"C" * 4096, "3.bin 内容损坏（流错位）"
+
+
+class TestRelativeDestinationPath:
+    """P1 回归：相对 ``dest_path`` 会被写进 ``src_dir`` 内部，导致静默 fallback。
+
+    根因：``ExternalCompressor._pack_from`` 以 ``cwd=src_dir`` 调 7z，``out_path`` 若是
+    相对路径就会被解析到 ``src_dir`` 里；``_commit()`` 在最终路径上找不到产物 →
+    抛 CompressionError → 上层 ``force`` 回退内置引擎，但记录里 ``backend`` 仍写
+    ``7z:7za.exe``（账实不符）。
+    """
+
+    def test_sevenzip_dest_is_absolute(self, sample_tree, tmp_path):
+        """``SevenZipCompressor.__init__`` 必须把相对 dest 解析成绝对路径。"""
+        from backupstudio.archives import ArchiveSpec, Progress, SevenZipCompressor
+        from backupstudio.tools import find_7z
+
+        seven = find_7z()
+        if not seven:
+            pytest.skip("本机无 7-Zip")
+        out = tmp_path / "out"
+        out.mkdir()
+        old = Path.cwd()
+        import os
+
+        os.chdir(tmp_path)
+        try:
+            spec = ArchiveSpec(dest_path=Path("out/rel.zip"), fmt="zip", level=5)
+            comp = SevenZipCompressor(Path("out/rel.zip"), spec, Progress(), exe=seven)
+            try:
+                assert Path(comp.dest).is_absolute(), f"dest 仍是相对路径：{comp.dest}"
+                assert Path(comp.dest) == (out / "rel.zip").resolve()
+            finally:
+                comp.abort()
+        finally:
+            os.chdir(old)
+
+    def test_pack_from_resolves_relative_out_path(self, sample_tree, tmp_path):
+        """``_pack_from`` 内部的 ``resolve()`` 必须兜住相对 out_path（第二道防线）。"""
+        import os
+
+        from backupstudio.archives import ArchiveSpec, Progress, SevenZipCompressor
+        from backupstudio.tools import find_7z
+
+        seven = find_7z()
+        if not seven:
+            pytest.skip("本机无 7-Zip")
+        outdir = tmp_path / "outdir"
+        outdir.mkdir()
+        comp = SevenZipCompressor(
+            outdir / "rel2.zip", ArchiveSpec(dest_path=outdir / "rel2.zip", fmt="zip", level=5),
+            Progress(), exe=seven,
+        )
+        staged = comp.tmpdir / "unpacked"
+        staged.mkdir(parents=True, exist_ok=True)
+        (staged / "s.txt").write_text("second guard", encoding="utf-8")
+        old = Path.cwd()
+        os.chdir(tmp_path)
+        try:
+            comp._pack_from(staged, Path("outdir/rel2.zip.bs-tmp"))
+        finally:
+            os.chdir(old)
+        try:
+            assert (outdir / "rel2.zip.bs-tmp").exists(), "相对 out_path 未落到预期位置"
+            assert not list(staged.rglob("*.bs-tmp")), "产物被写进了 src_dir 内部"
+        finally:
+            comp.abort()
+
+    def test_relative_dest_end_to_end(self, sample_tree, tmp_path):
+        """端到端：相对 destination 的任务产物必须落在预期位置，且 backend 账实相符。"""
+        import os
+
+        from backupstudio.engine import TaskEngine
+        from backupstudio.tools import find_7z
+
+        if not find_7z():
+            pytest.skip("本机无 7-Zip")
+        old = Path.cwd()
+        os.chdir(tmp_path)
+        try:
+            (tmp_path / "relout").mkdir()
+            rec = TaskEngine().run(_make_task("zip", "relout", sample_tree)).record
+        finally:
+            os.chdir(old)
+        assert rec.status == "success", rec.errors
+        arc = Path(rec.archive)
+        assert arc.is_absolute(), f"产物路径仍是相对：{arc}"
+        assert (tmp_path / "relout" / arc.name).exists(), f"产物不在预期位置：{arc}"
+        assert "7z" in (rec.backend or ""), f"backend 应记录真实外部引擎：{rec.backend}"

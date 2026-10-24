@@ -1,0 +1,17 @@
+# R-fix4：sdist（python -m build --sdist / pip 从源码树安装）默认只带 .py，
+# 运行期必需的图标资源必须显式包含，否则从 sdist 装出来的包没有托盘图标。
+# wheel/install 侧由 pyproject.toml 的 [tool.setuptools.package-data] 负责，两者互补。
+
+recursive-include backupstudio/assets *.png *.ico *.icns *.svg
+include backupstudio/py.typed
+
+# 打包/发布用的配套文件（sdist 里保留，便于从 sdist 复现构建）
+include README.md LICENSE CHANGELOG.md
+recursive-include packaging *.py *.sh *.ps1 *.in *.yml *.desktop *.metainfo.xml *.plist *.txt
+recursive-include docs *.md
+recursive-include tests *.py
+
+# 明确排除构建缓存与打包产物，避免 sdist 膨胀/带入旧产物
+global-exclude *.py[cod] __pycache__
+prune build
+prune dist

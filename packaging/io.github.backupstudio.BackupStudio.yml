@@ -17,8 +17,8 @@
     "--filesystem=/run/media",
     "--talk-name=org.freedesktop.Notifications",
     "--talk-name=org.kde.StatusNotifierWatcher",
-    "--env=QT_QPA_PLATFORM=wayland;xcb",
-    "--env=BACKUPSTUDIO_CONFIG_DIR=/var/config/backupstudio"
+    "--talk-name=org.freedesktop.portal.Desktop",
+    "--env=QT_QPA_PLATFORM=wayland;xcb"
   ],
   "modules": [
     {

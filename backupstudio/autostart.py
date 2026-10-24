@@ -265,6 +265,16 @@ def is_autostart_enabled() -> bool:
         return False
 
 
+def autostart_available() -> bool:
+    """本环境下「开机自启」这个功能是否**真的**可用（供 GUI 置灰开关）。
+
+    Flatpak 沙箱内为 False —— 写进去的文件宿主看不到（N3）。
+    """
+    from . import flatpak
+
+    return flatpak.autostart_supported()
+
+
 def _autostart_argv() -> list[str]:
     """自启动命令中应用自身收到的参数（即 ``python -m backupstudio`` 之后的 argv）。"""
     args = gui_command()[1:]
@@ -288,7 +298,18 @@ def _verify_autostart_command() -> str:
 
 
 def set_autostart(enabled: bool) -> tuple[bool, str]:
-    """开启/关闭开机自启动，返回 (成功, 说明)。"""
+    """开启/关闭开机自启动，返回 (成功, 说明)。
+
+    N3：Flatpak 沙箱内**必须拒绝**并说明原因。
+    沙箱里的 ``$HOME`` 是 ``~/.var/app/<app-id>/``，写进去的
+    ``~/.config/autostart/*.desktop`` 宿主桌面环境永远读不到；旧实现却返回
+    ``(True, "已写入 …（下次登录生效）")``，用户得到一个永不生效的"成功"。
+    这里改为 ``(False, 指引)``，让调用方（GUI/CLI）如实提示。
+    """
+    from . import flatpak
+
+    if enabled and not flatpak.autostart_supported():
+        return False, flatpak.autostart_hint()
     try:
         if sys.platform == "win32":
             ok, msg = _set_autostart_windows(enabled)

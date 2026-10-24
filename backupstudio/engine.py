@@ -228,6 +228,74 @@ def _verify_volumes(volumes, fmt: str, password: str | None = None) -> tuple[boo
         return None, f"分卷校验无法执行：{exc}"
 
 
+# py7zr "读得出目录但解不开载荷"的异常：属于无法判定，不得报 failed（名字匹配，避免版本间类名漂移）
+_PY7ZR_UNDECIDABLE = frozenset({"UnsupportedCompressionMethodError", "DecompressionError"})
+# py7zr/标准库在**载荷层**报"输入损坏"的异常：属于已损坏，必须判 failed。
+# 实测（审查 A1 补漏）：可压缩载荷（真实备份的典型形态：文本/日志/代码）翻转中段字节，
+# 解码器抛 ``LZMAError: Corrupt input data``；旧实现把它落到 ``password is None`` 兜底分支
+# 返回 None（skipped），真实损坏被静默漏判。随机载荷翻转换来的是 CrcError（已判 failed），
+# 所以只用 os.urandom 的回归测试**永远抓不到**这条路径。
+# 注意：加密归档由 PasswordRequired 分支先行拦截，不会落到这里，故无"加密包被误判"风险。
+_PY7ZR_CORRUPT = frozenset(
+    {
+        "Bad7zFile",
+        "CrcError",
+        "LZMAError",
+        "LZMACompressionError",
+        "ZlibError",
+        "BZ2DecompressorError",
+        "DecompressionBombError",
+    }
+)
+
+
+def _verify_7z_py7zr(main: Path, password: str | None) -> tuple[bool | None, str]:
+    """无 7-Zip 时用 py7zr 校验 7z 的**载荷**，返回三态（True / False / None）。
+
+    A1：旧实现只调 ``getnames()``（只读头），载荷被翻转字节的 7z 也会被判 passed。
+    这里改用 py7zr 1.x 的 ``testzip()``：读完所有条目并比对 CRC，返回 None 或出错的文件名。
+
+    三态规则（None 绝不等于 passed）：
+    * True  —— testzip() 返回 None：所有条目 CRC 全部匹配；
+    * False —— 结构性损坏（Bad7zFile / CrcError），或给了密码但解不开；
+    * None  —— 无法判定：没装 py7zr、py7zr 无 testzip()、归档加密但未提供密码、
+               本机 py7zr 缺该压缩方法的解码器。
+    """
+    try:
+        import py7zr
+    except ImportError:
+        return None, "跳过校验：未找到 7-Zip，且未安装 py7zr，无法校验 7z 载荷"
+    if not hasattr(py7zr.SevenZipFile, "testzip"):
+        return None, (
+            "跳过校验：未找到 7-Zip，当前 py7zr "
+            f"{getattr(py7zr, '__version__', '未知')} 没有 testzip()（需 py7zr>=1.0）"
+        )
+    try:
+        with py7zr.SevenZipFile(str(main), "r", password=password) as z:
+            bad = z.testzip()
+    except Exception as exc:  # noqa: BLE001 - 按类型名分类，不依赖具体异常类的位置
+        name = type(exc).__name__
+        if name == "PasswordRequired":
+            if password:
+                return False, "校验失败：密码错误（py7zr 无法解开归档）"
+            return None, "跳过校验：归档已加密，请提供密码后重试（本机无 7-Zip）"
+        if name in ("Bad7zFile", "CrcError"):
+            return False, f"7z 校验失败（{name}）：{exc}"
+        if name in _PY7ZR_UNDECIDABLE:
+            return None, f"跳过校验：本机 py7zr 无法解码该归档（{name}）"
+        if name in _PY7ZR_CORRUPT:
+            # 顺序关键：**先判 undecidable 再判 corrupt**。本机缺解码器是"无法判定"，
+            # 而解码器报"输入损坏"才是"已损坏"——两者都可能是 LZMA 系异常名。
+            return False, f"7z 校验失败（{name}）：载荷损坏（{exc}）"
+        if password is None:
+            # 无密码时无法区分"载荷损坏"与"载荷被加密"，不武断判失败
+            return None, f"跳过校验：py7zr 无法判定（{name}）"
+        return False, f"7z 校验失败（{name}）：{exc}"
+    if bad is None:
+        return True, "py7zr 载荷校验通过（testzip）"
+    return False, f"py7zr 校验失败：条目 {bad} 的 CRC 不匹配"
+
+
 def verify_archive(main: Path, fmt: str, password: str | None = None) -> tuple[bool | None, str]:
     """校验压缩包完整性。
 
@@ -242,15 +310,8 @@ def verify_archive(main: Path, fmt: str, password: str | None = None) -> tuple[b
 
             exe = find_7z()
             if not exe:
-                # 无 7-Zip：py7zr 兜底（能打开并读目录 = 结构完好）
-                try:
-                    import py7zr
-
-                    with py7zr.SevenZipFile(str(main), "r", password=password) as z:
-                        z.getnames()
-                    return True, "py7zr 结构校验通过"
-                except Exception as exc:  # noqa: BLE001
-                    return None, f"跳过校验：未找到 7-Zip，py7zr 无法验证（{type(exc).__name__}）"
+                # 无 7-Zip：交给 py7zr 做**载荷级**校验（审查 A1：只读头会把坏包判 passed）
+                return _verify_7z_py7zr(main, password)
             import subprocess
             import sys
 
@@ -408,9 +469,25 @@ class CleanupItem:
     files: list[str]
     size: int
     mtime: float
-    managed: bool = False  # True = 由 manifest 管理（可自动淘汰）；False = 旧包（迁移期只报告）
+    managed: bool = False  # True = 可信备份（计入份数，可自动淘汰）；False = 旧包/不可信
     complete: bool = True  # False = 缺卷/残包
     stem: str = ""  # manifest stem（managed 时用于清单清理）
+    reclaimable: bool = False  # True = 不可信但可回收（committing / partial / unverified）
+    # manifest 状态（committed / committing / partial / unverified；无清单时为空串）。
+    # P0 修复必需：仅凭 reclaimable 无法区分「中断/失败残包」与「只是没验过」。
+    state: str = ""
+
+
+def _is_unverified(b: CleanupItem) -> bool:
+    """是否是「没验过」的备份（P0：它**是**一份备份，只是没做校验）。
+
+    ``verify=False``（用户主动关闭校验）产出的包状态是 ``unverified``；
+    它和 ``committing``/``partial`` 一样落在 ``RECLAIMABLE_STATES`` 里，
+    但语义完全不同：前两者是"没写完的残包"，后者是"写完了、没验"。
+    """
+    from .manifest import STATE_UNVERIFIED
+
+    return b.state == STATE_UNVERIFIED
 
 
 def find_backup_blobs(task: BackupTask) -> list[CleanupItem]:
@@ -465,6 +542,8 @@ def find_backup_blobs(task: BackupTask) -> list[CleanupItem]:
                 managed=g.managed,
                 complete=g.complete,
                 stem=g.stem,
+                reclaimable=g.reclaimable,
+                state=(g.manifest.state if g.manifest is not None else ""),
             )
         )
     return sorted(blobs, key=lambda b: b.mtime)
@@ -512,9 +591,21 @@ def apply_retention(
     blobs = find_backup_blobs(task)
     if not blobs:
         return []
+    # 迁移红线（E5）：无清单旧包默认不参与自动淘汰。
+    # **只看 managed 会连 junk/unverified 一起筛掉**（融合要点 1/2）——它们都不是
+    # managed（只有 committed 才 managed），但一个必须被回收（残包），一个必须被计数
+    # （没验过也是一份备份）。所以这里必须用 reclaimable 补一条放行规则，否则
+    # 本分支的 P0 修复（unverified 不被回收）与 junk 回收都会在 include_legacy=False
+    # 这条默认路径上被静默旁路。
     if not include_legacy:
-        blobs = [b for b in blobs if b.managed or (protected and any(Path(f).resolve() == Path(pp).resolve() for pp in protected for f in b.files))]
-    # 本轮新组占位（审查 M11 / W-A1 推荐方案，S2）：
+        blobs = [
+            b
+            for b in blobs
+            if b.managed
+            or getattr(b, "reclaimable", False)
+            or (protected and any(Path(f).resolve() == Path(pp).resolve() for pp in protected for f in b.files))
+        ]
+    # 本轮新组占位（上游审查 M11 / W-A1，S2）：
     # apply_retention（engine 步骤 7）先于写 manifest（步骤 8），7z 原生分卷的本轮新卷
     # 名为 `X.7z.001`，既无清单、又不被 collect_groups 的后缀启发式 `_matches` 识别
     # （它只认 endswith(ext) / ".part" 规则）→ 本轮这一组对 find_backup_blobs **完全不可见**。
@@ -523,6 +614,10 @@ def apply_retention(
     # 修法：protected 非空、且其文件**不属于任何已见组**时，把本轮新卷合成一个虚拟组
     # 并入 blobs **参与计数**——它是最新的一组，protected_set 会让删除环节跳过它（不会被删），
     # 但它照样占掉 keep_last 的一个配额，差一即消除。
+    # 融合要点 3：本分支已改为两阶段提交（步骤 5b 先写 committing 清单），本轮产物的
+    # 清单因此在 retention 时已存在、且通常已被 collect_groups 看见；但 `_matches`
+    # 看不见原生分卷的旧缺口仍在（分卷主名来自 manifest.volumes，能看见；无清单路径
+    # 仍看不见），故两个占位必须**同时**保留：已见则不加，未见证才补，绝不重复计数。
     if protected:
         seen: set[str] = {str(Path(f).resolve()).lower() for b in blobs for f in b.files}
         if not any(str(Path(p).resolve()).lower() in seen for p in protected):
@@ -536,7 +631,7 @@ def apply_retention(
                     files=[str(p) for p in protected],
                     size=size,
                     mtime=time.time(),
-                    managed=True,  # 本轮刚产出的托管组（清单稍后写入）——只为计数
+                    managed=True,  # 本轮刚产出的托管组（清单稍后/刚写入）——只为计数
                     complete=True,
                     stem="",  # 无清单：删除环节本就会跳过，且不会去 delete_manifest
                 )
@@ -545,25 +640,60 @@ def apply_retention(
     if not blobs:
         return []
     protected_set = {str(Path(p).resolve()).lower() for p in (protected or [])}
-    # 以最新一份备份完成时刻作为时间基准
-    now = blobs[-1].mtime if protected else time.time()
-    expired: list[CleanupItem] = []
 
-    # 1) 份数：保留最新 keep_last 份
-    if policy.keep_last and len(blobs) > policy.keep_last:
-        expired.extend(blobs[: len(blobs) - policy.keep_last])
+    def _protected(b: CleanupItem) -> bool:
+        return any(str(Path(f).resolve()).lower() in protected_set for f in b.files)
+
+    # 三类对象必须分开算（审查 A3 + P0 回归）：
+    # * trusted     —— 可信备份（manifest 状态 = committed）：**唯一**计入份数/天数/总量的对象；
+    # * unverified  —— 「写完了但没验过」（verify=False 的产物）：**也是一份备份**，
+    #                  必须计入份数。否则 verify=False 的用户每次备份都会把上一份当残包删掉
+    #                  （P0 数据丢失：实测 keep_last=30 连跑 3 次只剩 1 份）；
+    # * junk        —— 中断/失败残组（committing / partial）：不是备份，也不该永久占盘 → 回收；
+    # * legacy      —— 无清单旧包：E5 红线，默认只读（include_legacy=True 才参与淘汰）。
+    # 本次刚产出的组即使在 retention 时仍是 committing，也必须按"一份备份"计入份数，
+    # 否则 keep_last 永远少算一份（原实现的 protected 兜底就是这个作用，不能丢）。
+    trusted = [b for b in blobs if b.managed or _protected(b)]
+    junk = [
+        b
+        for b in blobs
+        if b.reclaimable and not b.managed and not _protected(b) and not _is_unverified(b)
+    ]
+    unverified = [
+        b
+        for b in blobs
+        if b.reclaimable and not b.managed and not _protected(b) and _is_unverified(b)
+    ]
+    legacy = [b for b in blobs if not b.managed and not b.reclaimable and not _protected(b)]
+    trusted += unverified  # 无条件计入：没验过 ≠ 不是备份
+    trusted += legacy if include_legacy else []
+    trusted.sort(key=lambda b: b.mtime)
+    junk.sort(key=lambda b: b.mtime)
+
+    expired: list[CleanupItem] = []
+    # 0) 中断/失败残组：不是备份 → 直接回收（在飞的本次产物除外；默认 move 到回收目录，可反悔）
+    expired.extend(junk)
+
+    if not trusted and not expired:
+        return []
+    # 以最新一份**可信**备份的完成时刻为时间基准（没有可信备份时退回"此刻"）
+    now = trusted[-1].mtime if (protected and trusted) else time.time()
+
+    # 1) 份数：只数可信备份，保留最新 keep_last 份
+    if policy.keep_last and len(trusted) > policy.keep_last:
+        expired.extend(trusted[: len(trusted) - policy.keep_last])
 
     # 2) 天数
     cutoff = now - policy.keep_days * 86400
-    for b in blobs:
+    for b in trusted:
         if b.mtime < cutoff and b not in expired:
             expired.append(b)
 
     # 3) 总量
     if policy.max_total_gb and policy.max_total_gb > 0:
         limit = policy.max_total_gb * (1024**3)
-        total = sum(b.size for b in blobs)
-        for b in blobs:
+        total = sum(b.size for b in trusted)
+        for b in trusted:
             if total <= limit:
                 break
             if b not in expired:
@@ -800,6 +930,90 @@ class ExecutionResult:
         return f"失败：{rec.errors[0] if rec.errors else '原因未知'}"
 
 
+def _manifest_stem_for(path: Path) -> str:
+    """主文件名归一到「含压缩格式扩展名」的 stem（去掉 .partNN / .001 等分卷尾巴）。
+
+    **仅作兜底**：正常路径必须用后端正向给出的 ``ArchiveResult.stem``（见
+    ``_manifest_stem_for_result``）。从产物名反推正是上游 W-A2-2 修掉的坑。
+    """
+    name = Path(path).name
+    low = name.lower()
+    for ext in (".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".zip", ".7z", ".rar", ".tar"):
+        # 上游 W-A2-2：用 rfind（最后一个扩展名），不是 find 首匹配
+        idx = low.rfind(ext)
+        if idx >= 0:
+            return name[: idx + len(ext)]
+    return name
+
+
+def _manifest_stem_for_result(result: ArchiveResult) -> str:
+    """清单 stem：优先取后端正向给出的 ``result.stem``（上游 W-A2-2，S1）。
+
+    后端由 dest 推导 stem，是**唯一**正确的来源；只有后端没给（历史/桩对象）时
+    才退回按产物名归一。任务名本身含扩展名（任务名 `foo.zip` → 产物
+    `foo.zip_20261023_042116.zip`）时，反推会把 stem 截成 `foo.zip`，导致该任务
+    所有备份共用一个 `<stem>.json` 互相覆盖（实测 2 产物 1 清单）。
+    """
+    stem = getattr(result, "stem", "") or ""
+    # 本分支语义：stem 必须含压缩格式扩展名（collect_groups 的启发式与
+    # delete_manifest 都按它来对表）；后端已保证这点，仅兜底时补规整。
+    return stem or _manifest_stem_for(result.path)
+
+
+def manifest_state_for(record: RunRecord) -> str:
+    """运行记录 → 清单状态（审查 A3：把三态真正落到提交状态上）。
+
+    * 失败（含校验失败）      → ``partial``     ：不可信、可被保留策略回收；
+    * 校验未执行（skipped）    → ``unverified``  ：**不算可信备份**（此前写成 committed，
+      等于把"没校验"当"可信"，与 skipped 绝不当 passed 的承诺自相矛盾）；
+    * 校验通过                → ``committed``   ：唯一可计入份数的状态。
+    """
+    from .manifest import STATE_COMMITTED, STATE_PARTIAL, STATE_UNVERIFIED
+
+    if record.status != "success":
+        return STATE_PARTIAL
+    if record.verification == "passed":
+        return STATE_COMMITTED
+    if record.verification == "failed":
+        return STATE_PARTIAL
+    return STATE_UNVERIFIED
+
+
+def _write_manifest_stage(task: BackupTask, record: RunRecord, result: ArchiveResult, stem: str, state: str) -> None:
+    """写入/覆写清单（失败只记 warning，不阻断备份本身）。"""
+    from .manifest import Manifest, write_manifest
+
+    try:
+        mf = Manifest(
+            stem=stem,
+            task_id=task.id,
+            task_name=task.name,
+            fmt=record.format,
+            state=state,
+            volumes=[v.path.name for v in result.volumes],
+            size_bytes=record.archive_bytes,
+            source_bytes=record.source_bytes,
+            files=record.files,
+            dirs=record.dirs,
+            backend=record.backend,
+            encrypted=record.encrypted,
+            encrypt_mode=record.encrypt_mode or "",
+            created_at=record.started_at,
+            committed_at=record.finished_at or record.started_at,
+            verified=record.verification,
+        )
+        write_manifest(task.destination, mf)
+    except Exception as exc:  # noqa: BLE001 - 清单失败不阻断备份本身
+        # 上游 W-A2-4（S3）：文案必须可行动——清单失败意味着该包从此刻起是
+        # "无清单遗留"：保留策略视其为未托管旧包（迁移红线），**永远不会自动清理它**，
+        # 只报告不删除。旧文案"不影响备份文件"让用户以为无关紧要、一次都难察觉。
+        record.warnings.append(
+            f"写入备份清单失败（不影响备份文件本身）：{exc}。"
+            "该备份将以无清单形态存在，保留策略不会自动清理它——"
+            "重启程序后请在本目录核对，必要时手动删除或重新备份覆盖。"
+        )
+
+
 class TaskEngine:
     """执行任务；同一任务不允许并发执行。"""
 
@@ -908,8 +1122,12 @@ class TaskEngine:
             record.errors = problems
             return self._finish_early(record, task, started, "；".join(problems))
 
-        dest_dir = Path(task.destination)
+        # 备份目录解析成绝对路径（审查 D）：dest 在下文的 `cwd=src_dir` 子进程里会被
+        # 重新解释成 src_dir 内部的相对位置，产物与 record.archive 就此分叉。
+        dest_dir = Path(task.destination).resolve()
         main_path = archive_path(task)
+        if not main_path.is_absolute():
+            main_path = dest_dir / main_path.name
         # 同秒重名：追加序号
         counter = 1
         base_main = main_path
@@ -1034,19 +1252,31 @@ class TaskEngine:
         if result.files == 0 and result.dirs > 0:
             warnings.append("没有文件被写入压缩包（只包含空目录）")
 
+        # 5b. 两阶段提交第一步：卷已全部落盘、但还没校验 → 先写 committing 清单。
+        #     崩溃/断电在本步之后 → 目录里留下 committing 组，保留策略能看见并回收
+        #     （此前完全没有清单 → 被当 legacy 旧包 → 永不淘汰，磁盘悄悄涨；审查 A3）。
+        #     stem 取后端正向给出的 result.stem（上游 W-A2-2），与步骤 8 完全一致，
+        #     否则第一步和第二步会写两份**不同名**的清单（一份 committing 永远残留）。
+        _manifest_stem = _manifest_stem_for_result(result)
+        _write_manifest_stage(task, record, result, _manifest_stem, "committing")
+
         # 6. 校验（三态：passed / failed / skipped——skipped 绝不当成 passed）
+        # 按**真实容器格式**校验：强制模式下 RAR 请求可能降级成 ZIP 容器
+        # （见 create_archive 的 container_fmt），此时用 unrar t 打 ZIP 必然报
+        # "退出码 13"，把好好的备份误判成损坏（也是"账实相符"的一部分）。
+        verify_fmt = getattr(result, "container_fmt", "") or record.format
         if task.verify:
             if len(result.volumes) > 1:
                 progress.describe("verify")
-                ok, msg = _verify_volumes(result.volumes, record.format, opts.password or None)
+                ok, msg = _verify_volumes(result.volumes, verify_fmt, opts.password or None)
                 record.verification = "passed" if ok is True else ("failed" if ok is False else "skipped")
                 record.verification_message = msg
                 record.extracted_text = "\n".join(v.path.name for v in result.volumes[:12])
             else:
                 progress.describe("verify")
-                ok, msg = verify_archive(result.path, record.format, opts.password or None)
+                ok, msg = verify_archive(result.path, verify_fmt, opts.password or None)
                 record.verification = "passed" if ok is True else ("failed" if ok is False else "skipped")
-                record.extracted_text = _extract_text_sample(result.path, record.format) if ok is True else ""
+                record.extracted_text = _extract_text_sample(result.path, verify_fmt) if ok is True else ""
                 record.verification_message = msg
             if record.verification == "failed":
                 record.status = "failure"
@@ -1087,46 +1317,16 @@ class TaskEngine:
         # 汇总告警（放在保留策略之后：清理失败产生的告警也要收进去）
         record.warnings = warnings
 
-        # 8. 提交 manifest（备份身份层）：卷全部就位、状态定稿后才写
-        #    （state=committed 是保留策略的准入依据；写入失败不阻断备份本身）
-        #
-        #    stem 直接取后端正向给出的 result.stem（由 dest 推导）。
-        #    旧实现在这里用 `str.find(ext)` 从产物名**反推**主名：任务名本身含扩展名
-        #    （任务名 `foo.zip` → 产物 `foo.zip_20261023_042116.zip`）时命中的是**第一个**
-        #    `.zip`，stem 被截成 `foo.zip` → 该任务所有备份写同一个 `<stem>.json`，
-        #    后一轮覆盖前一轮清单（实测：2 产物 1 清单）。审查 W-A2-2（S1）。
-        manifest_stem = result.stem or Path(result.path).name
-        try:
-            from .manifest import STATE_COMMITTED, STATE_PARTIAL, Manifest, write_manifest
-
-            mf = Manifest(
-                stem=manifest_stem,
-                task_id=task.id,
-                task_name=task.name,
-                fmt=record.format,
-                state=STATE_COMMITTED if record.status == "success" else STATE_PARTIAL,
-                volumes=[v.path.name for v in result.volumes],
-                size_bytes=record.archive_bytes,
-                source_bytes=record.source_bytes,
-                files=record.files,
-                dirs=record.dirs,
-                backend=record.backend,
-                encrypted=record.encrypted,
-                encrypt_mode=record.encrypt_mode or "",
-                created_at=record.started_at,
-                committed_at=record.finished_at,
-                verified=record.verification,
-            )
-            write_manifest(task.destination, mf)
-        except Exception as exc:  # noqa: BLE001 - 清单失败不阻断备份本身
-            # 审查 W-A2-4（S3）：文案必须可行动——清单失败意味着该包从此刻起是
-            # "无清单遗留"：保留策略视其为未托管旧包（迁移红线），**永远不会自动清理它**，
-            # 只报告不删除。旧文案"不影响备份文件"让用户以为无关紧要、一次都难察觉。
-            record.warnings.append(
-                f"写入备份清单失败（不影响备份文件本身）：{exc}。"
-                "该备份将以无清单形态存在，保留策略不会自动清理它——"
-                "重启程序后请在本目录核对，必要时手动删除或重新备份覆盖。"
-            )
+        # 8. 两阶段提交第二步：状态定稿后覆写清单（=「提交」）。
+        #    状态由 manifest_state_for 判定：committed 是唯一样本；committing /
+        #    partial / unverified 都不是「一份可信备份」（本分支 A3 + P0 修复）。
+        #    stem 取后端正向给出的 result.stem（上游 W-A2-2）：**不再**从产物名用
+        #    `str.find(ext)` 反推 —— 任务名含扩展名（任务名 `foo.zip` → 产物
+        #    `foo.zip_20261023_042116.zip`）时命中的是第一个 `.zip`，stem 被截成
+        #    `foo.zip`，该任务所有备份写同一个 `<stem>.json` 互相覆盖（实测 2 产物
+        #    1 清单）。两处修复互补，缺一即错：状态错 → 份数算错；stem 错 → 清单互相覆盖。
+        _final_state = manifest_state_for(record)
+        _write_manifest_stage(task, record, result, _manifest_stem, _final_state)
 
         # 8. 写运行记录
         append_history(record, task)

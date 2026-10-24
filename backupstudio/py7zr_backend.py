@@ -176,6 +176,9 @@ class Py7zrCompressor:
             ts = (1980, 1, 1, 0, 0, 0)
         zi = zipfile.ZipInfo(arcname + ("/" if is_dir else ""), date_time=ts)
         zi.external_attr = (0o40755 if is_dir else 0o100644) << 16
+        # ZipInfo.compress_type 默认 STORED，会覆盖 ZipFile(compression=...)；
+        # 不显式设置则「强制压缩」的 ZIP 产物完全不压缩（审查 Q6）。目录条目保持 STORED。
+        zi.compress_type = zipfile.ZIP_STORED if (is_dir or self.spec.level == 0) else zipfile.ZIP_DEFLATED
         try:
             zi.flag_bits |= 0x800  # UTF-8 文件名标志位（中文/emoji 正确显示）
         except Exception:  # noqa: BLE001
@@ -351,6 +354,8 @@ class ZipFileCompressor:
             ts = (1980, 1, 1, 0, 0, 0)
         zi = zipfile.ZipInfo(arcname + ("/" if is_dir else ""), date_time=ts)
         zi.external_attr = (0o40755 if is_dir else 0o100644) << 16
+        # 同 Py7zrCompressor._zip_info：必须显式设置，否则 STORED 会覆盖全局 compression
+        zi.compress_type = zipfile.ZIP_STORED if (is_dir or self.spec.level == 0) else zipfile.ZIP_DEFLATED
         try:
             zi.flag_bits |= 0x800
         except Exception:  # noqa: BLE001

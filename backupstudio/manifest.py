@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -34,6 +35,9 @@ SCHEMA_VERSION = 1
 STATE_COMMITTING = "committing"
 STATE_COMMITTED = "committed"
 STATE_PARTIAL = "partial"
+STATE_UNVERIFIED = "unverified"
+# 可被保留策略回收的状态（不是「一份可信备份」，但也不该永久占盘 —— 审查 A3）
+RECLAIMABLE_STATES = frozenset({STATE_COMMITTING, STATE_PARTIAL, STATE_UNVERIFIED})
 
 
 def manifest_dir(destination: Path | str) -> Path:
@@ -106,7 +110,13 @@ class Manifest:
 
     @property
     def is_committed(self) -> bool:
+        """是否是「一份可信备份」（校验通过 + 卷齐全）。保留策略的份数只数这些。"""
         return self.state == STATE_COMMITTED
+
+    @property
+    def is_reclaimable(self) -> bool:
+        """是否是「不是备份、但可被清理」的对象（committing / partial / unverified）。"""
+        return self.state in RECLAIMABLE_STATES
 
 
 def write_manifest(destination: Path | str, manifest: Manifest) -> Path:
@@ -212,21 +222,63 @@ class BackupGroup:
 
     @property
     def managed(self) -> bool:
-        """是否由 manifest 管理（可安全参与自动淘汰）。"""
+        """是否是「一份可信备份」（可计入份数、可安全参与自动淘汰）。"""
         return self.manifest is not None and self.manifest.is_committed
+
+    @property
+    def reclaimable(self) -> bool:
+        """是否可被保留策略回收（不是可信备份，但占着盘 —— 审查 A3）。"""
+        return self.manifest is not None and self.manifest.is_reclaimable
+
+
+# 分卷名 → 组主名 + 卷序号（审查 A2）。三种真实形态，与 main 的 volume_glob_paths 对齐：
+#   1) 7z 原生分卷：``stem.7z.001`` / ``.002`` …（三位十进制）
+#   2) RAR 原生分卷：``base.part1.rar`` / ``base.part2.rar``（归到 ``base.rar``）
+#   3) 本产品通用切片：``stem.tar.gz.part01`` / ``.part02`` …
+# 严格锚定 ``$``，且要求 ``.partNN`` 前必须已有 ``.<ext>``，因此：
+#   * ``a.7z`` 的组主名是 ``a.7z``；``a.7z.bak`` 不匹配任何模式 → 单独一组，绝不误并。
+_VOLUME_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^(?P<stem>.+?\.(?:7z|zip|rar|tar|tar\.gz|tar\.bz2|tar\.xz|tar\.zst))\.(?P<num>[0-9]{3})$", re.IGNORECASE),
+    re.compile(r"^(?P<base>.+?)\.part(?P<num>[0-9]{1,3})\.rar$", re.IGNORECASE),
+    re.compile(r"^(?P<stem>.+?\.(?:7z|zip|rar|tar|tar\.gz|tar\.bz2|tar\.xz|tar\.zst))\.part(?P<num>[0-9]{1,5})$", re.IGNORECASE),
+)
+
+
+def _match_volume(name: str, exts: tuple[str, ...] | None = None) -> tuple[str, int] | None:
+    """判定 ``name`` 是否是分卷成员；是则返回 ``(组主名, 卷序号)``，否则 ``None``。
+
+    ``exts`` 非空时要求组主名以允许的扩展名结尾（向后兼容 collect_groups 的格式过滤）。
+    """
+    allowed = tuple(e.lower() for e in exts) if exts else None
+    low = name.lower()
+    for idx, pat in enumerate(_VOLUME_PATTERNS):
+        m = pat.match(name)
+        if not m:
+            continue
+        if idx == 1:  # base.partN.rar → 组主名补回 .rar，与"整包 stem 含扩展名"的约定一致
+            stem = m.group("base") + ".rar"
+        else:
+            stem = m.group("stem")
+        if allowed is not None and not stem.lower().endswith(allowed):
+            continue
+        return stem, int(m.group("num"))
+    return None
+
+
+def _matches(name: str, exts: tuple[str, ...]) -> bool:
+    """该文件名是否属于"备份产物"（整包，或任一分卷形态）。"""
+    low = name.lower()
+    if any(low.endswith(e.lower()) for e in exts):
+        return True
+    return _match_volume(name, exts) is not None
 
 
 def _volume_sort_key(name: str) -> tuple:
-    """分卷名 → 排序键：把结尾的纯数字段按数值排（.part100 > .part11）。"""
-    stem = name
-    num = -1
-    for sep in (".part", "."):
-        idx = stem.rfind(sep)
-        if idx >= 0 and stem[idx + len(sep):].isdigit():
-            num = int(stem[idx + len(sep):])
-            stem = stem[:idx]
-            break
-    return (stem, num, name)
+    """分卷名 → 排序键：卷序号按数值排（.part100 > .part11，.010 > .002）。"""
+    hit = _match_volume(name)
+    if hit is not None:
+        return (hit[0], hit[1], name)
+    return (name, -1, name)
 
 
 def collect_groups(destination: Path | str, fmt_ext: str, *, fmts: Iterable[str] | None = None) -> list[BackupGroup]:
@@ -270,14 +322,10 @@ def collect_groups(destination: Path | str, fmt_ext: str, *, fmts: Iterable[str]
         for f in g.files:
             claimed.add(f.name.lower())
 
-    def _matches(name: str) -> bool:
-        low = name.lower()
-        return any(low.endswith(e.lower()) or (".part" in low and low.split(".part")[0].lower().endswith(e.lower())) for e in exts)
-
     for p in sorted(folder.iterdir()):
         if not p.is_file() or p.name.lower() in claimed:
             continue
-        if not _matches(p.name):
+        if not _matches(p.name, exts):
             continue
         # 找这个包的主名（去分卷后缀）
         stem = _stem_of(p.name, exts)
@@ -301,30 +349,24 @@ def collect_groups(destination: Path | str, fmt_ext: str, *, fmts: Iterable[str]
 
 
 def _stem_of(name: str, exts: tuple[str, ...]) -> str:
-    """从文件名提取主名（去掉**尾部**分卷后缀，保留容器扩展名）。
+    """从文件名提取主名：整包返回自身，分卷返回其组主名。
 
-    审查 W-A2-2 的同类缺陷：旧实现用 `str.find(ext)` **首匹配**扩展名，任务名本身含
-    扩展名时（任务名 `foo.zip` → 产物 `foo.zip_20260101_120000.zip`）会把主名截成
-    `foo.zip`，于是**同任务的不同备份被并成一个启发式组**——该组一旦参与淘汰就是整组
-    删除（显式接管 include_legacy=True 时会连带删掉有清单的好包）。
-    新规则：先去掉**尾部**卷序号（`.001` / `.part01`），再按**最后一个**扩展名切；
-    得到的主名与 archives.product_stem(dest.name) 一致（native 分卷
-    `X.7z.001` → `X.7z`；split 分卷 `X.tar.gz.part01` → `X.tar.gz`），
-    因此启发式组能与 manifest 组正确对表，不再跨备份误并。
+    W-A2-2（上游）与 A2（本分支）修的是同一个缺陷：旧实现用 `str.find(ext)` **首匹配**
+    扩展名，任务名本身含扩展名时（任务名 `foo.zip` → 产物
+    `foo.zip_20260101_120000.zip`）会把主名截成 `foo.zip`，于是同任务的不同备份被并成
+    一个启发式组 —— 该组一旦参与淘汰就是整组删除（include_legacy=True 时会连带删掉
+    有清单的好包）。
+
+    融合取舍：这里采用本分支基于 ``_match_volume`` 的实现，因为它同时满足上游的三条
+    断言（`X.7z.001`→`X.7z`、`Y.zip.part02`→`Y.zip`、`Z.tar.gz.part03`→`Z.tar.gz`，
+    且与 ``archives.product_stem`` 一致），**并且**覆盖上游按"最后一个扩展名切"会漏掉
+    的 RAR 原生卷 `base.part1.rar` → `base.rar`（末尾是 `.rar`，没有可切的体序号）。
+    上游的 `rfind` 思路已由 ``_match_volume`` 的正则（严格尾部锚定）等价实现。
     """
-    base = name
-    low = base.lower()
-    for sep in (".part", "."):
-        idx = low.rfind(sep)
-        if idx > 0 and low[idx + len(sep) :].isdigit():
-            base = base[:idx]
-            low = base.lower()
-            break
-    for e in sorted(exts, key=len, reverse=True):
-        idx = low.rfind(e.lower())
-        if idx >= 0:
-            return base[: idx + len(e)]
-    return base
+    hit = _match_volume(name, exts)
+    if hit is not None:
+        return hit[0]
+    return name
 
 
 def _parse_ts(text: str) -> float:

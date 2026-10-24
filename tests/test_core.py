@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT))
 # fixtures
 # --------------------------------------------------------------------------
 
+
 @pytest.fixture()
 def tmp_config(tmp_path, monkeypatch):
     cfg = tmp_path / "config"
@@ -39,10 +40,6 @@ def sample_tree(tmp_path):
     (src / "Thumbs.db").write_bytes(b"junk")
     return src
 
-
-# --------------------------------------------------------------------------
-# 调度
-# --------------------------------------------------------------------------
 
 class TestSchedule:
     def test_daily_due(self):
@@ -94,10 +91,6 @@ class TestSchedule:
         assert due(task, datetime(2026, 1, 1, 23, 0), None) is False
 
 
-# --------------------------------------------------------------------------
-# 配置
-# --------------------------------------------------------------------------
-
 class TestConfig:
     def test_roundtrip(self):
         from backupstudio.config import ArchiveOptions, BackupTask, RetentionPolicy, ScheduleConfig, SourceConfig
@@ -144,10 +137,6 @@ class TestConfig:
         assert again.duplicate(t.id).name.endswith("（副本）")
 
 
-# --------------------------------------------------------------------------
-# 工具函数
-# --------------------------------------------------------------------------
-
 class TestUtil:
     def test_template_and_sanitize(self):
         from backupstudio.util import sanitize_component, template_context, render_template
@@ -173,10 +162,6 @@ class TestUtil:
         assert not is_path_inside(tmp_path.parent / "other", tmp_path)
 
 
-# --------------------------------------------------------------------------
-# 扫描
-# --------------------------------------------------------------------------
-
 class TestPlanning:
     def test_excludes_and_dir_sizes(self, sample_tree):
         from backupstudio.archives import Item, plan_items
@@ -201,10 +186,6 @@ class TestPlanning:
         assert "data/sub/b.bin" in arcs
         assert not warnings
 
-
-# --------------------------------------------------------------------------
-# 引擎 + 各格式
-# --------------------------------------------------------------------------
 
 def _make_task(fmt, dest, src, **opt_kwargs):
     from backupstudio.config import ArchiveOptions, BackupTask, SourceConfig
@@ -398,10 +379,6 @@ class TestEngine:
         assert result.record.warnings
 
 
-# --------------------------------------------------------------------------
-# 能力矩阵
-# --------------------------------------------------------------------------
-
 class TestCapabilities:
     def test_matrix_shape(self):
         from backupstudio.archives import SUPPORTED_FORMATS
@@ -428,10 +405,6 @@ class TestCapabilities:
         assert st.get("running") in (True, False)
 
 
-# --------------------------------------------------------------------------
-# 通知 / 自启动（只读检查）
-# --------------------------------------------------------------------------
-
 class TestNotify:
     def test_quiet_hours(self):
         from backupstudio.notify import in_quiet_hours
@@ -445,10 +418,6 @@ class TestNotify:
 
         assert describe_backend()
 
-
-# --------------------------------------------------------------------------
-# 测试员补充：取消、中文/emoji 文件名、强制 ZIP 真实性
-# --------------------------------------------------------------------------
 
 def _cjk_tree(tmp_path):
     src = tmp_path / "src"
@@ -513,10 +482,32 @@ class TestTesterFindings:
         ] if dest.exists() else []
         assert not leftovers, leftovers
 
+    def test_forced_rar_fallback_verifies_as_zip_container(self, sample_tree, tmp_path, tmp_config):
+        """强制 RAR 降级产物是 **ZIP 容器**（扩展名 .rar），校验必须按真实容器走。
 
-# --------------------------------------------------------------------------
-# P1-B 修复回归（W-A2-2 stem 覆盖 / M11 keep_last 差一 / M23 崩溃残包 / W-A2-4 文案）
-# --------------------------------------------------------------------------
+        背景：``find_unrar()`` 修好之后（此前它找不到随包的 ``tools/win32/rar/UnRAR.exe``），
+        校验会拿 ``unrar t`` 去打这个 ZIP 文件 → "RAR 测试失败（退出码 13）"，
+        把好好的备份判成损坏。``ArchiveResult.container_fmt`` 负责账实相符。
+        """
+        from backupstudio.archives import rar_available
+        from backupstudio.engine import TaskEngine
+
+        if rar_available():
+            pytest.skip("本机 RAR 可创建压缩包（走原生路径，不涉及降级）")
+
+        dest = tmp_path / "rarzip"
+        result = TaskEngine().run(_make_task("rar", dest, sample_tree, force=True))
+        rec = result.record
+        assert rec.status == "success", rec.errors
+        assert rec.verification == "passed", rec.verification_message
+
+        # 产物确实是 ZIP 容器（magic PK），但扩展名保持 .rar
+        arc = Path(rec.archive)
+        assert arc.suffix.lower() == ".rar", arc
+        assert arc.read_bytes()[:2] == b"PK", "强制 RAR 降级应产出 ZIP 容器"
+        # 真实容器格式如实记录
+        assert result.result is not None
+        assert result.result.container_fmt == "zip", result.result.container_fmt
 
 
 class TestP1BStem:

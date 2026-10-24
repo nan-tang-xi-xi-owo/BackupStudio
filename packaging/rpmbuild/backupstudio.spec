@@ -1,5 +1,5 @@
 # 由 packaging/make-rpm.sh 调用：rpmbuild -ba backupstudio.spec --define "_topdir ..." --define "_version x.y.z"
-%global _version %{?_version}%{!?_version:1.0.0}
+%global _version %{?_version}%{!?_version:1.1.0}
 
 Name:           backupstudio
 Version:        %{_version}

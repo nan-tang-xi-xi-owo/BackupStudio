@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import itertools
+import logging
 import os
 import re
 import shutil
@@ -24,6 +25,8 @@ import zipfile
 from pathlib import Path
 
 from .tools import find_7z, find_unrar
+
+log = logging.getLogger("backupstudio.extract")
 
 
 class ExtractionError(RuntimeError):
@@ -42,19 +45,80 @@ _SPLIT_CONTAINER_SUFFIXES = (
 )
 
 
-# 解压防护上限（审查 R1-N7：zip 炸弹实测 981× 无阻拦）
-_MAX_EXPANSION_RATIO = 1000  # 解压总量 / 压缩包大小 上限
+# 解压防护上限（审查 A4）。
+#
+# 旧实现把比例判定写成 ``min(100 GiB, 包大小 × 1000)`` 的**硬上限**，会拒绝本产品自己产出的
+# 正常备份：8 MiB 全零日志用 deflate 压到 8 KB = 1014×，用户灾难恢复时被自己的防护挡住，
+# 且没有任何逃生阀（实测见 raw/bomb_self.txt）。
+#
+# 新策略：**只以绝对上限为主**，比例仅作为「比绝对上限更松的兜底」而不参与收紧：
+#   * _MAX_TOTAL_BYTES      —— 解压总量绝对上限（默认 100 GiB），可通过
+#                              ``--max-unpacked-bytes`` / BACKUPSTUDIO_MAX_UNPACKED_BYTES 放宽；
+#   * _MAX_EXPANSION_RATIO  —— 默认 10000（而非 1000）：正常备份几乎不可能超过，
+#                              且可通过 BACKUPSTUDIO_MAX_UNPACK_RATIO 放宽到 0 = 关闭比例判定；
+#   * _MAX_ENTRIES          —— 条目数上限，可通过 BACKUPSTUDIO_MAX_ENTRIES 放宽。
+_MAX_EXPANSION_RATIO = 10000  # 解压总量 / 压缩包大小（仅在未设绝对上限时兜底）
 _MAX_TOTAL_BYTES = 100 * 1024**3  # 绝对上限 100 GiB
 _MAX_ENTRIES = 500_000
 
+# 环境变量名（GUI/CLI 都可设；CLI 还提供 --max-unpacked-bytes 覆盖）
+ENV_MAX_UNPACKED_BYTES = "BACKUPSTUDIO_MAX_UNPACKED_BYTES"
+ENV_MAX_UNPACK_RATIO = "BACKUPSTUDIO_MAX_UNPACK_RATIO"
+ENV_MAX_ENTRIES = "BACKUPSTUDIO_MAX_ENTRIES"
+
+
+def _env_int(name: str, default: int) -> int:
+    """读环境变量里的非负整数；非法值退回默认（不因用户笔误把防护关掉/炸掉）。"""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        return default
+    return val if val >= 0 else default
+
+
+def _limits() -> tuple[int, int, int]:
+    """当前生效的 (绝对上限字节, 比例, 条目数上限)。0 表示该项不限制。"""
+    total = _env_int(ENV_MAX_UNPACKED_BYTES, _MAX_TOTAL_BYTES)
+    ratio = _env_int(ENV_MAX_UNPACK_RATIO, _MAX_EXPANSION_RATIO)
+    entries = _env_int(ENV_MAX_ENTRIES, _MAX_ENTRIES)
+    return total, ratio, entries
+
+
+def unpack_limit(archive_size: int) -> int:
+    """解压总量允许的上限（字节）。0 = 不限制。
+
+    **绝对上限优先**：只有在没设绝对上限（<=0）时才用比例兜底。这样默认行为是
+    「100 GiB 以内一律放行」，比例只防"小包解出 TB"的极端情形。
+    """
+    total, ratio, _ = _limits()
+    if total > 0:
+        return total
+    if ratio > 0:
+        return max(archive_size, 1) * ratio
+    return 0
+
 
 def _check_bomb(archive_size: int, entry_count: int, unpacked: int) -> None:
-    if entry_count > _MAX_ENTRIES:
-        raise ExtractionError(f"疑似压缩炸弹：条目数 {entry_count} 超限，已中止")
-    limit = min(_MAX_TOTAL_BYTES, max(archive_size, 1) * _MAX_EXPANSION_RATIO)
-    if unpacked > limit:
+    total, ratio, max_entries = _limits()
+    if max_entries > 0 and entry_count > max_entries:
         raise ExtractionError(
-            f"疑似压缩炸弹：解压总量 {unpacked // (1024**2)} MB 超过上限，已中止"
+            f"疑似压缩炸弹：条目数 {entry_count} 超过上限 {max_entries}，已中止。"
+            f"（确认无误可设 {ENV_MAX_ENTRIES} 放宽，或 0 关闭）"
+        )
+    limit = unpack_limit(archive_size)
+    if limit <= 0:
+        return
+    if unpacked > limit:
+        hint = (
+            f"（确认无误可设 {ENV_MAX_UNPACKED_BYTES} 放宽，或 0 关闭绝对上限、"
+            f"用 {ENV_MAX_UNPACK_RATIO} 调节比例）"
+        )
+        raise ExtractionError(
+            f"疑似压缩炸弹：解压总量 {unpacked // (1024**2)} MB 超过上限 "
+            f"{limit // (1024**2)} MB，已中止。{hint}"
         )
 
 
@@ -111,6 +175,8 @@ def _extract_zip(archive: Path, target: Path, password: str | None = None) -> No
     if password:
         exe = find_7z()
         if exe:
+            # 审查 F：这条外部解压路径此前**零防护**（加密 ZIP 炸弹会照写满盘）
+            _check_external_bomb(exe, archive, password)
             argv = [exe, "x", "-y", f"-o{target}", str(archive)]
             argv.insert(3, f"-p{password}")
             code, out = _run(argv)
@@ -171,12 +237,174 @@ def _extract_tar(archive: Path, target: Path) -> None:
             tf.extractall(target, members=members)
 
 
+def _declared_unpacked_7z(exe: str, archive: Path, password: str | None) -> int | None:
+    """用 ``7z l -slt`` 预读 7z 的**声明**解压总量。
+
+    返回 None = 读不出来（不是错误：调用方按"无法预检"处理，仍受超时与后续防护约束）。
+    ``-slt`` 输出形如::
+
+        Path = a.bin
+        Size = 1048576
+        Packed Size = 1024
+
+    只取 ``Size`` 行并求和；目录条目不出现 ``Size``，自然不计入。
+
+    注意：``-slt``/``-ba`` 是 **7-Zip 的参数**，UnRAR 不认（会报 ``Unknown option: ba``
+    并返回 None → 预检静默放行）。rar 必须走 :func:`_declared_unpacked_unrar`。
+    """
+    argv = [exe, "l", "-slt", "-ba", str(archive)]
+    if password:
+        argv.insert(2, f"-p{password}")
+    return _sum_size_lines(argv)
+
+
+def _declared_unpacked_unrar(exe: str, archive: Path, password: str | None) -> int | None:
+    """用 UnRAR 的 ``lt``（列表技术信息）预读 rar 的声明解压总量。
+
+    UnRAR 没有 ``-slt``/``-ba``，必须用 ``lt``。安静标志要用 ``-idc``（不显示注释），
+    **不能用 ``-idq``**——``-idq`` 会把列表本身也压掉（实测输出为空，解析必然是 None）。
+
+    实测输出形如::
+
+        Archive: bomb.rar
+        Details: RAR 5
+
+                Name: zeros.bin
+                Type: File
+                Size: 4194304
+         Packed size: 188
+               Ratio: 0%
+               CRC32: 1147406A
+
+    只取 ``Size:``（注意 ``Packed size:`` 是小写 s 且前缀不同，不会误匹配）。
+    返回 None = 读不出来（调用方**必须拒绝放行**，不能让预检形同虚设）。
+    """
+    argv = [exe, "lt", "-idc", str(archive)]
+    if password:
+        argv.insert(2, f"-p{password}")
+    kwargs: dict = {"capture_output": True, "timeout": 300, "stdin": subprocess.DEVNULL}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        proc = subprocess.run(argv, **kwargs)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode not in (0, 1):  # unrar lt 对"某些警告"返回 1，仍带完整列表
+        return None
+    out = (proc.stdout or b"").decode("utf-8", "replace")
+    total = 0
+    seen = False
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("Name:"):
+            seen = True
+            continue
+        if not line.startswith("Size:"):
+            continue
+        try:
+            total += int(line[len("Size:"):].strip())
+        except ValueError:
+            continue
+    return total if seen else None
+
+
+def _sum_size_lines(argv: list[str]) -> int | None:
+    """跑 ``argv`` 并把输出里 ``Size =`` 行的数字求和；跑不起来/非 0 退出返回 None。"""
+    kwargs: dict = {"capture_output": True, "timeout": 300, "stdin": subprocess.DEVNULL}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        proc = subprocess.run(argv, **kwargs)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    out = (proc.stdout or b"").decode("utf-8", "replace")
+    total = 0
+    for line in out.splitlines():
+        line = line.strip()
+        # 精确匹配 "Size ="，避免把 "Packed Size =" 也算进来
+        if line.startswith("Size ="):
+            try:
+                total += int(line[len("Size ="):].strip())
+            except ValueError:
+                continue
+    return total
+
+
+def _count_entries_7z(exe: str, archive: Path, password: str | None) -> int | None:
+    """用 ``7z l -slt`` 数条目数（每段一个 ``Path = ``）。
+
+    用于条目数上限（审查 A4 的 ``max_entries`` 此前是 ``pass`` 空壳）。
+    """
+    argv = [exe, "l", "-slt", "-ba", str(archive)]
+    if password:
+        argv.insert(2, f"-p{password}")
+    kwargs: dict = {"capture_output": True, "timeout": 300, "stdin": subprocess.DEVNULL}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        proc = subprocess.run(argv, **kwargs)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    out = (proc.stdout or b"").decode("utf-8", "replace")
+    return sum(1 for line in out.splitlines() if line.strip().startswith("Path ="))
+
+
+def _check_external_bomb(
+    exe: str,
+    archive: Path,
+    password: str | None = None,
+    *,
+    unrar: bool = False,
+) -> None:
+    """外部解压前的**绝对上限**预检（审查 A4：此前 7z/rar 完全没有炸弹防护）。
+
+    只信"绝对上限"（默认 100 GiB，可用 BACKUPSTUDIO_MAX_UNPACKED_BYTES 放宽/关闭）：
+
+    * 声明值超限 → 直接拒绝（不必真解一遍把磁盘写满）；
+    * 声明值可读且未超限 → 放行（7z 解压后仍受 timeout 约束）；
+    * 读不出来 → **拒绝放行**（审查 E：此前静默 return，预检形同虚设）。
+      加密包确实读不出大小，调用方用 ``password`` 传对密码即可；
+      若仍读不出，宁可让用户显式放宽上限，也不默认放行未预检的解压。
+
+    ``unrar=True`` 时用 ``unrar lt`` 解析（UnRAR 不认 7z 的 ``-slt``）。
+    """
+    _, _, max_entries = _limits()
+    if unrar:
+        declared = _declared_unpacked_unrar(exe, archive, password)
+        entries = None
+    else:
+        declared = _declared_unpacked_7z(exe, archive, password)
+        entries = _count_entries_7z(exe, archive, password)
+    if declared is None:
+        raise ExtractionError(
+            f"无法预读 {archive.name} 的解压后大小，拒绝在未预检的情况下解压。"
+            f"（加密包请先提供正确密码；确认可信可设 {ENV_MAX_UNPACKED_BYTES}=0 关闭上限）"
+        )
+    if max_entries > 0 and entries is not None and entries > max_entries:
+        raise ExtractionError(
+            f"疑似压缩炸弹：条目数 {entries} 超过上限 {max_entries}，已中止。"
+            f"（确认无误可设 {ENV_MAX_ENTRIES} 放宽，或 0 关闭）"
+        )
+    limit = unpack_limit(archive.stat().st_size if archive.exists() else 0)
+    if limit > 0 and declared > limit:
+        raise ExtractionError(
+            f"疑似压缩炸弹：解压后总量 {declared // (1024**2)} MB 超过上限 "
+            f"{limit // (1024**2)} MB，已中止。"
+            f"（确认无误可设 {ENV_MAX_UNPACKED_BYTES} 放宽，或 0 关闭）"
+        )
+
+
 def _extract_external(archive: Path, target: Path, password: str | None) -> str:
     name = archive.name.lower()
     if name.endswith((".7z", ".001")):
         exe = find_7z()
         if not exe:
             raise ExtractionError("需要 7-Zip 才能解压 .7z")
+        _check_external_bomb(exe, archive, password)
         argv = [exe, "x", "-y", f"-o{target}", str(archive)]
         if password:
             argv.insert(3, f"-p{password}")
@@ -187,6 +415,8 @@ def _extract_external(archive: Path, target: Path, password: str | None) -> str:
     if name.endswith(".rar"):
         exe = find_unrar()
         if exe:
+            # UnRAR 不认 7z 的 -slt/-ba，必须走 lt（审查 E：此前解析失败被静默放行）
+            _check_external_bomb(exe, archive, password, unrar=True)
             argv = [exe, "x", "-idq", "-y", str(archive), str(target) + os.sep]
             if password:
                 argv.insert(3, f"-p{password}")
@@ -196,6 +426,7 @@ def _extract_external(archive: Path, target: Path, password: str | None) -> str:
             return "rar"
         seven = find_7z()
         if seven:
+            _check_external_bomb(seven, archive, password)
             argv = [seven, "x", "-y", f"-o{target}", str(archive)]
             if password:
                 argv.insert(3, f"-p{password}")
@@ -208,68 +439,129 @@ def _extract_external(archive: Path, target: Path, password: str | None) -> str:
 
 
 def _extract_zst_to_dir(archive: Path, target: Path) -> str:
-    """.tar.zst：先解出内层 tar，再走安全 tar 解压路径。
+    """.tar.zst：先解出内层 tar，再走安全 tar 解压路径（两条修复是互补的，缺一即错）。
 
     顺序：内置 `zstandard` 模块（项目已作为可选依赖，最稳）→ `zstd` CLI → 7-Zip。
-    审查 M22 全格式覆盖时发现：本机没有 zstd CLI 时旧实现直接 `7z x` 整包，7za 只剥掉
-    zstd 一层、留下一个同名 ``.tar`` 文件，却返回"已解压"——**假成功**（用户以为恢复完成，
-    实际一个成员都没解出来）。所以 7za 那一档现在只在能拿到内层 tar 时才认成功。
+
+    融合的两条独立缺陷：
+    * 上游 M22 —— **假成功**：本机没有 zstd CLI 时旧实现直接 `7z x` 整包，7za 只剥掉
+      zstd 一层、留下一个同名 ``.tar`` 文件，却返回"已解压"（用户以为恢复完成，实际
+      一个成员都没解出来）。因此任何一档都**必须真正拿到内层 tar 并解出成员**才算成功。
+    * 本分支 F —— **零防护**：这条路径此前没有任何炸弹检查。单纯加
+      ``_check_external_bomb`` 不够 —— 实测 7-Zip 对 ``.tar.zst`` 只报告外层流
+      （``Method = header-open-only ... unknown-content-size``），``7z l -slt`` 的
+      ``Size`` 是空值 → 预检读到 0 → 放行。所以内置解压与 7z 回退都改成
+      **边写边计数**，超限立即中止。
+
+    另外 ``read_across_frames=True``（上游）保证多帧拼接的 .zst 也被读全，否则内层 tar
+    被截断 → 解出半个包。
     """
-    inner = Path(tempfile.mkdtemp(prefix="bs-zst-", dir=str(target))) / "payload.tar"
+    # 1) 首选：进程内 zstandard 流式解压（能精确计数，且不额外起进程）
     try:
-        produced = False
-        try:  # 1) 内置 zstandard：流式解压，带膨胀上限（压缩炸弹防护不因这层失守）
-            import zstandard as _zstd
-        except ImportError:
-            _zstd = None
-        if _zstd is not None:
-            limit = min(_MAX_TOTAL_BYTES, max(archive.stat().st_size, 1) * _MAX_EXPANSION_RATIO)
-            dctx = _zstd.ZstdDecompressor()
-            written = 0
-            with open(archive, "rb") as fh, open(inner, "wb") as out:
-                try:
-                    # read_across_frames：多帧拼接的 .zst（split 后再压缩之类）也要读全，
-                    # 否则只取第一帧 → 内层 tar 被截断 → 解出半个包
-                    reader = dctx.stream_reader(fh, read_across_frames=True)
-                except TypeError:  # pragma: no cover - 老版本 zstandard 不认这个关键字
-                    reader = dctx.stream_reader(fh)
-                # 读到 EOF 才会校验帧内 checksum（与 M18 校验口径一致：读透才检得出损坏）
-                with reader as src:
-                    while True:
-                        chunk = src.read(1 << 20)
-                        if not chunk:
-                            break
-                        written += len(chunk)
-                        if written > limit:
-                            raise ExtractionError(
-                                f"疑似压缩炸弹：解压总量 {written // (1024**2)} MB 超过上限，已中止"
-                            )
-                        out.write(chunk)
-            produced = True
-        if not produced:
-            zstd = shutil.which("zstd")
-            if zstd:  # 2) 外部 zstd
-                code, out = _run([zstd, "-d", "-q", "-o", str(inner), str(archive)])
-                if code != 0:
-                    raise ExtractionError(f"zstd 解压失败：{out}")
-                produced = True
-        if not produced:  # 3) 7-Zip 兜底，并把留下的内层 tar 续解（否则就是假成功）
-            seven = find_7z()
-            if not seven:
-                raise ExtractionError("需要 zstandard / zstd 或 7-Zip 才能解压 .tar.zst")
-            code, out = _run([seven, "x", "-y", f"-o{inner.parent}", str(archive)])
-            if code != 0:
-                raise ExtractionError(f"7-Zip 解压失败（退出码 {code}）：{out}")
-            cands = [p for p in inner.parent.glob("*.tar") if p.is_file()]
-            if not cands:
-                raise ExtractionError(
-                    "7-Zip 解压 .tar.zst 后未得到内层 tar（可能只剥了一层），已中止以避免假成功"
-                )
-            inner = cands[0]
-        _extract_tar(inner, target)
+        import zstandard
+    except ImportError:
+        zstandard = None
+    if zstandard is not None:
+        limit = unpack_limit(archive.stat().st_size if archive.exists() else 0)
+        unpacked = 0
+        with tempfile.TemporaryDirectory(dir=str(target)) as tmp:
+            tar_path = Path(tmp) / "payload.tar"
+            try:
+                with open(archive, "rb") as src_fh, open(tar_path, "wb") as out_fh:
+                    try:
+                        # read_across_frames：多帧拼接的 .zst 也要读全，否则内层 tar 被截断
+                        reader = zstandard.ZstdDecompressor().stream_reader(
+                            src_fh, read_across_frames=True
+                        )
+                    except TypeError:  # pragma: no cover - 老版本不认这个关键字
+                        reader = zstandard.ZstdDecompressor().stream_reader(src_fh)
+                    with reader as src:
+                        while True:
+                            chunk = src.read(1 << 20)
+                            if not chunk:
+                                break
+                            unpacked += len(chunk)
+                            if limit > 0 and unpacked > limit:
+                                raise ExtractionError(
+                                    f"疑似压缩炸弹：解压后总量超过上限 {limit // (1024**2)} MB，已中止。"
+                                    f"（确认无误可设 {ENV_MAX_UNPACKED_BYTES} 放宽，或 0 关闭）"
+                                )
+                            out_fh.write(chunk)
+            except ExtractionError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - zstd 帧损坏等（校验和错也要报出来）
+                raise ExtractionError(f"zstd 解压失败：{type(exc).__name__}: {exc}") from exc
+            if tar_path.stat().st_size == 0:
+                raise ExtractionError("zstd 解压后内层 tar 为空，已中止以避免假成功")
+            _extract_tar(tar_path, target)
         return "tar"
+
+    # 2) 外部 zstd CLI：同样必须先拿到内层 tar 再解（不能只剥一层就报成功）
+    zstd = shutil.which("zstd")
+    if zstd:
+        with tempfile.TemporaryDirectory(dir=str(target)) as tmp:
+            tar_path = Path(tmp) / "payload.tar"
+            code, out = _run([zstd, "-d", "-q", "-o", str(tar_path), str(archive)])
+            if code != 0:
+                raise ExtractionError(f"zstd 解压失败：{out}")
+            if not tar_path.is_file() or tar_path.stat().st_size == 0:
+                raise ExtractionError(
+                    "zstd 解压 .tar.zst 后未得到内层 tar，已中止以避免假成功"
+                )
+            _extract_tar(tar_path, target)
+        return "tar"
+
+    # 3) 7-Zip 回退：无法预读大小（外层是 zstd 流），改为 `e -so` 流式解压 + 实时计数。
+    seven = find_7z()
+    if seven:
+        limit = unpack_limit(archive.stat().st_size if archive.exists() else 0)
+        _stream_extract_7z(seven, archive, target, limit)
+        return "7z"
+    raise ExtractionError("需要 zstandard / zstd 或 7-Zip 才能解压 .tar.zst")
+
+
+def _stream_extract_7z(exe: str, archive: Path, target: Path, limit: int) -> None:
+    """用 ``7z e -so archive`` 把内容流式写到 ``target``，边写边计数，超限即杀进程。
+
+    用于 7-Zip 无法给出条目清单/大小的场合（.tar.zst 外层是 zstd 流）。
+    staging 目录由调用方清理，所以中止时不会留下"半包"污染最终目录。
+    """
+    import subprocess as _sp
+
+    kwargs: dict = {
+        "stdout": _sp.PIPE,
+        "stdin": _sp.DEVNULL,
+        "stderr": _sp.PIPE,
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = getattr(_sp, "CREATE_NO_WINDOW", 0)
+    proc = _sp.Popen([exe, "e", "-so", "-y", str(archive)], **kwargs)
+    unpacked = 0
+    # 7z e -so 会把 tar 流原样输出；这里先把整个 tar 写到临时文件，再走安全 tar 解压。
+    tmp_tar = target / ".bs-stream.tar"
+    try:
+        with open(tmp_tar, "wb") as out_fh:
+            while True:
+                chunk = proc.stdout.read(1 << 20)
+                if not chunk:
+                    break
+                unpacked += len(chunk)
+                if limit > 0 and unpacked > limit:
+                    proc.kill()
+                    proc.wait(timeout=10)
+                    raise ExtractionError(
+                        f"疑似压缩炸弹：解压后总量超过上限 {limit // (1024**2)} MB，已中止。"
+                        f"（确认无误可设 {ENV_MAX_UNPACKED_BYTES} 放宽，或 0 关闭）"
+                    )
+                out_fh.write(chunk)
+        code = proc.wait(timeout=60)
+        if code != 0:
+            err = (proc.stderr.read() or b"").decode("utf-8", "replace").strip()[-400:]
+            raise ExtractionError(f"7-Zip 解压失败（退出码 {code}）：{err}")
+        _extract_tar(tmp_tar, target)
     finally:
-        shutil.rmtree(inner.parent, ignore_errors=True)
+        with contextlib.suppress(OSError):
+            tmp_tar.unlink()
 
 
 def _scan_escape(base: Path) -> list[str]:

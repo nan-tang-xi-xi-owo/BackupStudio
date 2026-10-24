@@ -44,7 +44,11 @@ Source: "__ROOT__\dist\BackupStudio\*"; DestDir: "{app}"; Flags: ignoreversion r
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
-Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--tray --minimized"; Tasks: autostart
+; R-fix4：`tray` 是 argparse 的**子命令**，不是选项。旧写法把 tray 当成长选项前缀，
+; 会被 argparse 判为 unrecognized arguments → 进程 rc=2 立即退出，用户勾了「开机自启」
+; 后定时备份一次都不执行且无任何提示。改用 `start --minimized`，
+; 与 autostart.py::gui_command() 四个平台写入点保持完全一致。
+Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "start --minimized"; Tasks: autostart
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "立即运行 {#MyAppName}"; Flags: nowait postinstall skipifsilent

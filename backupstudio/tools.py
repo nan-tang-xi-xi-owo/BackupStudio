@@ -93,7 +93,20 @@ def _tool_dir() -> Path:
     return here / "tools"
 
 
+def _disabled_by_env(name: str) -> bool:
+    """显式禁用某个外部工具（B8：CI 要能真正模拟"纯净机器"）。
+
+    只靠改目录名/清 PATH 都不可靠 —— 7-Zip 还可能在 Program Files、Chocolatey、
+    snap、flatpak、Keka 内置等多处（见 _SEVEN_ZIP_CANDIDATES）。这里在查找**入口**
+    直接短路，才是可测试、可复现的"无 7z 环境"。
+    """
+    val = os.environ.get(f"BACKUPSTUDIO_DISABLE_{name.upper()}", "").strip().lower()
+    return val not in ("", "0", "false", "no", "off")
+
+
 def find_7z() -> str | None:
+    if _disabled_by_env("7z"):
+        return None
     info = get_platform_info()
     key = "win32" if info.is_windows else ("darwin" if info.is_macos else "linux")
     tool_dir = _tool_dir()
@@ -115,6 +128,8 @@ def find_7z() -> str | None:
 
 
 def find_rar() -> str | None:
+    if _disabled_by_env("rar"):
+        return None
     info = get_platform_info()
     key = "win32" if info.is_windows else ("darwin" if info.is_macos else "linux")
     tool_dir = _tool_dir()
@@ -134,10 +149,23 @@ def find_rar() -> str | None:
 
 
 def find_unrar() -> str | None:
+    if _disabled_by_env("unrar"):
+        return None
     found = _which_many(["unrar", "UnRAR", "UNRAR"])
     if found:
         return found
     info = get_platform_info()
+    key = "win32" if info.is_windows else ("darwin" if info.is_macos else "linux")
+    tool_dir = _tool_dir()
+    # 应用自带的 UnRAR 优先（与 find_7z/find_rar 一致）。此前这里只查 PATH 与 Program
+    # Files，导致打包版明明带了 tools/win32/rar/UnRAR.exe 却 find_unrar()->None，
+    # 于是 .rar 解压落到 7za.exe（无 rar 解码器）→ 报 "Cannot open the file as archive"，
+    # 且 rar 炸弹预检（需要 unrar lt）永远不生效。
+    for sub in (tool_dir / key / "rar", tool_dir / "rar", tool_dir / key, tool_dir):
+        for name in ("UnRAR.exe", "unrar.exe", "unrar"):
+            p = sub / name
+            if p.is_file() and not p.is_dir():
+                return str(p)
     if info.is_windows:
         for cand in (
             r"%ProgramFiles%\WinRAR\UnRAR.exe",

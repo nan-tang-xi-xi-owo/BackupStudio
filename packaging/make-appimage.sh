@@ -38,10 +38,22 @@ cat > "$APPDIR/AppRun" <<'EOF'
 #!/bin/sh
 HERE="$(dirname "$(readlink -f "$0")")"
 export PATH="$HERE/usr/bin:$PATH"
-export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb;wayland}"
+# B4：wayland 优先、xcb 兜底（原值 xcb;wayland 在纯 Wayland 桌面上反而先失败）
+export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-wayland;xcb}"
 exec "$HERE/usr/lib/backupstudio/BackupStudio" "$@"
 EOF
 chmod +x "$APPDIR/AppRun"
+
+# B4：.desktop 里 Exec/TryExec 都是 `backupstudio`，但 AppDir 之前只有
+# usr/lib/backupstudio/BackupStudio，**没有 usr/bin/backupstudio** →
+# TryExec 失效（桌面环境判定"程序不存在"而不显示图标/无法从菜单启动）。
+# 补一个启动器脚本，让 Exec/TryExec 真正可解析。
+cat > "$APPDIR/usr/bin/backupstudio" <<'EOF'
+#!/bin/sh
+HERE="$(dirname "$(readlink -f "$0")")/../.."
+exec "$HERE/usr/lib/backupstudio/BackupStudio" "$@"
+EOF
+chmod +x "$APPDIR/usr/bin/backupstudio"
 
 cp "$ROOT/packaging/icon.png" "$APPDIR/io.github.backupstudio.BackupStudio.png"
 cp "$ROOT/packaging/icon.png" "$APPDIR/usr/share/icons/hicolor/512x512/apps/io.github.backupstudio.BackupStudio.png"
@@ -49,6 +61,20 @@ cp "$ROOT/packaging/io.github.backupstudio.BackupStudio.desktop" "$APPDIR/"
 cp "$ROOT/packaging/io.github.backupstudio.BackupStudio.desktop" "$APPDIR/usr/share/applications/"
 cp "$ROOT/packaging/io.github.backupstudio.BackupStudio.metainfo.xml" "$APPDIR/usr/share/metainfo/"
 cp "$ROOT/packaging/icon.png" "$APPDIR/.DirIcon"
+
+# 防线：appimagetool 内嵌的 desktop-file-validate 拒绝任何以 CR 结尾的行
+# （"file contains at least one line ending with a carriage return"）。
+# 仓库已用 .gitattributes 固定 eol=lf，但只要有人在 Windows 上以
+# core.autocrlf=false 检出、或补丁工具改写过换行，就会把 CRLF 带进构建。
+# 这里无条件剥离 CR，避免"本地能跑、CI 报桌面文件非法"这类假失败。
+for f in "$APPDIR/io.github.backupstudio.BackupStudio.desktop" \
+         "$APPDIR/usr/share/applications/io.github.backupstudio.BackupStudio.desktop" \
+         "$APPDIR/usr/share/metainfo/io.github.backupstudio.BackupStudio.metainfo.xml"; do
+  if [[ -f "$f" ]] && grep -q $'\r' "$f"; then
+    echo "==> 剥离 CR: $f"
+    sed -i 's/\r$//' "$f"
+  fi
+done
 
 # ---------------------------------------------------------------- appimagetool
 mkdir -p "$TOOLS"
