@@ -26,15 +26,24 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
-      - name: 环境自检（定位各 runner 的压缩工具差异）
+      - name: 准备 7-Zip（模拟打包版机器的"有 7z"环境）
         shell: pwsh
         run: |
-          python -m backupstudio info
-          python -c "from backupstudio.tools import find_7z, probe_7z; print('7z =', find_7z()); print(probe_7z())"
-          Write-Host "PATH 中的 7z/7za/tar："
-          Get-Command 7z,7za,7zr,tar -ErrorAction SilentlyContinue | Select-Object Name,Source
-      - name: pytest
-        run: python -m pytest tests -q -x
+          New-Item -ItemType Directory -Force tools/win32/7z | Out-Null
+          curl.exe -L -o 7zr.exe https://www.7-zip.org/a/7zr.exe
+          curl.exe -L -o 7z-extra.7z https://github.com/ip7z/7zip/releases/download/24.09/7z2409-extra.7z
+          ./7zr.exe x 7z-extra.7z -otools/win32/7z-extract -y
+          Copy-Item tools/win32/7z-extract/x64/7za.exe tools/win32/7z/
+          Copy-Item tools/win32/7z-extract/x64/7za.dll tools/win32/7z/
+          Copy-Item tools/win32/7z-extract/x64/7zxa.dll tools/win32/7z/
+      - name: pytest（有 7z 环境——模拟打包版用户机器）
+        run: python -m pytest tests -q
+      - name: pytest（无 7z 环境——模拟纯净安装机器）
+        shell: pwsh
+        run: |
+          Rename-Item -Path tools/win32/7z -NewName _7z_off
+          python -m pytest tests -q
+          Rename-Item -Path tools/win32/_7z_off -NewName 7z
 
   windows:
     name: Windows exe / 安装包

@@ -233,7 +233,6 @@ def format_capabilities(force: bool = True) -> dict[str, dict]:
     seven_full = bool(report["seven_zip"]) and report["seven_zip_full"]
     seven_any = bool(report["seven_zip"])
     rar_ok = bool(report["rar"]) and report["rar_can_write"]
-    gpg_ok = bool(report["gpg"])
     codecs = report["codecs"]
     tar_ok = bool(report["tar"])
 
@@ -326,12 +325,13 @@ def format_capabilities(force: bool = True) -> dict[str, dict]:
                     ok = seven_any
                     reason = "" if ok else "需要 7-Zip"
             elif mode == "zipcrypto":
-                ok = seven_any or True  # 标准库 zipfile 也能写，但需要 7z 来加密容器
-                reason = "" if seven_any else "需要 7-Zip 写入加密 ZIP"
                 ok = seven_any
+                reason = "" if seven_any else "需要 7-Zip 写入加密 ZIP"
             else:  # gpg
-                ok = gpg_ok and entry["available"]
-                reason = "" if ok else "需要安装 GPG（gnupg）"
+                # gpg 加密在引擎中尚未实现（archives.py 无任何 gpg 代码）：
+                # 标记为不可用，避免"记录已加密而实际明文"的静默失败。
+                ok = False
+                reason = "GPG 加密尚未实现（后续版本提供）"
             entry["password"][mode] = {
                 "available": ok,
                 "reason": reason,

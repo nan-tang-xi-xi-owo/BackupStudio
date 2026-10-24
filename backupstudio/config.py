@@ -6,6 +6,8 @@ import contextlib
 import copy
 import json
 import os
+import secrets
+import time
 import uuid
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
@@ -381,16 +383,34 @@ class RunRecord:
 # --------------------------------------------------------------------------
 
 def save_json_atomic(path: Path | str, data: Any) -> None:
-    """原子写入 JSON；文件权限收紧到仅当前用户可读写。"""
+    """原子写入 JSON；文件权限收紧到仅当前用户可读写。
+
+    R4：临时名必须唯一（pid + 随机后缀），否则 GUI 与 daemon 两进程同时
+    保存会对同一临时 inode 交错 O_TRUNC 写，产出「两份 JSON 拼接」的坏文件；
+    replace 增加重试以吸收 Windows 上杀毒/索引器造成的瞬态占用。
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
     text = json.dumps(data, ensure_ascii=False, indent=2)
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
-        os.replace(tmp, path)
+            fh.flush()
+            os.fsync(fh.fileno())
+        last_exc: OSError | None = None
+        delay = 0.02
+        for attempt in range(12):  # 首次 + 11 次重试（指数退避，吸收 CI/杀软下的高竞争）
+            try:
+                os.replace(tmp, path)
+                return
+            except OSError as exc:  # Windows 瞬态占用：短暂退避后重试
+                last_exc = exc
+                if attempt < 11:
+                    time.sleep(delay)
+                    delay = min(delay * 1.7, 0.5)
+        raise last_exc if last_exc is not None else OSError(f"无法写入 {path}")
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
@@ -398,17 +418,46 @@ def save_json_atomic(path: Path | str, data: Any) -> None:
 
 
 def load_json(path: Path | str, default: Any) -> Any:
+    """读取 JSON，尽力容错。
+
+    * 文件不存在 → 默认值；
+    * 内容损坏（JSONDecodeError）→ 带时间戳归档为 ``.corrupt-<ts>`` 后返回默认值
+      （时间戳防止二次损坏覆盖第一次的备份）；
+    * 坏字节 → ``errors="replace"`` 尽力恢复，仅当结构确实无法解析才归档；
+    * 瞬态 OSError（如 Windows 上正被另一进程 replace）→ 重试 3 次后仍失败则
+      **抛出不改名**——绝不能让瞬态读失败把完好文件误判为损坏（会引发
+      "空库回写→用户任务静默消失"链）；调用方 store.py 有兜底且保存前会保全原文件。
+    """
     path = Path(path)
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return json.load(fh)
-    except FileNotFoundError:
-        return copy.deepcopy(default)
-    except (OSError, json.JSONDecodeError):
-        # 损坏的配置不阻塞启动：备份一份后回到默认值
+    text: str | None = None
+    last_exc: OSError | None = None
+    for attempt in range(4):  # 首次 + 3 次重试
         try:
-            if path.exists():
-                path.replace(path.with_suffix(path.suffix + ".corrupt"))
-        except OSError:
-            pass
-        return copy.deepcopy(default)
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+            break
+        except FileNotFoundError:
+            return copy.deepcopy(default)
+        except OSError as exc:
+            last_exc = exc
+            if attempt < 3:
+                time.sleep(0.05)
+    if text is None:
+        raise last_exc if last_exc is not None else OSError(f"无法读取 {path}")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # 损坏的配置不阻塞启动：带时间戳备份一份后回到默认值（防覆盖第一次备份）
+    try:
+        if path.exists():
+            stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            archive = path.with_suffix(path.suffix + f".corrupt-{stamp}")
+            n = 1
+            while archive.exists():  # 同一秒内二次损坏也要并存，不覆盖第一次
+                archive = path.with_suffix(path.suffix + f".corrupt-{stamp}-{n}")
+                n += 1
+            path.replace(archive)
+    except OSError:
+        pass
+    return copy.deepcopy(default)

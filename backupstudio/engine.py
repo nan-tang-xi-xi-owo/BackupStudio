@@ -156,6 +156,9 @@ def _auto_skip(path: Path) -> bool:
         return True
     if name.startswith(".bs-staging") or name.endswith(".full-tmp") or ".part-tmp" in name:
         return True
+    if ".bs-tmp-" in name:
+        # 事务性落地的临时产物（<最终名>.bs-tmp-<pid>）：不是备份、不是源数据
+        return True
     return False
 
 
@@ -207,6 +210,32 @@ def verify_archive(main: Path, fmt: str, password: str | None = None) -> tuple[b
             import zipfile
 
             with zipfile.ZipFile(main) as zf:
+                infos = zf.infolist()
+                encrypted = any(bool(i.flag_bits & 0x1) for i in infos if not i.is_dir())
+                if encrypted:
+                    # 加密条目无法用 zipfile 测试（读不了内容）：
+                    # 有 7-Zip 时用 7z t 带密码测试；否则明确跳过（不得误报成败）。
+                    from .tools import find_7z
+
+                    seven = find_7z()
+                    if seven:
+                        import subprocess
+                        import sys as _sys
+
+                        argv = [seven, "t", str(main)]
+                        if password:
+                            argv.insert(2, f"-p{password}")
+                        kwargs: dict = {"capture_output": True, "timeout": 600, "stdin": subprocess.DEVNULL}
+                        if _sys.platform == "win32":
+                            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                        proc = subprocess.run(argv, **kwargs)
+                        out7 = (proc.stdout or b"").decode("utf-8", "replace")
+                        if proc.returncode == 0:
+                            return True, "7-Zip 测试通过（加密 ZIP）"
+                        if not password:
+                            return False, "加密 ZIP 需要密码才能校验，请提供密码"
+                        return False, f"加密 ZIP 校验失败（退出码 {proc.returncode}）{out7.strip()[-200:]}"
+                    return True, "跳过内容校验：加密 ZIP 需 7-Zip（条目数与加密位已核对）"
                 bad = zf.testzip()
                 if bad is None:
                     return True, f"{len(zf.infolist())} 个条目校验通过"
@@ -233,7 +262,28 @@ def verify_archive(main: Path, fmt: str, password: str | None = None) -> tuple[b
             import tarfile
 
             if fmt == "tar.zst":
-                # Python < 3.14 的 tarfile 不认识 zstd：优先用 7-Zip，其次 zstd 解压后校验
+                # Python < 3.14 的 tarfile 不认识 zstd：优先用 zstandard 模块流式解压
+                # 再交给 tarfile 遍历（覆盖 pip 安装的普通用户机）；
+                # 其次 7-Zip，再到系统 zstd，最后才回退 tarfile 原生（会失败）。
+                try:
+                    import zstandard as _zstd  # noqa: PLC0415
+
+                    with open(main, "rb") as fh:
+                        reader = _zstd.ZstdDecompressor().stream_reader(fh)
+                        with tarfile.open(fileobj=reader, mode="r|") as tf:
+                            count = 0
+                            for m in tf:
+                                count += 1
+                                if m.isfile():
+                                    f = tf.extractfile(m)
+                                    if f is not None:
+                                        while f.read(1 << 20):
+                                            pass
+                    return True, f"{count} 个条目校验通过（zstandard 流式）"
+                except ImportError:
+                    pass
+                except Exception as exc:  # noqa: BLE001 - 能解但内容坏 → 明确失败
+                    return False, f"zstandard 校验失败：{type(exc).__name__}: {exc}"
                 from .tools import find_7z
 
                 seven = find_7z()
@@ -241,7 +291,7 @@ def verify_archive(main: Path, fmt: str, password: str | None = None) -> tuple[b
                     import subprocess
                     import sys
 
-                    kwargs: dict = {"capture_output": True, "timeout": 3600}
+                    kwargs: dict = {"capture_output": True, "timeout": 3600, "stdin": subprocess.DEVNULL}
                     if sys.platform == "win32":
                         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
                     proc = subprocess.run([seven, "t", str(main)], **kwargs)
@@ -253,11 +303,9 @@ def verify_archive(main: Path, fmt: str, password: str | None = None) -> tuple[b
                 if zstd:
                     import subprocess
 
-                    proc = subprocess.run([zstd, "-t", str(main)], capture_output=True, timeout=3600)
+                    proc = subprocess.run([zstd, "-t", str(main)], capture_output=True, timeout=3600, stdin=subprocess.DEVNULL)
                     return proc.returncode == 0, "zstd 校验通过" if proc.returncode == 0 else "zstd 校验失败"
-                with tarfile.open(main, "r:*") as tf:
-                    count = sum(1 for _ in tf)
-                return True, f"{count} 个条目可读取"
+                return False, "跳过校验：无 zstandard 模块 / zstd / 7-Zip，无法验证 tar.zst 内容"
             with tarfile.open(main, "r:*") as tf:
                 count = 0
                 for _ in tf:

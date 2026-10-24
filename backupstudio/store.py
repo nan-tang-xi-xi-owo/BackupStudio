@@ -34,10 +34,13 @@ class TaskStore:
 
     # ------------------------------------------------------------------
     def _load(self) -> None:
+        self._load_error: BaseException | None = None
         try:
             raw = load_json(self.path, {})
         except Exception as exc:  # noqa: BLE001 - 配置损坏不应阻止启动
             log.warning("读取配置失败，使用空配置：%s", exc)
+            # 记住失败原因：保存时若原文件仍存在，先保全再覆写（防"读不到→空库回写"数据丢失链）
+            self._load_error = exc
             raw = {}
         if not isinstance(raw, dict):
             raw = {}
@@ -54,6 +57,17 @@ class TaskStore:
 
     def save(self) -> None:
         with self._lock:
+            # 加载曾失败且原文件仍在：先保全迁移，禁绝不覆盖（防数据丢失链）
+            if self._load_error is not None and self.path.exists():
+                stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+                rescue = self.path.with_name(self.path.name + f".rescue-{stamp}")
+                try:
+                    self.path.replace(rescue)
+                    log.warning("配置读取曾失败（%s）；原文件已保全为 %s，避免覆写", self._load_error, rescue)
+                except OSError:
+                    log.error("配置读取曾失败且无法保全原文件，取消本次保存以避免覆写 %s", self.path)
+                    raise
+                self._load_error = None
             data = {
                 "app": APP_NAME,
                 "version": CONFIG_VERSION,

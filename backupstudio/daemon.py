@@ -17,7 +17,7 @@ import time
 from datetime import datetime
 
 from . import __version__
-from .config import BackupTask
+from .config import BackupTask, RunRecord
 from .engine import TaskEngine
 from .paths import config_dir, ipc_endpoint, log_dir, pid_file_path, state_file_path
 from .schedule import describe_next, due, parse_ts
@@ -183,24 +183,27 @@ class DaemonService:
     def _execute(self, task: BackupTask) -> None:
         try:
             result = self.engine.run(task, trigger="schedule")
+            rec = result.record
         except Exception:
             log.exception("任务执行异常：%s", task.name)
             return
-        # 回写任务状态
+        # 回写任务状态（磁盘优先；失败则退回内存更新，保证 due() 判定立即失效）
         try:
             fresh = TaskStore(self.store.path)
             t = fresh.get(task.id)
-            if t is not None:
-                rec = result.record
-                t.last_run = rec.started_at
-                t.last_status = rec.status
-                t.last_message = rec.errors[0] if rec.errors else result.message
-                t.last_archive = rec.archive
-                t.last_duration = rec.duration
+            if t is None:
+                # 任务运行期间已被删除：同步删除内存中的副本，避免 15s 后再次触发
+                log.warning("任务 %s 在运行期间已被删除，不再回写状态", task.id)
+                self.store.delete(task.id)
+            else:
+                _apply_record(t, rec, result.message)
                 fresh.upsert(t)
                 fresh.save()
         except Exception:
-            log.exception("回写任务状态失败")
+            log.exception("回写任务状态失败，改用内存更新（防止重复触发）")
+            mem = self.store.get(task.id)
+            if mem is not None:
+                _apply_record(mem, rec, result.message)
         if rec.status == "failure":
             _native_notify("BackupStudio 备份失败", f"{task.name}：{(rec.errors or ['未知错误'])[0][:150]}", "critical")
         elif rec.status == "success":
@@ -279,6 +282,15 @@ class DaemonService:
             )
         except OSError:
             pass
+
+
+def _apply_record(task: BackupTask, rec: RunRecord, fallback_message: str) -> None:
+    """把一次执行结果写进任务记录字段（磁盘与内存两条路径共用）。"""
+    task.last_run = rec.started_at
+    task.last_status = rec.status
+    task.last_message = rec.errors[0] if rec.errors else fallback_message
+    task.last_archive = rec.archive
+    task.last_duration = rec.duration
 
 
 def _write_state(store: TaskStore, engine: TaskEngine) -> None:
