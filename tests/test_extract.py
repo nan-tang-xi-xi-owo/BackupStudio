@@ -921,3 +921,68 @@ class TestBuiltinZipActuallyCompresses:
             with zipfile.ZipFile(dest) as zf:
                 info = zf.getinfo("big.txt")
             assert info.compress_type == zipfile.ZIP_DEFLATED, f"{cls.__name__} 仍未压缩"
+
+
+class TestNoSizeContainerFailClosed:
+    """评审 R2-3（S1）：容器不报解压后大小时，预检必须 fail-closed。
+
+    复现：把 200 MiB 全零数据压成 zstd 流、改名为 ``bomb.7z``。
+    7za 能开这个流但 ``l -slt`` 只给出空的 ``Size =``（且没有 ``Path =``），
+    旧实现把"解析不出"当成 0 → 预检认为"声明 0 字节"放行 → 真解压写满磁盘。
+    """
+
+    @staticmethod
+    def _make_no_size_archive(path, size=64 * 1024 * 1024):
+        zstd = pytest.importorskip("zstandard", reason="需要 zstandard 构造样本")
+        import zstandard as z
+
+        path.write_bytes(z.ZstdCompressor().compress(b"\x00" * size))
+        return path
+
+    def test_declared_size_returns_none_not_zero(self, tmp_path):
+        from backupstudio import extract as ex
+        from backupstudio.tools import find_7z
+
+        exe = find_7z()
+        if not exe:
+            pytest.skip("需要 7-Zip")
+        arc = self._make_no_size_archive(tmp_path / "bomb.7z")
+        # None = "读不出"，调用方据此拒绝；返回 0 就会被当成"声明 0 字节"放行
+        assert ex._declared_unpacked_7z(exe, arc, None) is None
+
+    def test_extract_refuses_no_size_container(self, tmp_path, monkeypatch):
+        from backupstudio import extract as ex
+
+        if not ex.find_7z():
+            pytest.skip("需要 7-Zip")
+        monkeypatch.setenv(ex.ENV_MAX_UNPACKED_BYTES, str(1024 * 1024))
+        arc = self._make_no_size_archive(tmp_path / "bomb.7z")
+        out = tmp_path / "out"
+        ok, msg = ex.extract_archive(arc, out)
+        assert ok is False, f"无长度容器被放行：{msg}"
+        assert "无法预读" in msg or "炸弹" in msg, msg
+        written = sum(f.stat().st_size for f in out.rglob("*") if f.is_file()) if out.exists() else 0
+        assert written == 0, f"拒绝前已写入 {written} 字节"
+
+    def test_zero_size_archive_still_allowed(self, tmp_path):
+        """反向守卫：真正的 0 字节内容（纯目录包）必须继续放行。
+
+        ``Size = 0`` 是能解析出来的合法值，不能和"解析不出"混为一谈。
+        """
+        from backupstudio import extract as ex
+        from backupstudio.tools import find_7z
+
+        exe = find_7z()
+        if not exe:
+            pytest.skip("需要 7-Zip")
+        src = tmp_path / "srcdir"
+        (src / "e1").mkdir(parents=True)
+        (src / "e2").mkdir()
+        arc = tmp_path / "dironly.7z"
+        import subprocess
+
+        subprocess.run([exe, "a", "-t7z", str(arc), str(src)], capture_output=True, check=True)
+        assert ex._declared_unpacked_7z(exe, arc, None) == 0
+        assert ex._count_entries_7z(exe, arc, None) is not None
+        ok, msg = ex.extract_archive(arc, tmp_path / "out")
+        assert ok, f"纯目录 7z 被误拒：{msg}"

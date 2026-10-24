@@ -309,7 +309,16 @@ def _declared_unpacked_unrar(exe: str, archive: Path, password: str | None) -> i
 
 
 def _sum_size_lines(argv: list[str]) -> int | None:
-    """跑 ``argv`` 并把输出里 ``Size =`` 行的数字求和；跑不起来/非 0 退出返回 None。"""
+    """跑 ``argv`` 并把输出里 ``Size =`` 行的数字求和；读不出返回 None。
+
+    ``None`` 与 ``0`` 必须严格区分（评审 R2-3）：
+    * 解析出数值 0（空文件、纯目录包）是**合法**的声明值，调用方应放行；
+    * 一个 ``Size =`` 都没能解析出数字（行存在但值为空）说明这个容器
+      **不报告内容长度**——7za 对 zstd/bz2 这类"能开流但不知大小"的输入
+      正是输出空 ``Size =`` 且 rc=0。此时若返回 0，预检会认为"声明 0 字节"
+      而放行，实测可把 200 MiB 全零数据写满磁盘（fail-open）。
+      这类情况一律返回 None，由调用方按"无法预检"拒绝。
+    """
     kwargs: dict = {"capture_output": True, "timeout": 300, "stdin": subprocess.DEVNULL}
     if sys.platform == "win32":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -321,14 +330,25 @@ def _sum_size_lines(argv: list[str]) -> int | None:
         return None
     out = (proc.stdout or b"").decode("utf-8", "replace")
     total = 0
+    parsed = 0
+    size_lines = 0
     for line in out.splitlines():
         line = line.strip()
         # 精确匹配 "Size ="，避免把 "Packed Size =" 也算进来
-        if line.startswith("Size ="):
-            try:
-                total += int(line[len("Size ="):].strip())
-            except ValueError:
-                continue
+        if not line.startswith("Size ="):
+            continue
+        size_lines += 1
+        try:
+            total += int(line[len("Size ="):].strip())
+        except ValueError:
+            continue
+        parsed += 1
+    if size_lines == 0:
+        # 完全没有 Size 行：没有可求和的内容（纯目录包也会给 Size = 0，故此处属异常）
+        return None if not out.strip() else 0
+    if parsed == 0:
+        # 有 Size 行但全为空/非数字 → 容器不报长度，不能当成 0 放行
+        return None
     return total
 
 
@@ -350,7 +370,12 @@ def _count_entries_7z(exe: str, archive: Path, password: str | None) -> int | No
     if proc.returncode != 0:
         return None
     out = (proc.stdout or b"").decode("utf-8", "replace")
-    return sum(1 for line in out.splitlines() if line.strip().startswith("Path ="))
+    count = sum(1 for line in out.splitlines() if line.strip().startswith("Path ="))
+    # 有输出却一个 Path= 都没有 → 拿不到条目信息（7za 对"能开流但不知结构"的容器
+    # 会只给匿名 Size 段）。返回 None 表示"读不出"，与"确实 0 个条目"区分开。
+    if count == 0 and out.strip():
+        return None
+    return count
 
 
 def _check_external_bomb(
