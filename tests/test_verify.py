@@ -1,4 +1,4 @@
-"""校验体系测试（审查 E-1/E-2/C1/X2 回归）。
+﻿"""校验体系测试（审查 E-1/E-2/C1/X2 回归）。
 
 核心断言：**skipped 绝不当成 passed**；损坏包必须被检出；
 分卷校验走真实拼接（截断卷必须失败）。
@@ -196,3 +196,72 @@ class TestPy7zrPayloadVerify:
         assert ok is None, f"加密包无密码应 skipped，实际 {ok!r}"
         ok2, msg2 = verify_archive(arc, "7z", "pw")
         assert ok2 is True, f"正确密码应 passed，实际 {ok2!r}（msg={msg2}）"
+
+
+class TestPy7zrCorruptVsUndecidable:
+    """P1 回归：可压缩载荷损坏（LZMAError）必须判 failed，不能落进 skipped 兜底。
+
+    盲区成因：``test_verify.py`` 原有用例的载荷是 ``os.urandom``（不可压缩）——
+    随机数据翻转字节后仍能解码 → ``CrcError`` → 早就判 failed，测试常绿。
+    真实备份（文本/日志/代码）高度可压缩，翻转中段字节后解码器报
+    ``LZMAError: Corrupt input data``，旧实现落到 ``password is None`` 分支返回
+    ``None``（skipped）→ 真实损坏被静默放过。
+    """
+
+    @staticmethod
+    def _make_compressible_7z(tmp_path, size=200_000):
+        py7zr = pytest.importorskip("py7zr")
+        payload = tmp_path / "log.txt"
+        # 真实备份形态：重复文本行（压缩率极高）
+        payload.write_bytes(b"2026-10-24 INFO backupstudio compressible log line\n" * (size // 50))
+        arc = tmp_path / "good.7z"
+        with py7zr.SevenZipFile(arc, "w") as z:
+            z.write(payload, "log.txt")
+        return arc
+
+    def test_corrupt_set_contains_lzma(self):
+        """``_PY7ZR_CORRUPT`` 必须覆盖载荷层"输入损坏"的异常名。"""
+        from backupstudio.engine import _PY7ZR_CORRUPT, _PY7ZR_UNDECIDABLE
+
+        for name in ("LZMAError", "LZMACompressionError", "CrcError", "Bad7zFile"):
+            assert name in _PY7ZR_CORRUPT, f"{name} 未归入 corrupt"
+        assert not (_PY7ZR_CORRUPT & _PY7ZR_UNDECIDABLE), "两类异常不得重叠（否则顺序会串味）"
+
+    def test_compressible_payload_corruption_is_failed(self, tmp_path, no_7z):
+        """可压缩载荷翻转中段字节 → failed（旧实现返回 None）。"""
+        from backupstudio.engine import verify_archive
+
+        arc = self._make_compressible_7z(tmp_path)
+        ok0, msg0 = verify_archive(arc, "7z")
+        assert ok0 is True, f"完好的可压缩 7z 应 passed：{msg0}"
+
+        data = bytearray(arc.read_bytes())
+        data[len(data) // 2] ^= 0xFF
+        bad = tmp_path / "bad.7z"
+        bad.write_bytes(bytes(data))
+        ok, msg = verify_archive(bad, "7z")
+        assert ok is False, f"可压缩载荷损坏被判 {ok!r}（应为 failed）：{msg}"
+
+    def test_compressible_good_payload_still_passed(self, tmp_path, no_7z):
+        """修 LZMAError 不能把完好包误判失败。"""
+        from backupstudio.engine import verify_archive
+
+        arc = self._make_compressible_7z(tmp_path)
+        ok, msg = verify_archive(arc, "7z")
+        assert ok is True, f"完好可压缩 7z 被误判 {ok!r}：{msg}"
+
+    def test_encrypted_without_password_still_none(self, tmp_path, no_7z):
+        """加密包无密码仍须 None —— 加严 corrupt 分类不得殃及加密路径。"""
+        py7zr = pytest.importorskip("py7zr")
+        from backupstudio.engine import verify_archive
+
+        payload = tmp_path / "s.txt"
+        payload.write_text("secret" * 1000, encoding="utf-8")
+        arc = tmp_path / "enc.7z"
+        with py7zr.SevenZipFile(arc, "w", password="pw") as z:
+            z.write(payload, "s.txt")
+
+        ok, msg = verify_archive(arc, "7z")
+        assert ok is None, f"加密包无密码应 skipped，实际 {ok!r}（password is None 分支被绕过？）：{msg}"
+        ok2, msg2 = verify_archive(arc, "7z", "pw")
+        assert ok2 is True, f"正确密码应 passed：{msg2}"

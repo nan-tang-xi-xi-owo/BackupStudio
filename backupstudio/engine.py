@@ -215,6 +215,23 @@ def _verify_volumes(volumes, fmt: str, password: str | None = None) -> tuple[boo
 
 # py7zr "读得出目录但解不开载荷"的异常：属于无法判定，不得报 failed（名字匹配，避免版本间类名漂移）
 _PY7ZR_UNDECIDABLE = frozenset({"UnsupportedCompressionMethodError", "DecompressionError"})
+# py7zr/标准库在**载荷层**报"输入损坏"的异常：属于已损坏，必须判 failed。
+# 实测（审查 A1 补漏）：可压缩载荷（真实备份的典型形态：文本/日志/代码）翻转中段字节，
+# 解码器抛 ``LZMAError: Corrupt input data``；旧实现把它落到 ``password is None`` 兜底分支
+# 返回 None（skipped），真实损坏被静默漏判。随机载荷翻转换来的是 CrcError（已判 failed），
+# 所以只用 os.urandom 的回归测试**永远抓不到**这条路径。
+# 注意：加密归档由 PasswordRequired 分支先行拦截，不会落到这里，故无"加密包被误判"风险。
+_PY7ZR_CORRUPT = frozenset(
+    {
+        "Bad7zFile",
+        "CrcError",
+        "LZMAError",
+        "LZMACompressionError",
+        "ZlibError",
+        "BZ2DecompressorError",
+        "DecompressionBombError",
+    }
+)
 
 
 def _verify_7z_py7zr(main: Path, password: str | None) -> tuple[bool | None, str]:
@@ -251,6 +268,10 @@ def _verify_7z_py7zr(main: Path, password: str | None) -> tuple[bool | None, str
             return False, f"7z 校验失败（{name}）：{exc}"
         if name in _PY7ZR_UNDECIDABLE:
             return None, f"跳过校验：本机 py7zr 无法解码该归档（{name}）"
+        if name in _PY7ZR_CORRUPT:
+            # 顺序关键：**先判 undecidable 再判 corrupt**。本机缺解码器是"无法判定"，
+            # 而解码器报"输入损坏"才是"已损坏"——两者都可能是 LZMA 系异常名。
+            return False, f"7z 校验失败（{name}）：载荷损坏（{exc}）"
         if password is None:
             # 无密码时无法区分"载荷损坏"与"载荷被加密"，不武断判失败
             return None, f"跳过校验：py7zr 无法判定（{name}）"
