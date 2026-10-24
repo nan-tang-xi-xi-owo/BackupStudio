@@ -1,4 +1,4 @@
-"""manifest（备份身份层）测试：提交标记、卷组归组、迁移红线。
+﻿"""manifest（备份身份层）测试：提交标记、卷组归组、迁移红线。
 
 覆盖审查 E1/E2/E5 的关键断言：
 * 成功备份写 committed 清单；失败写 partial；
@@ -321,3 +321,118 @@ class TestCommitStateMachine:
             _time.sleep(1.05)
         zips = sorted(p.name for p in dest.glob("*.zip"))
         assert len(zips) == 1, f"keep_last=1 应只留 1 份：{zips}"
+
+
+class TestUnverifiedNotReclaimed:
+    """P0 回归：``unverified`` 是「没验过」，不是「不是备份」，不得被保留策略回收。
+
+    背景：``manifest.RECLAIMABLE_STATES`` 含 ``STATE_UNVERIFIED``，而
+    ``apply_retention`` 把所有 reclaimable 组当成残包无条件回收。
+    ``verify=False`` 的用户每次备份都会产出 unverified → **每次备份都把上一份删掉**。
+    实测 keep_last=30 连跑 3 次只剩 1 份（数据丢失）。
+    """
+
+    @staticmethod
+    def _policy(**kw):
+        from backupstudio.config import RetentionPolicy
+
+        base = dict(enabled=True, keep_last=30, keep_days=3650, on_cleanup="delete")
+        base.update(kw)
+        return RetentionPolicy(**base)
+
+    def test_unverified_survives_next_run(self, src_tree, tmp_path):
+        """P0 核心：verify=False 连跑 3 次，keep_last=30 时 3 份必须都还在。"""
+        import time as _t
+
+        from backupstudio.engine import TaskEngine
+        from backupstudio.manifest import STATE_UNVERIFIED, collect_groups
+
+        dest = tmp_path / "keepunv"
+        eng = TaskEngine()
+        for i in range(3):
+            t = _task(dest, src_tree, fmt="zip")
+            t.verify = False
+            t.name = f"u{i}"
+            t.retention = self._policy()
+            assert eng.run(t).record.status == "success"
+            _t.sleep(1.05)
+
+        zips = sorted(p.name for p in dest.glob("*.zip"))
+        assert len(zips) == 3, f"unverified 历史备份被误删（P0）：{zips}"
+
+        states = [g.manifest.state for g in collect_groups(dest, ".zip") if g.manifest]
+        assert states and set(states) == {STATE_UNVERIFIED}, f"状态应为 unverified，实际 {states}"
+
+    def test_unverified_survives_with_verify_true(self, src_tree, tmp_path):
+        """verify=True + on_cleanup=delete 组合同样不能丢历史份。"""
+        import time as _t
+
+        from backupstudio.engine import TaskEngine
+
+        dest = tmp_path / "delchk"
+        eng = TaskEngine()
+        for i in range(3):
+            t = _task(dest, src_tree, fmt="zip")
+            t.verify = True
+            t.name = f"v{i}"
+            t.retention = self._policy()
+            assert eng.run(t).record.status == "success"
+            _t.sleep(1.05)
+        assert len(list(dest.glob("*.zip"))) == 3, "verify=True 连跑 3 次也应保留 3 份"
+
+    def test_unverified_survives_with_move_mode(self, src_tree, tmp_path):
+        """on_cleanup=move 下 unverified 也不能被挪进 trash。"""
+        import time as _t
+
+        from backupstudio.engine import TaskEngine
+
+        dest = tmp_path / "movechk"
+        eng = TaskEngine()
+        for i in range(3):
+            t = _task(dest, src_tree, fmt="zip")
+            t.verify = False
+            t.name = f"m{i}"
+            t.retention = self._policy(on_cleanup="move")
+            assert eng.run(t).record.status == "success"
+            _t.sleep(1.05)
+        assert len(list(dest.glob("*.zip"))) == 3, "move 模式下 unverified 也不得被回收"
+        trash = dest / ".backupstudio" / "trash"
+        moved = list(trash.rglob("*.zip")) if trash.is_dir() else []
+        assert not moved, f"unverified 被挪进回收站：{moved}"
+
+    def test_partial_junk_still_reclaimed(self, src_tree, tmp_path):
+        """反向守卫：真残包（partial）必须仍被回收 —— 修 P0 不能把 junk 一起保住。"""
+        from backupstudio.engine import TaskEngine
+        from backupstudio.manifest import Manifest, STATE_PARTIAL, write_manifest
+
+        dest = tmp_path / "junk"
+        dest.mkdir()
+        junk = dest / "junk.zip"
+        junk.write_bytes(b"PK\x05\x06" + b"\x00" * 18)
+        write_manifest(dest, Manifest(
+            stem="junk.zip", task_id="t", fmt="zip", state=STATE_PARTIAL,
+            volumes=["junk.zip"], size_bytes=22,
+        ))
+        t = _task(dest, src_tree, fmt="zip")
+        t.name = "j"
+        t.retention = self._policy()
+        assert TaskEngine().run(t).record.status == "success"
+        assert not junk.exists(), "partial 残包应被回收（否则残包永久占盘）"
+
+    def test_unverified_still_counts_for_keep_last(self, src_tree, tmp_path):
+        """反向守卫：unverified 计入份数并参与淘汰，不是"永不删除"。"""
+        import time as _t
+
+        from backupstudio.engine import TaskEngine
+
+        dest = tmp_path / "keep2"
+        eng = TaskEngine()
+        for i in range(3):
+            t = _task(dest, src_tree, fmt="zip")
+            t.verify = False
+            t.name = f"k{i}"
+            t.retention = self._policy(keep_last=2)
+            assert eng.run(t).record.status == "success"
+            _t.sleep(1.05)
+        zips = sorted(p.name for p in dest.glob("*.zip"))
+        assert len(zips) == 2, f"keep_last=2 时 unverified 应淘汰到 2 份：{zips}"

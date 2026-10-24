@@ -415,6 +415,21 @@ class CleanupItem:
     complete: bool = True  # False = 缺卷/残包
     stem: str = ""  # manifest stem（managed 时用于清单清理）
     reclaimable: bool = False  # True = 不可信但可回收（committing / partial / unverified）
+    # manifest 状态（committed / committing / partial / unverified；无清单时为空串）。
+    # P0 修复必需：仅凭 reclaimable 无法区分「中断/失败残包」与「只是没验过」。
+    state: str = ""
+
+
+def _is_unverified(b: CleanupItem) -> bool:
+    """是否是「没验过」的备份（P0：它**是**一份备份，只是没做校验）。
+
+    ``verify=False``（用户主动关闭校验）产出的包状态是 ``unverified``；
+    它和 ``committing``/``partial`` 一样落在 ``RECLAIMABLE_STATES`` 里，
+    但语义完全不同：前两者是"没写完的残包"，后者是"写完了、没验"。
+    """
+    from .manifest import STATE_UNVERIFIED
+
+    return b.state == STATE_UNVERIFIED
 
 
 def find_backup_blobs(task: BackupTask) -> list[CleanupItem]:
@@ -452,6 +467,7 @@ def find_backup_blobs(task: BackupTask) -> list[CleanupItem]:
                 complete=g.complete,
                 stem=g.stem,
                 reclaimable=g.reclaimable,
+                state=(g.manifest.state if g.manifest is not None else ""),
             )
         )
     return sorted(blobs, key=lambda b: b.mtime)
@@ -483,23 +499,35 @@ def apply_retention(
     def _protected(b: CleanupItem) -> bool:
         return any(str(Path(f).resolve()).lower() in protected_set for f in b.files)
 
-    # 两类对象必须分开算（审查 A3）：
+    # 三类对象必须分开算（审查 A3 + P0 回归）：
     # * trusted     —— 可信备份（manifest 状态 = committed）：**唯一**计入份数/天数/总量的对象；
-    # * reclaimable —— 有清单但不是可信备份（committing / partial / unverified）：
-    #                  它们本来就不是"一份备份"，既不计数，也不许永久占盘 → 一律回收；
+    # * unverified  —— 「写完了但没验过」（verify=False 的产物）：**也是一份备份**，
+    #                  必须计入份数。否则 verify=False 的用户每次备份都会把上一份当残包删掉
+    #                  （P0 数据丢失：实测 keep_last=30 连跑 3 次只剩 1 份）；
+    # * junk        —— 中断/失败残组（committing / partial）：不是备份，也不该永久占盘 → 回收；
     # * legacy      —— 无清单旧包：E5 红线，默认只读（include_legacy=True 才参与淘汰）。
     # 本次刚产出的组即使在 retention 时仍是 committing，也必须按"一份备份"计入份数，
     # 否则 keep_last 永远少算一份（原实现的 protected 兜底就是这个作用，不能丢）。
     trusted = [b for b in blobs if b.managed or _protected(b)]
-    reclaimable = [b for b in blobs if b.reclaimable and not _protected(b)]
+    junk = [
+        b
+        for b in blobs
+        if b.reclaimable and not b.managed and not _protected(b) and not _is_unverified(b)
+    ]
+    unverified = [
+        b
+        for b in blobs
+        if b.reclaimable and not b.managed and not _protected(b) and _is_unverified(b)
+    ]
     legacy = [b for b in blobs if not b.managed and not b.reclaimable and not _protected(b)]
+    trusted += unverified  # 无条件计入：没验过 ≠ 不是备份
     trusted += legacy if include_legacy else []
     trusted.sort(key=lambda b: b.mtime)
-    reclaimable.sort(key=lambda b: b.mtime)
+    junk.sort(key=lambda b: b.mtime)
 
     expired: list[CleanupItem] = []
-    # 0) 不可信残组：不是备份 → 直接回收（在飞的本次产物除外；默认 move 到回收目录，可反悔）
-    expired.extend(reclaimable)
+    # 0) 中断/失败残组：不是备份 → 直接回收（在飞的本次产物除外；默认 move 到回收目录，可反悔）
+    expired.extend(junk)
 
     if not trusted and not expired:
         return []
