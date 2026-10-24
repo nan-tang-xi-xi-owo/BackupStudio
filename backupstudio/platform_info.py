@@ -336,4 +336,12 @@ def describe_environment() -> list[tuple[str, str]]:
         rows += [("包管理器", info.package_manager or "未找到 Homebrew")]
     elif info.is_windows:
         rows += [("版本分支", info.branch), ("构建号", info.extra.get("build", "")), ("包管理器", info.package_manager or "未找到 winget")]
+    # N3/N4：运行在 Flatpak 沙箱内时把真实权限边界摆到明面上（否则用户会以为
+    # 「开机自启已开启」「定时备份会跑」，而两者在沙箱里都可能不成立）。
+    try:
+        from . import flatpak  # 延迟导入：非 Linux 平台不必付这个成本
+
+        rows += flatpak.describe()
+    except Exception:  # noqa: BLE001 - 环境探测永远不能拖垮 info/界面
+        pass
     return rows

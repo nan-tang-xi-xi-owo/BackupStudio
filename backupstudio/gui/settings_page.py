@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -22,10 +23,11 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import QTime
 
 from .. import APP_NAME, APP_NAME_ZH, APP_ID, __version__
-from ..autostart import is_autostart_enabled, set_autostart
+from ..autostart import autostart_available, is_autostart_enabled, set_autostart
 from ..daemon import daemon_status, ensure_daemon, stop_daemon_safe
+from ..flatpak import daemon_supported as daemon_available
 from ..notify import describe_backend
-from ..paths import config_dir, log_dir
+from ..paths import config_dir, config_dir_state, log_dir
 from ..util import open_in_file_manager
 from .appstate import AppState
 from .widgets import Card, Combo, Switch, muted, title_label
@@ -58,7 +60,19 @@ class SettingsPage(QWidget):
         general.add(title_label("常规", 3))
         self.sw_autostart = Switch(dark=state.palette.dark)
         self.sw_autostart.toggled.connect(self._on_autostart)
-        general.add(self._row("开机自动启动（启动后常驻托盘）", self.sw_autostart))
+        self.row_autostart = self._row("开机自动启动（启动后常驻托盘）", self.sw_autostart)
+        general.add(self.row_autostart)
+        # N3：Flatpak 沙箱内开关**置灰**并说明原因，而不是让用户点了以后
+        # 得到一个写进沙箱、宿主永远看不到的"成功"。
+        from .. import flatpak as _flatpak
+
+        if _flatpak.is_flatpak() and not _flatpak.portal_declared():
+            # N4：没有门户授权时 home 之外的目录根本选不到/读不到，必须先说清楚。
+            general.add(muted("⚠ " + _flatpak.portal_hint().replace("\n", " ")))
+        if not autostart_available():
+            self.sw_autostart.setEnabled(False)
+            self.sw_autostart.setToolTip(_flatpak.autostart_hint())
+            general.add(muted("⚠ " + _flatpak.autostart_hint().replace("\n", " ")))
         self.sw_start_min = Switch(dark=state.palette.dark)
         self.sw_start_min.toggled.connect(self._save)
         general.add(self._row("启动时最小化到托盘", self.sw_start_min))
@@ -67,7 +81,17 @@ class SettingsPage(QWidget):
         general.add(self._row("关闭窗口时最小化到托盘（不退出程序）", self.sw_close_tray))
         self.sw_daemon = Switch(dark=state.palette.dark)
         self.sw_daemon.toggled.connect(self._save)
-        general.add(self._row("同时启动后台守护进程（关闭主窗口后也能按计划备份）", self.sw_daemon))
+        self.row_daemon = self._row(
+            "同时启动后台守护进程（关闭主窗口后也能按计划备份）", self.sw_daemon
+        )
+        general.add(self.row_daemon)
+        # N4：Flatpak 沙箱内守护进程拿不到文件门户授权，home 之外的备份会静默失败。
+        # 与其"假装支持"，不如把开关置灰 + 明确指向内置调度器。
+        if not daemon_available():
+            self.sw_daemon.setEnabled(False)
+            self.sw_daemon.setChecked(False)
+            self.sw_daemon.setToolTip(_flatpak.daemon_hint())
+            general.add(muted("⚠ " + _flatpak.daemon_hint().replace("\n", " ")))
         appearance = QHBoxLayout()
         appearance.addWidget(QLabel("外观主题"), 1)
         self.theme_combo = Combo()
@@ -140,6 +164,12 @@ class SettingsPage(QWidget):
         dh.addWidget(self.btn_daemon_refresh)
         dh.addStretch(1)
         daemon.add_layout(dh)
+        if not daemon_available():
+            from .. import flatpak
+
+            self.btn_daemon_start.setEnabled(False)
+            self.btn_daemon_stop.setEnabled(False)
+            self.btn_daemon_start.setToolTip(flatpak.daemon_hint())
         lay.addWidget(daemon)
 
         # 数据与日志
@@ -243,6 +273,14 @@ class SettingsPage(QWidget):
             self.sw_autostart.blockSignals(False)
         self.lbl_config.setText(str(config_dir()))
         self.lbl_logs.setText(str(log_dir()))
+        # N2：配置目录发生回退时必须让用户看见（回退位置可能是 tmpfs，重启即丢）。
+        st = config_dir_state()
+        if st.get("fell_back"):
+            self.lbl_config.setText(
+                f"{st.get('actual')}  ⚠ 已回退（首选 {st.get('preferred')} 不可写）"
+            )
+            self.lbl_config.setStyleSheet("color:#B45309;")
+            self.lbl_config.setToolTip(str(st.get("reason") or ""))
         self._loading = False
         self._refresh_daemon()
 
@@ -252,7 +290,9 @@ class SettingsPage(QWidget):
         s = self.state.store.settings
         s.start_minimized = self.sw_start_min.isChecked()
         s.close_to_tray = self.sw_close_tray.isChecked()
-        s.auto_run_backup_daemon = self.sw_daemon.isChecked()
+        # N4：沙箱内不落盘守护进程开关（否则每次启动都会去拉起一个注定拿不到
+        # 门户授权的子进程，用户看到的是"定时备份永不执行"且没有提示）。
+        s.auto_run_backup_daemon = self.sw_daemon.isChecked() if daemon_available() else False
         s.theme_mode = self.theme_combo.currentData() or "system"
         n = s.notifications
         n.enabled = self.sw_notif.isChecked()
@@ -279,9 +319,10 @@ class SettingsPage(QWidget):
         if self._loading:
             return
         ok, msg = set_autostart(checked)
-        self.state.store.settings.start_with_system = checked
-        self.state.store.save()
         if ok:
+            # 只有真的写成功才落盘，避免"设置显示已开启、实际没生效"。
+            self.state.store.settings.start_with_system = checked
+            self.state.store.save()
             QMessageBox.information(self, "开机自启", msg)
         else:
             QMessageBox.warning(self, "设置失败", msg)
@@ -314,6 +355,15 @@ class SettingsPage(QWidget):
         self.daemon_status.setText("检测中…")
 
     def _render_daemon(self, st: dict) -> None:
+        if not daemon_available():
+            from .. import flatpak
+
+            self.daemon_status.setText(
+                "<b style='color:#B45309'>使用内置调度器</b><br>"
+                + flatpak.daemon_hint().replace("\n", "<br>")
+            )
+            self.daemon_status.setTextFormat(Qt.TextFormat.RichText)
+            return
         if "error" in st:
             self.daemon_status.setText(f"状态未知：{st['error']}")
             return
@@ -331,7 +381,12 @@ class SettingsPage(QWidget):
 
     def _daemon_start(self) -> None:
         ok, msg = ensure_daemon()
-        QMessageBox.information(self, "守护进程", msg)
+        if ok:
+            QMessageBox.information(self, "守护进程", msg)
+        else:
+            # N4：Flatpak 内会返回「请使用内置调度器」的指引，这里要按警告展示，
+            # 不能再用 information 图标假装成功。
+            QMessageBox.warning(self, "守护进程不可用", msg)
         self._refresh_daemon()
 
     def _daemon_stop(self) -> None:
@@ -426,16 +481,50 @@ def _parse(text: str, default: tuple[int, int]) -> tuple[int, int]:
         return default
 
 
+def _license_search_dirs() -> list[Path]:
+    """第三方许可文本的查找目录（源码运行 & 冻结产物都要能命中）。
+
+    N8 背景：旧实现只看 ``Path(__file__).parent.parent.parent``，
+    源码运行时是仓库根（``packaging/THIRD-PARTY-7ZIP.txt`` 能命中），
+    但 PyInstaller 冻结后它是 ``_internal/``，而 build.py 当时只把许可复制到
+    **产物根目录** → 打包版设置页的「第三方许可」对话框里看不到 7-Zip 许可全文，
+    等于分发了 LGPL 二进制却没随附许可。现在两边都找，且 build.py 两处都复制。
+    """
+    dirs: list[Path] = []
+    pkg_parent = Path(__file__).resolve().parent.parent.parent
+    dirs.append(pkg_parent)
+    # 冻结形态：sys._MEIPASS 指向 _internal；可执行文件旁是产物根目录
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        dirs.append(Path(meipass))
+    if getattr(sys, "frozen", False):
+        dirs.append(Path(sys.executable).resolve().parent)
+    # 去重但保持顺序
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for d in dirs:
+        if d not in seen:
+            seen.add(d)
+            unique.append(d)
+    return unique
+
+
 def _licenses_text() -> str:
-    here = Path(__file__).resolve().parent.parent.parent
     parts = []
-    for name in ("THIRD-PARTY-NOTICES.txt", "packaging/THIRD-PARTY-7ZIP.txt"):
-        p = here / name
-        if p.exists():
+    candidates = [
+        ("THIRD-PARTY-NOTICES.txt", ("THIRD-PARTY-NOTICES.txt", "packaging/THIRD-PARTY-NOTICES.txt")),
+        ("THIRD-PARTY-7ZIP.txt", ("THIRD-PARTY-7ZIP.txt", "packaging/THIRD-PARTY-7ZIP.txt")),
+    ]
+    for label, relatives in candidates:
+        for base in _license_search_dirs():
+            hit = next((base / rel for rel in relatives if (base / rel).is_file()), None)
+            if hit is None:
+                continue
             try:
-                parts.append(f"===== {name} =====\n" + p.read_text(encoding="utf-8", errors="replace"))
+                parts.append(f"===== {label} =====\n" + hit.read_text(encoding="utf-8", errors="replace"))
             except OSError:
                 continue
+            break
     parts.append(
         "===== 组件概览 =====\n"
         "* PySide6 / Qt 6 — LGPLv3（动态链接，二进制分发时随附本说明）\n"

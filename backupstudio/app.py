@@ -209,7 +209,12 @@ def _run_gui_inner(start_minimized: bool = False, open_new: bool = False) -> int
         window.hide()
 
     state.start_scheduler()
-    if store.settings.auto_run_backup_daemon:
+    # N4：Flatpak 沙箱内不启动独立守护进程（它拿不到 GUI 的文件门户授权，
+    # home 之外的备份会在后台静默失败）。GUI 自己的调度器已在上一行启动，
+    # 关窗到托盘即可继续按计划备份。
+    from . import flatpak as _flatpak
+
+    if store.settings.auto_run_backup_daemon and _flatpak.daemon_supported():
         from .daemon import ensure_daemon
 
         def _ensure() -> None:
@@ -219,6 +224,8 @@ def _run_gui_inner(start_minimized: bool = False, open_new: bool = False) -> int
                 log.exception("守护进程启动失败")
 
         QTimer.singleShot(1200, _ensure)
+    elif not _flatpak.daemon_supported():
+        log.info("Flatpak 沙箱内：跳过独立守护进程，改用内置调度器")
 
     # 每隔一段时间心跳写一次，便于确认「程序确实在运行」
     def _heartbeat() -> None:
@@ -343,7 +350,11 @@ def _build_parser() -> argparse.ArgumentParser:
     info.add_argument("--json", action="store_true")
 
     sub.add_parser("doctor", help="诊断缺失的压缩软件并给出安装命令")
-    sub.add_parser("selftest", help="自检：目录、日志、压缩引擎与界面能否正常启动")
+    selftest = sub.add_parser("selftest", help="自检：目录、日志、压缩引擎与界面能否正常启动")
+    selftest.add_argument(
+        "--json", action="store_true",
+        help="以 JSON 输出自检结果（含配置目录是否回退），便于脚本/CI 断言",
+    )
 
     extract = sub.add_parser("extract", help="解压备份（需安装对应工具）")
     extract.add_argument("archive")
@@ -392,7 +403,7 @@ def _cli(argv: list[str]) -> int:
     if cmd == "doctor":
         return _cmd_doctor()
     if cmd == "selftest":
-        return _cmd_selftest()
+        return _cmd_selftest(as_json=bool(getattr(args, "json", False)))
     if cmd == "daemon":
         return _cmd_daemon(args)
     if cmd == "task":
@@ -474,20 +485,57 @@ def _cmd_doctor() -> int:
     return 0
 
 
-def _cmd_selftest() -> int:
-    """自检：确认目录、日志、压缩引擎与界面都能正常工作。"""
-    from .paths import STARTUP_DIAGNOSTICS, config_dir, log_dir, runtime_dir
+def _cmd_selftest(as_json: bool = False) -> int:
+    """自检：确认目录、日志、压缩引擎与界面都能正常工作。
+
+    N2：``as_json`` 为真时输出结构化结果（含 ``config_fell_back`` /
+    ``config_dir`` / ``preferred_config_dir``），便于测试与 CI 断言
+    「配置目录是否发生了回退」，而不是靠匹配中文字符串。
+    """
+    import json as _json
+
+    from .paths import STARTUP_DIAGNOSTICS, config_dir, config_dir_state, log_dir, runtime_dir
 
     problems: list[str] = []
-    print(f"{APP_NAME_ZH} {APP_NAME} {__version__} 自检\n")
+    warnings: list[str] = []
+    checks: list[dict[str, object]] = []
+
+    if not as_json:
+        print(f"{APP_NAME_ZH} {APP_NAME} {__version__} 自检\n")
 
     def check(label: str, ok: bool, detail: str = "") -> None:
-        print(f"  [{'OK' if ok else 'FAIL'}] {label}" + (f"  {detail}" if detail else ""))
+        checks.append({"label": label, "status": "OK" if ok else "FAIL", "detail": detail})
+        if not as_json:
+            print(f"  [{'OK' if ok else 'FAIL'}] {label}" + (f"  {detail}" if detail else ""))
         if not ok:
             problems.append(label)
 
+    def warn(label: str, detail: str = "") -> None:
+        checks.append({"label": label, "status": "WARN", "detail": detail})
+        if not as_json:
+            print(f"  [WARN] {label}" + (f"  {detail}" if detail else ""))
+        warnings.append(label)
+
     cfg = config_dir()
-    check("配置目录可写", cfg.is_dir() and os.access(cfg, os.W_OK), str(cfg))
+    state = config_dir_state()
+    if state["fell_back"]:
+        # 回退位置可能是 tmpfs / 临时目录，重启即丢配置；旧实现只报
+        # `[OK] 配置目录可写`，测的却是回退后的那个目录（Flatpak 里正是 tmpfs）。
+        warn(
+            "配置目录为回退位置（首选目录不可写）",
+            f"当前 {cfg}；首选 {state['preferred']}；原因：{state['reason'] or '未记录'}",
+        )
+        check("配置目录可写（回退位置）", cfg.is_dir() and os.access(cfg, os.W_OK), str(cfg))
+    elif state["override_ignored"]:
+        # 指定了 BACKUPSTUDIO_CONFIG_DIR 但不可用 → 已忽略并改用默认位置。
+        # 不是"回退到临时目录"，但同样是"你以为的目录不是实际用的目录"，必须说清。
+        warn(
+            "已忽略不可用的 BACKUPSTUDIO_CONFIG_DIR",
+            f"指定 {state['requested']}；实际使用 {cfg}；原因：{state['reason'] or '未记录'}",
+        )
+        check("配置目录可写", cfg.is_dir() and os.access(cfg, os.W_OK), str(cfg))
+    else:
+        check("配置目录可写", cfg.is_dir() and os.access(cfg, os.W_OK), str(cfg))
     rdir = runtime_dir()
     check("运行目录可写", rdir.is_dir(), str(rdir))
     ldir = log_dir()
@@ -516,13 +564,59 @@ def _cmd_selftest() -> int:
 
     check("紧急日志可写", bool(write_emergency("selftest", filename="selftest.log")))
 
-    if STARTUP_DIAGNOSTICS:
+    # N3/N4：Flatpak 沙箱的能力边界必须"如实告知"，不能让用户以为功能可用。
+    from . import flatpak
+
+    sandbox = {
+        "is_flatpak": flatpak.is_flatpak(),
+        "autostart_supported": flatpak.autostart_supported(),
+        "daemon_supported": flatpak.daemon_supported(),
+        "portal_declared": flatpak.portal_declared(),
+    }
+    if flatpak.is_flatpak():
+        if not sandbox["autostart_supported"]:
+            warn("Flatpak 版不支持开机自启", flatpak.autostart_hint().replace("\n", " "))
+        if not sandbox["daemon_supported"]:
+            warn("Flatpak 版使用内置调度器", flatpak.daemon_hint().replace("\n", " "))
+        if not sandbox["portal_declared"]:
+            warn("Flatpak 未显式声明文件门户权限", flatpak.portal_hint().replace("\n", " "))
+
+    if not as_json and STARTUP_DIAGNOSTICS:
         print("\n启动期间的诊断信息：")
         for line in STARTUP_DIAGNOSTICS:
             print("  -", line)
 
-    print("\n结果：" + ("全部通过 ✓" if not problems else f"{len(problems)} 项异常 ✗ → {', '.join(problems)}"))
-    return 0 if not problems else 1
+    ok = not problems
+    if as_json:
+        print(_json.dumps(
+            {
+                "ok": ok,
+                "problems": problems,
+                "warnings": warnings,
+                "checks": checks,
+                "config_dir": str(cfg),
+                "preferred_config_dir": str(state["preferred"]),
+                "config_fell_back": bool(state["fell_back"]),
+                "config_override_ignored": bool(state["override_ignored"]),
+                "config_reason": str(state["reason"]),
+                "sandbox": sandbox,
+                "diagnostics": list(STARTUP_DIAGNOSTICS),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ))
+        return 0 if ok else 1
+    if problems:
+        print(f"\n结果：{len(problems)} 项异常 ✗ → {', '.join(problems)}")
+        return 1
+    if warnings:
+        print(
+            f"\n结果：核心项全部通过 ✓，但有 {len(warnings)} 项需要留意 ⚠ → "
+            f"{', '.join(warnings)}"
+        )
+        return 0
+    print("\n结果：全部通过 ✓")
+    return 0
 
 
 def _cmd_daemon(args) -> int:  # noqa: ANN001

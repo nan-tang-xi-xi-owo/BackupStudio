@@ -129,6 +129,38 @@ jobs:
           python packaging/check_autostart_args.py
           if ($LASTEXITCODE -ne 0) { throw "自启动参数契约校验失败（rc=$LASTEXITCODE）" }
 
+          # R-fixN 门禁①：exe 必须带 PE 版本资源（N1）。
+          # 历史缺陷：build.py 从未传 --version-file，PyInstaller 日志里只有
+          # "Copying 0 resources to EXE" → 安装包有版本、装进去的主程序版本全空。
+          $vi = (Get-Item dist/BackupStudio/BackupStudio.exe).VersionInfo
+          "FileVersion=$($vi.FileVersion) ProductVersion=$($vi.ProductVersion)"
+          "CompanyName=$($vi.CompanyName) ProductName=$($vi.ProductName)"
+          if ([string]::IsNullOrWhiteSpace($vi.FileVersion)) { throw "exe 没有 FileVersion（N1 复发）" }
+          if ([string]::IsNullOrWhiteSpace($vi.ProductVersion)) { throw "exe 没有 ProductVersion（N1 复发）" }
+          if ([string]::IsNullOrWhiteSpace($vi.CompanyName)) { throw "exe 没有 CompanyName（N1 复发）" }
+          if ([string]::IsNullOrWhiteSpace($vi.ProductName)) { throw "exe 没有 ProductName（N1 复发）" }
+          if ([string]::IsNullOrWhiteSpace($vi.LegalCopyright)) { throw "exe 没有 LegalCopyright（N1 复发）" }
+          $pkgver = python -c "import sys; sys.path.insert(0, '.'); import backupstudio; print(backupstudio.__version__)"
+          if (-not $vi.FileVersion.StartsWith($pkgver.Trim())) {
+            throw "exe FileVersion=$($vi.FileVersion) 与包版本 $pkgver 不一致"
+          }
+          "exe 版本资源 OK：$($vi.FileVersion)"
+
+          # R-fixN 门禁②：7-Zip 许可必须随包分发（N8，LGPL 合规）。
+          # 历史缺陷：packaging/THIRD-PARTY-7ZIP.txt 存在却从未被复制进产物，
+          # 冻结后 _internal/ 里连 THIRD-PARTY-NOTICES.txt 都没有。
+          foreach ($f in @("THIRD-PARTY-7ZIP.txt", "THIRD-PARTY-NOTICES.txt")) {
+            if (-not (Test-Path "dist/BackupStudio/$f")) { throw "产物根目录缺少 $f（N8 复发）" }
+            if (-not (Test-Path "dist/BackupStudio/_internal/$f")) { throw "_internal 缺少 $f（设置页读不到）" }
+          }
+          "随附许可 OK：7-Zip 许可已在产物根目录与 _internal 各一份"
+
+          # R-fixN 门禁③：py.typed 必须在产物里（N5，PEP 561）。
+          if (-not (Test-Path "dist/BackupStudio/_internal/backupstudio/py.typed")) {
+            throw "产物缺少 backupstudio/py.typed（N5 复发）"
+          }
+          "py.typed OK"
+
           # R-fix4 门禁③：真跑一次备份（不是只看 --version）。
           $env:BACKUPSTUDIO_CONFIG_DIR = "$PWD/smoke-cfg"
           New-Item -ItemType Directory -Force "$PWD/smoke-src","$PWD/smoke-dst",$env:BACKUPSTUDIO_CONFIG_DIR | Out-Null
@@ -370,6 +402,69 @@ jobs:
           if grep -q $'\r' "$DESKTOP"; then echo ".desktop 含 CR（应为 LF）"; exit 1; fi
           echo ".desktop OK:"
           cat "$DESKTOP"
+
+          # ------------------------------------------------------------------
+          # R-fixN 门禁（N2 / N3 / N4）—— 这三条只能在真 Flatpak 沙箱里验证
+          # ------------------------------------------------------------------
+
+          # N2：manifest 不得强制 BACKUPSTUDIO_CONFIG_DIR 到不可写的 /var/config。
+          # 历史缺陷：沙箱内 /var/config 不可写 → 程序回退到私有 tmpfs →
+          # 每次重启丢光任务/设置/调度记录，而 selftest 仍显示 [OK] 配置目录可写。
+          if grep -q 'BACKUPSTUDIO_CONFIG_DIR' packaging/io.github.backupstudio.BackupStudio.yml; then
+            echo "manifest 仍强制配置目录（N2 复发）"; exit 1
+          fi
+          # 配置目录必须落在 ~/.var/app/<app-id>/ 下（Flatpak 的持久化位置）
+          CFG_JSON="$(flatpak run --command=backupstudio io.github.backupstudio.BackupStudio selftest --json)"
+          echo "$CFG_JSON"
+          python3 - "$CFG_JSON" <<'PY'
+          import json, sys, pathlib
+          payload = json.loads(sys.argv[1])
+          cfg = pathlib.Path(payload["config_dir"])
+          print("config_dir =", cfg)
+          assert ".var/app/io.github.backupstudio.BackupStudio" in str(cfg), (
+              f"配置目录不在 ~/.var/app/<app-id> 下（重启会丢）：{cfg}"
+          )
+          assert payload["config_fell_back"] is False, (
+              f"配置目录发生了回退：{payload['config_reason']}"
+          )
+          assert payload["config_override_ignored"] is False, (
+              f"配置目录覆盖被忽略：{payload['config_reason']}"
+          )
+          print("Flatpak 配置目录 OK（持久、未回退）")
+          PY
+          if [ $? -ne 0 ]; then echo "Flatpak 配置目录门禁失败（N2）"; exit 1; fi
+
+          # 再验证一次：写进去的配置在**新进程**里仍然读得到（等价于"重启后还在"）。
+          flatpak run --command=backupstudio io.github.backupstudio.BackupStudio selftest --json > /tmp/bs-st.json
+          CFG1="$(python3 -c 'import json;print(json.load(open("/tmp/bs-st.json"))["config_dir"])')"
+          flatpak run --command=backupstudio io.github.backupstudio.BackupStudio \
+            task add --name ci-persist --source /tmp --dest /tmp --format zip || true
+          flatpak run --command=backupstudio io.github.backupstudio.BackupStudio task list > /tmp/bs-tl.txt
+          flatpak run --command=backupstudio io.github.backupstudio.BackupStudio task list | grep -q ci-persist \
+            || { echo "任务没有持久化到 $CFG1（N2 复发：配置写进了临时目录）"; exit 1; }
+          echo "配置持久化 OK：$CFG1"
+
+          # N3：沙箱内的 selftest 必须**如实**说明自启动不受支持（而不是报 OK）。
+          flatpak run --command=backupstudio io.github.backupstudio.BackupStudio selftest --json \
+            | python3 -c '
+          import json, sys
+          payload = json.load(sys.stdin)
+          sb = payload["sandbox"]
+          print("sandbox =", sb)
+          assert sb["is_flatpak"] is True, "沙箱探测失败：没认出自己在 Flatpak 里"
+          assert sb["autostart_supported"] is False, "Flatpak 内仍声称支持开机自启（N3 复发）"
+          assert sb["daemon_supported"] is False, "Flatpak 内仍声称支持独立守护进程（N4 复发）"
+          warn = " ".join(payload["warnings"])
+          assert "自启" in warn, f"selftest 没有为自启给出 WARN：{warn}"
+          assert "调度器" in warn, f"selftest 没有为守护进程给出 WARN：{warn}"
+          print("沙箱能力边界 OK（如实告知不支持）")
+          '
+          if [ $? -ne 0 ]; then echo "Flatpak 沙箱能力边界门禁失败（N3/N4）"; exit 1; fi
+
+          # N4：manifest 必须声明文件门户总线名。
+          grep -q 'org.freedesktop.portal.Desktop' packaging/io.github.backupstudio.BackupStudio.yml \
+            || { echo "manifest 缺少 --talk-name=org.freedesktop.portal.Desktop（N4 复发）"; exit 1; }
+          echo "文件门户声明 OK"
       - uses: actions/upload-artifact@v4
         with:
           name: linux-flatpak

@@ -455,6 +455,19 @@ def daemon_status(timeout_ms: int = 500) -> dict:
 
 
 def ensure_daemon() -> tuple[bool, str]:
+    """确保守护进程在运行。
+
+    N4：Flatpak 沙箱内**不启动**独立守护进程，改为明确告知原因。
+    门户（xdg-desktop-portal）的授权绑定在发起请求的沙箱实例上，
+    子进程守护进程拿不到 → home 之外的备份在后台静默失败
+    （用户看到的现象是「手动备份成功、定时备份从不执行」）。
+    GUI 自身有内置调度器（``AppState.start_scheduler``），关窗到托盘即可继续定时备份，
+    因此这里拒绝是有替代路径的，不是功能缺失。
+    """
+    from . import flatpak
+
+    if not flatpak.daemon_supported():
+        return False, flatpak.daemon_hint()
     from .autostart import find_daemon_pid, spawn_daemon
 
     if find_daemon_pid(pid_file_path(), allow_scan=True):
