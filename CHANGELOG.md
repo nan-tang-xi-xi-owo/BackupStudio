@@ -4,40 +4,48 @@
 
 ## 1.1.0 — 2026-10-24
 
-信任批次（可信备份身份层）：只有「卷齐全 + 校验通过」的归档才算一份备份。
+可信批次：把「备份可信」与「出事能找回来」从口号变成可验证的行为。
 
-### 修复（数据安全）
-- **7z 假通过**：无 7-Zip 时不再用 `getnames()`（只读头）冒充校验，改为 py7zr `testzip()`
-  读载荷并比对 CRC；API 不可用时返回「跳过」而不是「通过」。损坏的 7z 现在稳定判失败。
-- **分卷归组回退**：恢复 `stem.7z.001/.002` 与 `base.part1.rar/part2.rar` 两种分卷的归组
-  （此前 `.001` 完全不可见、`partN.rar` 被拆成多组，可能只删掉 part1 留下残缺包）。
-  同时保证 `a.7z` 与 `a.7z.bak` 不会被误并为一份。
-- **状态机修正**：`committing` 改为真实的两阶段提交（校验前先落盘一份临时清单），
-  崩溃不再留下"永不被淘汰"的无清单残包；校验失败 → `partial`、未校验 → `unverified`，
-  两者都不再算「可信备份」，且都会进入保留策略候选（不再永久占盘）。
-- **炸弹防护不再自伤**：解压上限从「1000× 比例硬拒」改为「绝对上限（默认 100 GiB）+ 可放宽」，
-  默认比例放宽到 10000×；新增 `--max-unpacked-bytes` / `--max-unpack-ratio` 与环境变量
-  `BACKUPSTUDIO_MAX_UNPACKED_BYTES` / `BACKUPSTUDIO_MAX_UNPACK_RATIO`。
-  8 MiB 全零日志（1014×）这类**本产品自己产出的正常备份**不再被拒绝。
-  同时给 7z / rar 外部解压补上同样的绝对上限预检（此前完全没有防护）。
+### 数据安全（会真的丢数据的问题）
 
-### 修复（CI / 打包）
-- Windows 打包脚本在 cp1252 控制台下崩溃（`UnicodeEncodeError`）：新增 `packaging/_console.py`，
-  在模块导入时即切换到 UTF-8；workflow 同时设 `PYTHONIOENCODING=utf-8`
-  （`PYTHONUTF8` 会被 `PYTHONIOENCODING` 覆盖，只设前者不够）。
-- `.desktop` 的 `Categories` 去掉未注册值 `Backup`，改用合法的 `Compression`（appimagetool 不再拒绝）。
-- AppImage 补 `/usr/bin/backupstudio` 启动器（此前 `Exec`/`TryExec` 指向的文件不存在），
-  `QT_QPA_PLATFORM` 改为 `wayland;xcb`。
-- macOS runner 迁移：`macos-14` → `macos-15`、`macos-13`（已退役）→ `macos-15-intel`。
-- Flatpak：镜像改用 `ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-24.08`
-  （原 tag 从未发布）；manifest 修掉 JSON 尾逗号、去掉 `--no-deps`、构建期允许网络。
-- dmg 产物名加架构后缀，避免 arm64 / x64 互相覆盖。
-- 版本号统一到 1.1.0，`packaging/build.py` 改为引用 `backupstudio.__version__`。
-- 依赖钉上界：`PySide6-Essentials>=6.8,<6.13`、`pyinstaller>=6.3,<7`（消除不可复现构建）。
+- **保留策略不再跨任务误删**：多任务备份到同一目录时，每个任务只认领自己的
+  备份，不再互相删除对方的包。
+- **校验失败不再挤掉好备份**：清理只在本轮成功时执行，一次损坏不会让目录里
+  只剩坏包。
+- **跨进程锁加固**：修掉接管竞态下两个进程同时持有同一任务锁（会产出坏包）、
+  空锁导致任务永久卡死、进程号被复用时锁永不释放等问题。
+- **崩溃残包自动清扫**：强杀/断电留下的临时文件与暂存目录，启动时清理。
 
-### 测试
-- 新增 A1–A4 的回归用例（见 `tests/test_verify.py`、`test_manifest.py`、`test_extract.py`）。
+### 校验与恢复
 
+- **tar 系校验不再假通过**：tar.gz / tar.bz2 / tar.xz / tar.zst 的内容损坏
+  （如位翻转）现在能被检出；tar.zst 同时启用帧校验和。
+- **通用分卷可直接恢复**：`.part01/02/…` 分卷可由程序自行拼接解压（此前只能
+  手动 `copy /b`），缺卷时精确提示缺哪一卷。
+- **tar.zst 解压不再假成功**：没有 zstd 命令行时曾只剥一层压缩、报告"已解压"
+  却什么都没解出来。
+- **分卷加密状态实测**：分卷产物先拼接再检测加密，无法判定时如实记为"未加密"
+  并告警，绝不再把未加密的包记成已加密。
+
+### 加密
+
+- 7z 容器配 ZipCrypto 现在会在创建前明确拒绝（此前会静默丢掉密码、产出明文）。
+- ZIP 密码含中文/非 ASCII 字符时提前给出可行动的提示（7-Zip 的格式限制），
+  不再以乱码报错收场。
+- 7-Zip 的中文报错不再乱码。
+
+### 界面
+
+- 编辑任务不再静默改写加密方式（此前 zip 的 AES-256 会被悄悄换成较弱的
+  ZipCrypto）、不再丢第二个备份来源、7z+分卷等既有组合不再被拒绝保存。
+- 「改用内置引擎重试」弹窗不再无限循环（曾两分钟内弹出数百次）。
+- 界面打开期间的定时/命令行任务变更会实时同步，不再被界面保存覆盖掉。
+
+### 发布与打包
+
+- 修复 Windows 安装包的构建失败（Inno 注释语法与语言文件）。
+- 修复 Flatpak、AppImage、macOS x64 三个打包任务。
+- 配置文件改为唯一的原子写入，多进程并发保存不再损坏。
 
 ## 1.0.0 — 2026-10-18
 

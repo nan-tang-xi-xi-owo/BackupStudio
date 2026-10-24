@@ -50,12 +50,12 @@ jobs:
       - name: pytest（无 7z 环境——模拟纯净安装机器）
         shell: pwsh
         env:
-          # B8：光改目录名**不等于**无 7z —— find_7z() 还会回落到 PATH
-          # （tools.py:107 `_which_many`）与 Program Files（tools.py:110），而
-          # windows-latest 预装 7-Zip（实测 C:\ProgramData\chocolatey\bin\7z.EXE）。
-          # 这就是"两遍都 137 passed / 0 skip"、双环境门禁从未生效的原因。
-          # 这里用 BACKUPSTUDIO_DISABLE_7Z=1 让 find_7z() 在源头直接返回 None
-          #（比改 PATH 更可靠：7z 分散在 Chocolatey/PATH/Program Files 三处）。
+          # 无 7-Zip 环境需要**两个**开关，缺一不可（两者职责不同）：
+          # R-10（上游）：测试层 monkeypatch —— tests/conftest.py 读 BACKUPSTUDIO_NO_7Z
+          # B8（本分支）：源码级闸门 —— tools.py 的 _disabled_by_env() 读 BACKUPSTUDIO_DISABLE_7Z，
+          #   让 find_7z() 直接返回 None。仅改目录名无效：runner 预装
+          #   C:\ProgramData\chocolatey\bin\7z.EXE，find_7z() 仍会经 PATH 回退命中。
+          BACKUPSTUDIO_NO_7Z: "1"
           BACKUPSTUDIO_DISABLE_7Z: "1"
         run: |
           Rename-Item -Path tools/win32/7z -NewName _7z_off
@@ -99,7 +99,12 @@ jobs:
           ./packaging/make-windows-installer.ps1 -ISCC $iscc -SkipBuild
       - name: 便携 zip
         shell: pwsh
-        run: Compress-Archive -Path dist/BackupStudio/* -DestinationPath dist/BackupStudio-${{ env.APP_VERSION }}-windows-x64.zip
+        run: |
+          $ver = python -c "import sys; sys.path.insert(0, '.'); import backupstudio; print(backupstudio.__version__)"
+          if ($LASTEXITCODE -ne 0 -or -not $ver) { throw "无法从 backupstudio.__version__ 取得版本号" }
+          $ver = $ver.Trim()
+          "便携 zip 版本：$ver"
+          Compress-Archive -Path dist/BackupStudio/* -DestinationPath "dist/BackupStudio-$ver-windows-x64.zip" -Force
       - name: 冒烟测试
         shell: pwsh
         run: |
@@ -109,7 +114,7 @@ jobs:
         with:
           name: windows
           path: |
-            dist/BackupStudio-${{ env.APP_VERSION }}-windows-x64.zip
+            dist/BackupStudio-*-windows-x64.zip
             dist/BackupStudio-Setup-*.exe
 
   macos-arm64:
@@ -222,6 +227,34 @@ jobs:
           manifest-path: packaging/io.github.backupstudio.BackupStudio.yml
           cache-key: flatpak-${{ github.sha }}
           build-bundle: true
+      # R-4：构建"成功"不等于包能用——此前 --no-deps 让 job 绿着产出
+      # ImportError 的坏包。下面两步都必须让 job 失败，不许 || true 吞掉。
+      - name: 冒烟测试（Flatpak）
+        run: |
+          set -euo pipefail
+          # 先备齐运行时（--user 安装需要它）。幂等，已存在则跳过。
+          flatpak remote-add --if-not-exists --user flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y --noninteractive flathub org.freedesktop.Platform//24.08 org.freedesktop.Platform.GL.default//24.08
+
+          flatpak install --user -y --noninteractive --bundle BackupStudio.flatpak
+
+          # 结构门禁：直接查装好的文件树，逐项确认运行期依赖真的进包了。
+          # 这一步就是当初 --no-deps 会挂掉而"构建成功"却放过的地方。
+          APP="$(flatpak info --show-location io.github.backupstudio.BackupStudio)/files"
+          ls "$APP/bin"
+          test -x "$APP/bin/backupstudio"
+          test -x "$APP/bin/7zz"
+          for pkg in PySide6 py7zr zmq psutil Cryptodome zstandard pyzstd rarfile; do
+            ls -d "$APP"/lib/python3.*/site-packages/"$pkg"
+          done
+          echo "包结构 OK：入口、7zz 与全部运行期依赖均在包内"
+
+          # 运行时门禁：真跑一遍（依赖缺失即非零退出）。
+          flatpak run --command=backupstudio io.github.backupstudio.BackupStudio --version
+          flatpak run --command=python3 io.github.backupstudio.BackupStudio \
+            -c "import PySide6, py7zr, zmq, psutil, Cryptodome, zstandard, pyzstd, rarfile; print('deps ok')"
+          flatpak run --command=python3 io.github.backupstudio.BackupStudio \
+            -c "import backupstudio; print('app ok', backupstudio.__version__)"
       - uses: actions/upload-artifact@v4
         with:
           name: linux-flatpak
@@ -233,6 +266,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: [windows, macos-arm64, macos-x64, linux-appimage, linux-flatpak]
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: docs
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -242,10 +278,31 @@ jobs:
           cd artifacts
           ls -la
           sha256sum * > SHA256SUMS.txt || true
-      - name: 创建 Release
+      - name: 选择发布说明
+        id: notes
+        run: |
+          f="docs/RELEASE_NOTES_${GITHUB_REF_NAME#v}.md"
+          if [ -f "$f" ]; then
+            echo "使用发布说明：$f"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "path=$f" >> "$GITHUB_OUTPUT"
+          else
+            echo "未找到 $f，改用 GitHub 自动生成的发布说明"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: 创建 Release（使用发布说明文件）
+        if: steps.notes.outputs.found == 'true'
         uses: softprops/action-gh-release@v2
         with:
           name: BackupStudio ${{ github.ref_name }}
-          body_path: docs/RELEASE_NOTES_${{ env.APP_VERSION }}.md
+          body_path: ${{ steps.notes.outputs.path }}
+          files: artifacts/**/*
+          fail_on_unmatched_files: false
+      - name: 创建 Release（自动生成说明）
+        if: steps.notes.outputs.found != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: BackupStudio ${{ github.ref_name }}
+          generate_release_notes: true
           files: artifacts/**/*
           fail_on_unmatched_files: false

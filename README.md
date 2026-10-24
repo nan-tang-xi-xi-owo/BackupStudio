@@ -20,7 +20,7 @@
 | 平台 | 文件 | 使用 |
 | --- | --- | --- |
 | Windows 10/11 x64 | `BackupStudio-1.1.0-windows-x64.zip` / `BackupStudio-Setup-1.1.0.exe` | 解压运行 `BackupStudio.exe`，或用安装包安装 |
-| macOS（Apple Silicon / Intel） | `BackupStudio-1.1.0-<arch>.dmg` | 拖入「应用程序」；未签名版首次需右键 → 打开 |
+| macOS（Apple Silicon / Intel） | `BackupStudio-1.1.0-arm64.dmg` / `BackupStudio-1.1.0-x64.dmg` | 拖入「应用程序」；未签名版首次需右键 → 打开 |
 | Linux x86_64 | `BackupStudio-1.1.0-x86_64.AppImage` | `chmod +x` 后直接运行（需要 libfuse2） |
 | Linux（通用） | `BackupStudio.flatpak` | `flatpak install --user BackupStudio.flatpak` |
 
@@ -59,7 +59,7 @@ python -m backupstudio            # 打开图形界面
 python -m backupstudio --help     # 命令行
 ```
 
-要求 Python ≥ 3.10（开发环境为 3.15 + PySide6 6.12）。
+要求 Python ≥ 3.10（开发环境为 3.12 + PySide6 6.12）。
 
 ### 2. 用打包好的程序
 
@@ -197,7 +197,7 @@ dev/                开发期测试脚本（CLI/GUI/托盘/端到端自测）
 ## 开发与测试
 
 ```bash
-python -m pytest tests -q                       # 33 个用例
+python -m pytest tests -q                       # 250 个用例
 python dev/tester_cli.py                        # CLI 端到端
 python dev/tester_round2.py                     # 格式/边界/并发/守护进程
 python dev/tester_gui.py                        # GUI 全流程（离屏）
@@ -258,7 +258,7 @@ GUI 全流程（新建/运行/编辑/复制/删除/主题/设置）、托盘图�
 # 1) 更新版本号：backupstudio/__init__.py 与 pyproject.toml
 # 2) 更新 CHANGELOG.md 与 docs/RELEASE_NOTES_<版本>.md
 # 3) 打标签推送，GitHub Actions 会自动构建四个平台并创建 Release
-git tag v1.0.0 && git push origin v1.0.0
+git tag v1.1.0 && git push origin v1.1.0
 ```
 
 CI 会产出：Windows 便携 zip + Inno Setup 安装包、macOS arm64/x64 的 dmg、

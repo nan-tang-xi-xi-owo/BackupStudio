@@ -189,8 +189,10 @@ def _post_build() -> None:
             shutil.copy2(src, target / Path(name).name)
     readme = target / "README.md"
     if readme.exists():
+        from backupstudio import __version__ as _ver
+
         (target / "使用说明.txt").write_text(
-            f"BackupStudio 备份工坊 {_app_version()}\n\n"
+            f"BackupStudio 备份工坊 {_ver}\n\n"
             "1. 双击 BackupStudio.exe 启动，右下角托盘会出现图标。\n"
             "2. 点「新建任务」选择要备份的文件夹、备份位置、压缩格式（可选密码/分卷）。\n"
             "3. 「计划与保留」里设置自动备份时间，并可自动清理旧备份。\n"
