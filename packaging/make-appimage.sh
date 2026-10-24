@@ -62,6 +62,20 @@ cp "$ROOT/packaging/io.github.backupstudio.BackupStudio.desktop" "$APPDIR/usr/sh
 cp "$ROOT/packaging/io.github.backupstudio.BackupStudio.metainfo.xml" "$APPDIR/usr/share/metainfo/"
 cp "$ROOT/packaging/icon.png" "$APPDIR/.DirIcon"
 
+# 防线：appimagetool 内嵌的 desktop-file-validate 拒绝任何以 CR 结尾的行
+# （"file contains at least one line ending with a carriage return"）。
+# 仓库已用 .gitattributes 固定 eol=lf，但只要有人在 Windows 上以
+# core.autocrlf=false 检出、或补丁工具改写过换行，就会把 CRLF 带进构建。
+# 这里无条件剥离 CR，避免"本地能跑、CI 报桌面文件非法"这类假失败。
+for f in "$APPDIR/io.github.backupstudio.BackupStudio.desktop" \
+         "$APPDIR/usr/share/applications/io.github.backupstudio.BackupStudio.desktop" \
+         "$APPDIR/usr/share/metainfo/io.github.backupstudio.BackupStudio.metainfo.xml"; do
+  if [[ -f "$f" ]] && grep -q $'\r' "$f"; then
+    echo "==> 剥离 CR: $f"
+    sed -i 's/\r$//' "$f"
+  fi
+done
+
 # ---------------------------------------------------------------- appimagetool
 mkdir -p "$TOOLS"
 if [[ ! -x "$TOOLS/appimagetool" ]]; then

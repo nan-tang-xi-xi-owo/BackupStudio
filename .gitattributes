@@ -38,3 +38,4 @@
 # 补丁/差异文件保持原样，不做换行转换
 *.patch -text
 *.diff -text
+*.desktop text eol=lf
