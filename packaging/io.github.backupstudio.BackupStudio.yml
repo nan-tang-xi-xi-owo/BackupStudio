@@ -25,9 +25,7 @@
       "name": "p7zip",
       "buildsystem": "simple",
       "build-commands": [
-        "pwd && ls -la && file 7z2301-linux-x64.tar.xz || true",
-        "mkdir -p /app/bin",
-        "tar xf 7z2301-linux-x64.tar.xz -C . && ls -la",
+        "tar xf 7z2301-linux-x64.tar.xz -C .",
         "install -Dm755 7zz /app/bin/7zz",
         "install -Dm755 7zzs /app/bin/7zzs || true",
         "ln -sf /app/bin/7zz /app/bin/7z",
