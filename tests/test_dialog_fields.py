@@ -369,26 +369,36 @@ class TestMultiSourcePreservation:
         assert got.sources[0].path == home and got.sources[0].files == ["a.txt"]
         assert got.sources[1].to_dict() == task.sources[1].to_dict(), "第二来源必须原样保留"
 
-    def test_first_source_edit_does_not_touch_tail(self, qapp, monkeypatch):
-        """编辑第一来源的路径/文件清单 → 尾部来源照旧，且总条数不变。"""
+    def test_first_source_edit_does_not_touch_tail(self, qapp, monkeypatch, tmp_path):
+        """编辑第一来源的路径/文件清单 → 尾部来源照旧，且总条数不变。
+
+        注意：不能用 ``Path.home()/Pictures`` 这类**真实用户目录** —— Linux
+        runner 上 `Pictures`/`Music`/`Videos` 通常不存在，`_collect()` 会因
+        路径校验失败返回 None，测试假红（Windows 上恰好存在所以一直没暴露）。
+        这里用 tmp_path 造真实目录，跨平台稳定。
+        """
         from backupstudio.config import ArchiveOptions, BackupTask, SourceConfig
+
+        base = tmp_path / "home"
+        for name in ("Pictures", "Music", "Videos", "backups"):
+            (base / name).mkdir(parents=True, exist_ok=True)
 
         task = BackupTask(
             name="EDIT_HEAD",
             sources=[
-                SourceConfig(path=str(Path.home()), mode="folder"),
-                SourceConfig(path=str(Path.home() / "Pictures"), mode="folder"),
-                SourceConfig(path=str(Path.home() / "Music"), mode="folder"),
+                SourceConfig(path=str(base), mode="folder"),
+                SourceConfig(path=str(base / "Pictures"), mode="folder"),
+                SourceConfig(path=str(base / "Music"), mode="folder"),
             ],
-            destination=str(Path.home() / "backups"),
+            destination=str(base / "backups"),
             options=ArchiveOptions(fmt="zip", force=False),
         )
         dlg, _shown = _dialog_blocking_dialogs(qapp, task, monkeypatch)
-        dlg.src_path.edit.setText(str(Path.home() / "Videos"))
+        dlg.src_path.edit.setText(str(base / "Videos"))
         got = dlg._collect()
         assert got is not None
         assert len(got.sources) == 3
-        assert got.sources[0].path == str(Path.home() / "Videos")
+        assert got.sources[0].path == str(base / "Videos")
         assert [s.path for s in got.sources[1:]] == [task.sources[1].path, task.sources[2].path]
 
     def test_single_source_stays_single(self, qapp, monkeypatch):

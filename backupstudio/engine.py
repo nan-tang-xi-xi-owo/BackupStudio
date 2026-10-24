@@ -469,13 +469,19 @@ class CleanupItem:
     files: list[str]
     size: int
     mtime: float
-    managed: bool = False  # True = 可信备份（计入份数，可自动淘汰）；False = 旧包/不可信
+    managed: bool = False  # True = 有已提交（committed）清单；**不等于**「可计入配额」
     complete: bool = True  # False = 缺卷/残包
     stem: str = ""  # manifest stem（managed 时用于清单清理）
     reclaimable: bool = False  # True = 不可信但可回收（committing / partial / unverified）
     # manifest 状态（committed / committing / partial / unverified；无清单时为空串）。
     # P0 修复必需：仅凭 reclaimable 无法区分「中断/失败残包」与「只是没验过」。
     state: str = ""
+    # 「可计入 keep_last 配额」的**唯一**判据（S2，数据丢失级）。
+    # 只有 committed + 卷齐全（complete）才是「一份完整可信备份」。幽灵组（清单在、
+    # 卷全丢）与缺卷残包都是 False：它们不占配额，但由 incomplete 桶负责回收。
+    countable: bool = False
+    # 清单已提交、但卷不齐（含卷全丢的幽灵组）：不占配额，可被回收清理。
+    incomplete: bool = False
 
 
 def _is_unverified(b: CleanupItem) -> bool:
@@ -544,6 +550,8 @@ def find_backup_blobs(task: BackupTask) -> list[CleanupItem]:
                 stem=g.stem,
                 reclaimable=g.reclaimable,
                 state=(g.manifest.state if g.manifest is not None else ""),
+                countable=g.countable,
+                incomplete=g.incomplete,
             )
         )
     return sorted(blobs, key=lambda b: b.mtime)
@@ -633,6 +641,7 @@ def apply_retention(
                     mtime=time.time(),
                     managed=True,  # 本轮刚产出的托管组（清单稍后/刚写入）——只为计数
                     complete=True,
+                    countable=True,  # 本轮产物卷已全部落盘 → 它占一个 keep_last 配额
                     stem="",  # 无清单：删除环节本就会跳过，且不会去 delete_manifest
                 )
             )
@@ -644,16 +653,22 @@ def apply_retention(
     def _protected(b: CleanupItem) -> bool:
         return any(str(Path(f).resolve()).lower() in protected_set for f in b.files)
 
-    # 三类对象必须分开算（审查 A3 + P0 回归）：
-    # * trusted     —— 可信备份（manifest 状态 = committed）：**唯一**计入份数/天数/总量的对象；
+    # 五类对象必须分开算（审查 A3 + P0 回归 + S2）：
+    # * trusted     —— 可信备份（manifest committed **且卷齐全**）：**唯一**计入份数/天数/
+    #                  总量的对象。S2 修复前这里用的是 `managed`（只要求 committed），
+    #                  于是幽灵组（清单在、卷全丢，files=[]）也占一个配额：实测
+    #                  keep_last=2 + 1 个幽灵组 → 只剩 1 份真备份（静默多删一份）。
     # * unverified  —— 「写完了但没验过」（verify=False 的产物）：**也是一份备份**，
     #                  必须计入份数。否则 verify=False 的用户每次备份都会把上一份当残包删掉
-    #                  （P0 数据丢失：实测 keep_last=30 连跑 3 次只剩 1 份）；
-    # * junk        —— 中断/失败残组（committing / partial）：不是备份，也不该永久占盘 → 回收；
+    #                  （P0 数据丢失：实测 keep_last=30 连跑 3 次只剩 1 份）。
+    #                  与 trusted 一样要求卷齐全——缺卷的 unverified 也恢复不了。
+    # * incomplete  —— 清单已提交/未验证但**卷不齐**（含卷全丢的幽灵组）：S2 新增。
+    #                  不是「一份完整备份」→ **不占配额**；但占着清单和盘 → 可回收（见下）。
+    # * junk        —— 中断/失败残组（committing / partial 状态）：不是备份，也不该永久占盘 → 回收；
     # * legacy      —— 无清单旧包：E5 红线，默认只读（include_legacy=True 才参与淘汰）。
     # 本次刚产出的组即使在 retention 时仍是 committing，也必须按"一份备份"计入份数，
     # 否则 keep_last 永远少算一份（原实现的 protected 兜底就是这个作用，不能丢）。
-    trusted = [b for b in blobs if b.managed or _protected(b)]
+    trusted = [b for b in blobs if b.countable or _protected(b)]
     junk = [
         b
         for b in blobs
@@ -662,17 +677,57 @@ def apply_retention(
     unverified = [
         b
         for b in blobs
-        if b.reclaimable and not b.managed and not _protected(b) and _is_unverified(b)
+        if b.reclaimable
+        and not b.managed
+        and not _protected(b)
+        and _is_unverified(b)
+        and b.complete  # 缺卷的 unverified 同样不占配额（S2）
+    ]
+    # incomplete：**卷不齐**的组——含「卷全丢」的幽灵组，以及缺卷的 unverified。
+    # 刻意用 `managed or _is_unverified` 收口（committing/partial 已经在 junk 桶里），
+    # 且不在 junk/unverified 桶里重复出现（它们的判据都要求 complete 或非 managed）。
+    incomplete = [
+        b
+        for b in blobs
+        if not _protected(b) and not b.complete and (b.managed or _is_unverified(b))
     ]
     legacy = [b for b in blobs if not b.managed and not b.reclaimable and not _protected(b)]
     trusted += unverified  # 无条件计入：没验过 ≠ 不是备份
     trusted += legacy if include_legacy else []
     trusted.sort(key=lambda b: b.mtime)
     junk.sort(key=lambda b: b.mtime)
+    incomplete.sort(key=lambda b: b.mtime)
 
     expired: list[CleanupItem] = []
     # 0) 中断/失败残组：不是备份 → 直接回收（在飞的本次产物除外；默认 move 到回收目录，可反悔）
     expired.extend(junk)
+    # 0b) 残包（审查 S2）：卷不齐 → 不是一份完整备份，不占 keep_last 配额，但必须能回收，
+    #     否则「空清单永久占盘」。两种情形处置不同：
+    #     * 幽灵组（files 为空）：盘上没有任何用户数据，只剩一份**孤儿清单** → 回收
+    #       （实际动作只是删掉那个 .json，不碰任何备份文件）；
+    #     * 缺卷残包（还有部分卷）：已无法完整恢复，但卷本身仍是用户数据 → 只在**已被一份
+    #       更新的完整备份取代**时才回收。这样既清得掉垃圾，又不会因为"备份盘瞬时不可读 →
+    #       全部卷被误判缺失"而把用户唯一的一份备份清走（默认 move 模式还会先进回收站）。
+    newest_complete = max((b.mtime for b in trusted), default=0.0)
+    # 幽灵清单的回收闸门：**目录里必须至少有一份看得见的完整备份**才动手。
+    # 理由：`collect_groups` 用 `Path.is_file()` 判定卷在不在，而 pathlib 在 OSError
+    # （网络盘掉线、介质尚未挂载、权限瞬时收紧）时**返回 False 而不抛异常**。那种时刻
+    # 所有清单的卷会"同时消失"——如果照样把清单全删了，用户的备份会退化成无清单旧包，
+    # 从此受 E5 迁移红线保护而**永不自动清理**（磁盘悄悄涨），且丢失全部元数据。
+    # 要求"存在一份完整备份"等价于"此刻这个卷确实读得出来"，是廉价而有效的健全性检查。
+    directory_trustworthy = bool(trusted)
+    for b in incomplete:
+        if not b.files:
+            if directory_trustworthy:
+                expired.append(b)  # 幽灵组：只有孤儿清单，删除不触及任何备份文件
+            else:
+                log.warning(
+                    "跳过回收幽灵清单 %s：本目录没有可见的完整备份，"
+                    "卷可能只是瞬时不可读（若是真的丢了，请手动清理该 .json）",
+                    b.stem,
+                )
+        elif b.mtime < newest_complete:
+            expired.append(b)  # 缺卷残包，且已被更新的完整备份取代
 
     if not trusted and not expired:
         return []

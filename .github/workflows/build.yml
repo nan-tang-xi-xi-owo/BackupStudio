@@ -63,6 +63,62 @@ jobs:
           python -m pytest tests -q
           Rename-Item -Path tools/win32/_7z_off -NewName 7z
 
+  test-linux:
+    name: 单元测试（Linux）
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+        cache: pip
+    - name: 安装依赖
+      run: 'python -m pip install --upgrade pip
+
+        pip install -r requirements.txt -r requirements-dev.txt'
+    - name: 准备 7-Zip（系统包）
+      run: 'sudo apt-get update -qq
+
+        sudo apt-get install -y -qq p7zip-full
+
+        command -v 7z 7za 7zz || true
+
+        7z i 2>/dev/null | head -3 || 7za i 2>/dev/null | head -3 || true'
+    - name: 版本一致性门禁（env.APP_VERSION == backupstudio.__version__）
+      run: |
+        pkg_ver="$(python -c 'import backupstudio; print(backupstudio.__version__)')"
+        env_ver="${{ env.APP_VERSION }}"
+        echo "env.APP_VERSION=$env_ver  package.__version__=$pkg_ver"
+        if [ "$env_ver" != "$pkg_ver" ]; then
+          echo "::error::版本漂移：env.APP_VERSION=$env_ver 但 backupstudio.__version__=$pkg_ver"
+          echo "::error::请同步 .github/workflows/build.yml 的 env.APP_VERSION 与 backupstudio/__init__.py"
+          exit 1
+        fi
+        echo "版本一致：$env_ver"
+
+    - name: pytest（Linux + 系统 7z）
+      run: python -m pytest tests -q --basetemp="$PWD/build-bt" -rs
+
+  test-macos:
+    name: 单元测试（macOS arm64）
+    runs-on: macos-15
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+        cache: pip
+    - name: 安装依赖
+      run: 'python -m pip install --upgrade pip
+
+        pip install -r requirements.txt -r requirements-dev.txt'
+    - name: 准备 7-Zip（brew）
+      run: 'brew install p7zip || true
+
+        command -v 7z 7za 7zz || true'
+    - name: pytest（macOS + 系统 7z）
+      run: python -m pytest tests -q --basetemp="$PWD/build-bt" -rs
+
   windows:
     name: Windows exe / 安装包
     runs-on: windows-latest
@@ -389,6 +445,10 @@ jobs:
           manifest-path: packaging/io.github.backupstudio.BackupStudio.yml
           cache-key: flatpak-${{ github.sha }}
           build-bundle: true
+          # N1：flatpak-builder 自带 upload-artifact（默认 true），会与下一步
+          # 手动上传的 linux-flatpak 重复（同 digest 同大小），导致 Release 上
+          # 出现两个一模一样的 flatpak。这里关掉，只保留我们自己的 artifact。
+          upload-artifact: false
       # R-4：构建"成功"不等于包能用——此前 --no-deps 让 job 绿着产出
       # ImportError 的坏包。这一步必须让 job 失败，不许 || true 吞掉。
       - name: 冒烟测试（Flatpak）

@@ -161,10 +161,18 @@ def test_verify_version_file_rejects_wrong_version(build_mod, version_file):
 # 能被 PyInstaller 真正反序列化（构建期走的就是这条路径）
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="PyInstaller.utils.win32.versioninfo 内部 import win32api，非 Windows 上必然 ImportError",
+)
 def test_pyinstaller_can_deserialize_version_file(version_file):
     """PyInstaller 用 ``eval()`` 读版本文件，格式错了会直接构建失败。
 
     这是构建期走的**同一条**代码路径，所以必须真调它，不能只靠正则匹配文本。
+
+    注意：``importorskip`` 不够——``PyInstaller.utils.win32.versioninfo``
+    在 Linux/macOS 上**能导入**，但内部 ``from PyInstaller.compat import win32api``
+    会抛 ``ImportError``（CI 的 test-linux job 上实测）。必须显式按平台跳过。
     """
     versioninfo = pytest.importorskip("PyInstaller.utils.win32.versioninfo")
     info = versioninfo.load_version_info_from_text_file(str(version_file))
@@ -177,6 +185,10 @@ def test_pyinstaller_can_deserialize_version_file(version_file):
     assert strings["ProductVersion"] == EXPECTED_VERSION
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="同 test_pyinstaller_can_deserialize_version_file：非 Windows 缺 win32api",
+)
 def test_pyinstaller_reads_fixed_file_info_versions(version_file):
     """固定版本信息（数字部分）也必须真的写进去了。"""
     versioninfo = pytest.importorskip("PyInstaller.utils.win32.versioninfo")

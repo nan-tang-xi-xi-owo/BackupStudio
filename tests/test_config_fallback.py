@@ -56,6 +56,59 @@ def _clean_paths():
 # paths 侧：结构化状态
 # ---------------------------------------------------------------------------
 
+
+def _block_preferred_config(tmp_path, monkeypatch):
+    """按平台把「首选配置目录」变成不可用（用普通文件占位使 mkdir 失败）。
+
+    返回该"占位文件"路径，供断言 ``preferred`` 使用。
+
+    各平台的首选目录来源不同，所以必须设对应的环境变量：
+      win32  → APPDATA
+      darwin → HOME（首选 = ~/Library/Application Support/<app>）
+      其它   → XDG_CONFIG_HOME
+    """
+    import sys
+
+    monkeypatch.delenv("BACKUPSTUDIO_CONFIG_DIR", raising=False)
+    if sys.platform == "win32":
+        blocker = tmp_path / "appdata"
+        blocker.write_text("x", encoding="utf-8")
+        monkeypatch.setenv("APPDATA", str(blocker))
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+        return blocker
+    if sys.platform == "darwin":
+        home = tmp_path / "home"
+        appsup = home / "Library" / "Application Support"
+        appsup.mkdir(parents=True, exist_ok=True)
+        blocker = appsup / "BackupStudio"
+        blocker.write_text("x", encoding="utf-8")
+        monkeypatch.setenv("HOME", str(home))
+        return blocker
+    # Linux / 其它 POSIX
+    blocker = tmp_path / "xdg"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(blocker))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    return blocker
+
+def _prime_writable_preferred(tmp_path, monkeypatch):
+    """按平台把「首选配置目录」指向 tmp_path 下的可写位置。
+
+    用于那些主断言与首选目录无关的用例（如测 ``BACKUPSTUDIO_CONFIG_DIR``
+    被忽略时），避免落到真实用户目录、也避免在 Linux 上设了 ``APPDATA``
+    却根本没被读取。
+    """
+    import sys
+
+    if sys.platform == "win32":
+        monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    elif sys.platform == "darwin":
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    else:
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
 def test_state_not_fell_back_for_writable_override(tmp_path, monkeypatch):
     """显式指定且可写的覆盖目录 = 用户的选择，**不算**回退。"""
     cfg = tmp_path / "cfg"
@@ -73,7 +126,7 @@ def test_state_flags_unusable_override(tmp_path, monkeypatch):
     blocker = tmp_path / "blocker"
     blocker.write_text("not a directory", encoding="utf-8")
     monkeypatch.setenv("BACKUPSTUDIO_CONFIG_DIR", str(blocker / "sub"))
-    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    _prime_writable_preferred(tmp_path, monkeypatch)
     paths.reset_decisions()
     st = paths.config_dir_state()
     assert st["override_ignored"] is True, "不可用的 BACKUPSTUDIO_CONFIG_DIR 没有被标记"
@@ -83,18 +136,17 @@ def test_state_flags_unusable_override(tmp_path, monkeypatch):
 
 def test_state_flags_fallback_when_preferred_unwritable(tmp_path, monkeypatch):
     """首选目录不可写 → ``fell_back`` 为真，并记录首选目录与原因。"""
-    blocker = tmp_path / "appdata"
-    blocker.write_text("x", encoding="utf-8")  # 让 APPDATA 变成文件，导致 mkdir 失败
-    monkeypatch.setenv("APPDATA", str(blocker))
-    monkeypatch.delenv("BACKUPSTUDIO_CONFIG_DIR", raising=False)
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    blocker = _block_preferred_config(tmp_path, monkeypatch)
     paths.reset_decisions()
     st = paths.config_dir_state()
     assert st["fell_back"] is True, (
         f"首选目录不可写却没有标记 fell_back：{st}"
     )
-    assert Path(str(st["preferred"])) == blocker / "BackupStudio"
-    assert Path(str(st["actual"])) != Path(str(st["preferred"]))
+    # 首选目录名按平台不同：Windows 用 APP_NAME（BackupStudio），
+    # Linux 用 app 名（backupstudio）。用 paths 内部常量断言，避免写死大小写。
+    preferred = Path(str(st["preferred"]))
+    assert preferred.parent == blocker, f"首选目录应落在占位路径下：{preferred}"
+    assert Path(str(st["actual"])) != preferred
     assert st["reason"], "回退必须记录原因"
 
 
@@ -114,11 +166,7 @@ def test_reset_clears_state(tmp_path, monkeypatch):
 
 def test_selftest_reports_fallback_warning(tmp_path, monkeypatch, capsys):
     """核心回归：回退后 selftest 必须出现 WARN，且 JSON 里可断言。"""
-    blocker = tmp_path / "appdata"
-    blocker.write_text("x", encoding="utf-8")
-    monkeypatch.setenv("APPDATA", str(blocker))
-    monkeypatch.delenv("BACKUPSTUDIO_CONFIG_DIR", raising=False)
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    blocker = _block_preferred_config(tmp_path, monkeypatch)
     # 让运行时/日志目录也走临时位置，避免落到真实 APPDATA
     monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp"))
     paths.reset_decisions()
@@ -157,7 +205,7 @@ def test_selftest_reports_ignored_override(tmp_path, monkeypatch, capsys):
     blocker = tmp_path / "blocker"
     blocker.write_text("x", encoding="utf-8")
     monkeypatch.setenv("BACKUPSTUDIO_CONFIG_DIR", str(blocker / "sub"))
-    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    _prime_writable_preferred(tmp_path, monkeypatch)
     paths.reset_decisions()
 
     code, payload = _run_selftest_json(capsys)
@@ -200,11 +248,7 @@ def test_selftest_text_shows_warn_on_fallback(tmp_path, monkeypatch, capsys):
     """文本输出也必须出现 WARN 字样（用户看的就是这个）。"""
     from backupstudio.app import _cmd_selftest
 
-    blocker = tmp_path / "appdata"
-    blocker.write_text("x", encoding="utf-8")
-    monkeypatch.setenv("APPDATA", str(blocker))
-    monkeypatch.delenv("BACKUPSTUDIO_CONFIG_DIR", raising=False)
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    blocker = _block_preferred_config(tmp_path, monkeypatch)
     paths.reset_decisions()
 
     code = _cmd_selftest(as_json=False)
@@ -229,14 +273,15 @@ def test_settings_page_shows_fallback(tmp_path, monkeypatch):
 def test_appdata_dir_never_raises_with_hostile_env(monkeypatch, tmp_path):
     """任何环境都不能让目录决定抛异常（启动路径上的硬性要求）。
 
-    用「指向一个普通文件的路径」制造必然的 mkdir 失败（Windows 上带 NUL 的
-    环境变量根本设不进去，会先在 os.environ 层抛 ValueError）。
+    构造「覆盖目录 + 首选目录都不可用」的敌对环境，断言：
+      1. ``app_data_dir()`` 仍返回 Path（不抛异常）；
+      2. 状态里标记了回退（fell_back=True）。
     """
     blocker = tmp_path / "blocker"
     blocker.write_text("not a dir", encoding="utf-8")
-    monkeypatch.setenv("APPDATA", str(blocker))
+    # 首选目录也要不可用 —— 用 _block_preferred_config（按平台设对应 env）
+    _block_preferred_config(tmp_path, monkeypatch)
     monkeypatch.setenv("BACKUPSTUDIO_CONFIG_DIR", str(blocker / "sub"))
-    monkeypatch.setenv("LOCALAPPDATA", str(blocker / "local"))
     paths.reset_decisions()
     got = paths.app_data_dir()
     assert isinstance(got, Path)

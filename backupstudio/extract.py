@@ -309,7 +309,25 @@ def _declared_unpacked_unrar(exe: str, archive: Path, password: str | None) -> i
 
 
 def _sum_size_lines(argv: list[str]) -> int | None:
-    """跑 ``argv`` 并把输出里 ``Size =`` 行的数字求和；跑不起来/非 0 退出返回 None。"""
+    """跑 ``argv`` 并把输出里 ``Size =`` 行的数字求和。
+
+    返回 ``None`` = **读不出声明大小**；调用方（``_check_external_bomb``）必须据此拒绝放行。
+
+    **零命中必须返回 None，不能返回 0**（S1，安全级）。此前的实现无论如何都返回
+    ``total``（初始 0），于是「命令成功、但一行 ``Size =`` 都没解析到」被当成
+    "解压后共 0 字节" → ``declared > limit`` 恒假 → **炸弹预检静默 fail-open**。
+
+    触发场景是真实存在的：7-Zip 对**流式/未知大小的容器**只给出一行空值——
+    例如 ``.tar.zst`` 报 ``Method = header-open-only ... unknown-content-size``，
+    ``7z l -slt -ba`` 输出恰好是 ``Size = ``（空）与 ``Packed Size = ``（空），
+    一个数字都没有。实测把上限压到 256 KiB 仍能把这个 4 MiB 的包完整解出来。
+
+    与 rar 路径对齐：``_declared_unpacked_unrar`` 早就有 ``seen`` 守卫
+    （``return total if seen else None``），7z 路径此前漏了——两条路必须对称。
+
+    注意**不要**把"只有空目录的包"误伤成 None：那种包的条目行是 ``Size = 0``，
+    能解析出 0 → ``seen=True`` → 正常返回 0（本来就该放行，0 字节炸不了盘）。
+    """
     kwargs: dict = {"capture_output": True, "timeout": 300, "stdin": subprocess.DEVNULL}
     if sys.platform == "win32":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -321,15 +339,19 @@ def _sum_size_lines(argv: list[str]) -> int | None:
         return None
     out = (proc.stdout or b"").decode("utf-8", "replace")
     total = 0
+    seen = False
     for line in out.splitlines():
         line = line.strip()
         # 精确匹配 "Size ="，避免把 "Packed Size =" 也算进来
         if line.startswith("Size ="):
+            raw = line[len("Size ="):].strip()
             try:
-                total += int(line[len("Size ="):].strip())
+                total += int(raw)
             except ValueError:
+                # 空值（`Size = `）或非数字：该条目大小未知，**不算见过**
                 continue
-    return total
+            seen = True
+    return total if seen else None
 
 
 def _count_entries_7z(exe: str, archive: Path, password: str | None) -> int | None:

@@ -38,11 +38,10 @@
 # 补丁/差异文件保持原样，不做换行转换
 *.patch -text
 *.diff -text
-*.desktop text eol=lf
 
-# R-fixWSL?Linux/macOS ?????????? LF?
-# appimagetool ??? desktop-file-validate ? CR ????
-# AppStream?metainfo?? flatpak ? YAML ??? LF ????
+# R-fixWSL：Linux/macOS 打包脚本与元数据必须 LF。
+# appimagetool 内嵌的 desktop-file-validate 对 CR 零容忍；
+# AppStream（metainfo）与 flatpak 的 YAML 也应在 LF 下处理。
 *.desktop text eol=lf
 *.metainfo.xml text eol=lf
 packaging/*.yml text eol=lf

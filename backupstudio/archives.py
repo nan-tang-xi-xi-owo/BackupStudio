@@ -477,6 +477,45 @@ def _chunks_of(
 # ZIP
 # --------------------------------------------------------------------------
 
+#: ZIP 支持的 deflate 级别下界。**0 不是级别** —— 0 表示「不压缩」（STORED），
+#: zlib 的合法级别是 1..9，传 0 会变成 zlib.Z_DEFAULT_COMPRESSION（=6），
+#: 于是「级别 0」与「不设级别」产出同样的字节，用户看不出区别（S3 的另一半）。
+ZIP_MIN_DEFLATE_LEVEL = 1
+ZIP_MAX_DEFLATE_LEVEL = 9
+
+
+def zip_deflate_level(level: int) -> int:
+    """把产品的 0..9 级别夹到 ZIP deflate 的合法区间 1..9。
+
+    仅用于 ``compress_type == ZIP_DEFLATED`` 的条目。``level == 0`` 应走 STORED，
+    调用方**不要**把 0 传进来（这里也夹成 1 只是防御，不代表 0 应当压缩）。
+    """
+    return max(ZIP_MIN_DEFLATE_LEVEL, min(ZIP_MAX_DEFLATE_LEVEL, int(level)))
+
+
+def zip_info_level(zi: zipfile.ZipInfo, level: int, *, is_dir: bool = False) -> None:
+    """给 ``ZipInfo`` 同时设好 compress_type 与 compress_level（S3 的修复点）。
+
+    **两条都必须设，缺一即错**：
+
+    * ``compress_type`` —— ``ZipInfo`` 自带该字段，默认 ``0 = STORED``，会**覆盖**
+      ``ZipFile(compression=...)``；不设就整包不压缩（审查 Q6）。
+    * ``compress_level`` —— Python 3.12+ 的 ``_ZipWriteFile`` 直接读
+      ``zinfo.compress_level`` 交给 ``zlib.compressobj``；``ZipInfo`` 的默认值是
+      ``None`` → 落到 ``zlib.Z_DEFAULT_COMPRESSION``（恒 6）。**只设 compress_type
+      的话，level=1 与 level=9 产出的字节完全相同**（实测均 231809 B）——
+      用户以为自己在调压缩级别，实际永远是 6。全项目此前 `compress_level` 零命中。
+
+    STORED（目录条目、``level == 0``）不设 ``compress_level``：zlib 不参与，
+    设了也没有意义，还会让产物多一个与事实不符的字段。
+    """
+    if is_dir or level == 0:
+        zi.compress_type = zipfile.ZIP_STORED
+        return
+    zi.compress_type = zipfile.ZIP_DEFLATED
+    zi.compress_level = zip_deflate_level(level)
+
+
 class ZipCompressor:
     """标准库 zipfile 后端（不支持加密）。
 
@@ -526,7 +565,9 @@ class ZipCompressor:
         zi.create_system = 3
         # ZipInfo 自带 compress_type，默认 0=STORED，会**覆盖** ZipFile(compression=...)；
         # 不显式设置，整个内置 ZIP 后端就退化成「不压缩」（审查 Q6）。目录条目保持 STORED。
-        zi.compress_type = zipfile.ZIP_STORED if (is_dir or self.spec.level == 0) else zipfile.ZIP_DEFLATED
+        # S3：**还必须设 compress_level** —— Python 3.12+ 只读 zinfo.compress_level，
+        # 默认 None → 恒用 zlib 默认级别 6，级别 1..9 全部产出同样的字节。
+        zip_info_level(zi, self.spec.level, is_dir=is_dir)
         return zi
 
     def add_dir(self, arcname: str, mtime: float | None = None) -> None:
