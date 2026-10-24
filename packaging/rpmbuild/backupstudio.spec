@@ -67,5 +67,9 @@ install -Dm644 packaging/io.github.backupstudio.BackupStudio.metainfo.xml \
 %{python3_sitelib}/backupstudio-*.dist-info
 
 %changelog
+* Sat Oct 24 2026 BackupStudio contributors <noreply@example.com> - 1.1.0-1
+- Trust batch: retention is task-scoped, tar-family verification detects corruption,
+  split volumes restore in-app, encryption state is probed, cross-process locking hardened
+
 * Sat Oct 18 2026 BackupStudio contributors <noreply@example.com> - 1.0.0-1
 - Initial release
