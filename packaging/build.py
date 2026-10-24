@@ -24,6 +24,13 @@ import sys
 import time
 from pathlib import Path
 
+from _console import make_console_utf8_safe
+
+# B1：**在模块导入后立刻**切 UTF-8（不能等到 build() 里）——
+# argparse 的 --help / 报错信息本身含中文，`python packaging/build.py --help`
+# 在 cp1252 下会先在 argparse 阶段崩掉，根本走不到 build()。
+make_console_utf8_safe()
+
 ROOT = Path(__file__).resolve().parent.parent
 DIST = ROOT / "dist"
 BUILD = ROOT / "build" / "pyinstaller"
@@ -73,6 +80,9 @@ def _excludes() -> list[str]:
 
 
 def build(include_tools: bool = True, clean: bool = True, console: bool = False) -> int:
+    # B1：幂等再切一次（覆盖被调用方/子进程提前改写流的场景）；
+    # 真正的兜底在模块导入处，见文件头。
+    make_console_utf8_safe()
     try:
         import PyInstaller  # noqa: F401
     except ImportError:
@@ -134,6 +144,16 @@ def build(include_tools: bool = True, clean: bool = True, console: bool = False)
     return 0
 
 
+def _app_version() -> str:
+    """读取包版本（唯一真源 backupstudio/__init__.py::__version__），避免版本号写死。"""
+    try:
+        import backupstudio
+
+        return backupstudio.__version__
+    except Exception:  # noqa: BLE001 - 打包脚本不应因读不到版本而失败
+        return "0.0.0"
+
+
 def platform_key() -> str:
     if sys.platform == "win32":
         return "win32"
@@ -163,7 +183,7 @@ def _post_build() -> None:
     readme = target / "README.md"
     if readme.exists():
         (target / "使用说明.txt").write_text(
-            "BackupStudio 备份工坊 1.0.0\n\n"
+            f"BackupStudio 备份工坊 {_app_version()}\n\n"
             "1. 双击 BackupStudio.exe 启动，右下角托盘会出现图标。\n"
             "2. 点「新建任务」选择要备份的文件夹、备份位置、压缩格式（可选密码/分卷）。\n"
             "3. 「计划与保留」里设置自动备份时间，并可自动清理旧备份。\n"

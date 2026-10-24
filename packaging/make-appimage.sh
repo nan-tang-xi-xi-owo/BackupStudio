@@ -31,10 +31,22 @@ cat > "$APPDIR/AppRun" <<'EOF'
 #!/bin/sh
 HERE="$(dirname "$(readlink -f "$0")")"
 export PATH="$HERE/usr/bin:$PATH"
-export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb;wayland}"
+# B4：wayland 优先、xcb 兜底（原值 xcb;wayland 在纯 Wayland 桌面上反而先失败）
+export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-wayland;xcb}"
 exec "$HERE/usr/lib/backupstudio/BackupStudio" "$@"
 EOF
 chmod +x "$APPDIR/AppRun"
+
+# B4：.desktop 里 Exec/TryExec 都是 `backupstudio`，但 AppDir 之前只有
+# usr/lib/backupstudio/BackupStudio，**没有 usr/bin/backupstudio** →
+# TryExec 失效（桌面环境判定"程序不存在"而不显示图标/无法从菜单启动）。
+# 补一个启动器脚本，让 Exec/TryExec 真正可解析。
+cat > "$APPDIR/usr/bin/backupstudio" <<'EOF'
+#!/bin/sh
+HERE="$(dirname "$(readlink -f "$0")")/../.."
+exec "$HERE/usr/lib/backupstudio/BackupStudio" "$@"
+EOF
+chmod +x "$APPDIR/usr/bin/backupstudio"
 
 cp "$ROOT/packaging/icon.png" "$APPDIR/io.github.backupstudio.BackupStudio.png"
 cp "$ROOT/packaging/icon.png" "$APPDIR/usr/share/icons/hicolor/512x512/apps/io.github.backupstudio.BackupStudio.png"

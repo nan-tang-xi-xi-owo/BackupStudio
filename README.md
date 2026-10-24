@@ -19,9 +19,9 @@
 
 | 平台 | 文件 | 使用 |
 | --- | --- | --- |
-| Windows 10/11 x64 | `BackupStudio-1.0.0-windows-x64.zip` / `BackupStudio-Setup-1.0.0.exe` | 解压运行 `BackupStudio.exe`，或用安装包安装 |
-| macOS（Apple Silicon / Intel） | `BackupStudio-1.0.0.dmg` | 拖入「应用程序」；未签名版首次需右键 → 打开 |
-| Linux x86_64 | `BackupStudio-1.0.0-x86_64.AppImage` | `chmod +x` 后直接运行（需要 libfuse2） |
+| Windows 10/11 x64 | `BackupStudio-1.1.0-windows-x64.zip` / `BackupStudio-Setup-1.1.0.exe` | 解压运行 `BackupStudio.exe`，或用安装包安装 |
+| macOS（Apple Silicon / Intel） | `BackupStudio-1.1.0-<arch>.dmg` | 拖入「应用程序」；未签名版首次需右键 → 打开 |
+| Linux x86_64 | `BackupStudio-1.1.0-x86_64.AppImage` | `chmod +x` 后直接运行（需要 libfuse2） |
 | Linux（通用） | `BackupStudio.flatpak` | `flatpak install --user BackupStudio.flatpak` |
 
 ---
@@ -65,8 +65,8 @@ python -m backupstudio --help     # 命令行
 
 * **Windows**：`dist/BackupStudio/BackupStudio.exe`（onedir，内含 7za，开箱即用）。
   如需安装包：`pwsh packaging/make-windows-installer.ps1`（需 Inno Setup 6）。
-* **macOS**：`python packaging/build.py` → `bash packaging/make-dmg.sh` → `dist/BackupStudio-1.0.0.dmg`
-* **Linux AppImage**：`python packaging/build.py` → `bash packaging/make-appimage.sh` → `dist/BackupStudio-1.0.0-x86_64.AppImage`
+* **macOS**：`python packaging/build.py` → `bash packaging/make-dmg.sh` → `dist/BackupStudio-1.1.0-<arch>.dmg`
+* **Linux AppImage**：`python packaging/build.py` → `bash packaging/make-appimage.sh` → `dist/BackupStudio-1.1.0-x86_64.AppImage`
 * **Flatpak**：`flatpak-builder --user --install --force-clean build-dir packaging/io.github.backupstudio.BackupStudio.yml`
 * **RPM**（Fedora/RHEL/openEuler）：`bash packaging/make-rpm.sh`
 

@@ -1,5 +1,5 @@
 # 由 packaging/make-rpm.sh 调用：rpmbuild -ba backupstudio.spec --define "_topdir ..." --define "_version x.y.z"
-%global _version %{?_version}%{!?_version:1.0.0}
+%global _version %{?_version}%{!?_version:1.1.0}
 
 Name:           backupstudio
 Version:        %{_version}
@@ -67,5 +67,7 @@ install -Dm644 packaging/io.github.backupstudio.BackupStudio.metainfo.xml \
 %{python3_sitelib}/backupstudio-*.dist-info
 
 %changelog
+* Sat Oct 24 2026 BackupStudio contributors <noreply@example.com> - 1.1.0-1
+- Trust release: manifest identity layer, cross-process locks, three-state verify
 * Sat Oct 18 2026 BackupStudio contributors <noreply@example.com> - 1.0.0-1
 - Initial release

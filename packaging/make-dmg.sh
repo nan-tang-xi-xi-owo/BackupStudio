@@ -13,7 +13,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="$("${PYTHON:-python3}" -c 'import sys; sys.path.insert(0, "'"$ROOT"'"); import backupstudio; print(backupstudio.__version__)')"
 APP="$ROOT/dist/BackupStudio.app"
-DMG="$ROOT/dist/BackupStudio-${VERSION}.dmg"
+# B7：产物名必须带架构后缀 —— 否则 arm64 与 x64 两个 job 都产出
+# `BackupStudio-<version>.dmg`，release job 用 `merge-multiple: true` 下载
+# 到同一目录时后到的会覆盖先到的，用户只能拿到其中一种架构。
+ARCH="$(uname -m)"
+DMG="$ROOT/dist/BackupStudio-${VERSION}-${ARCH}.dmg"
 STAGE="$ROOT/build/dmg-stage"
 
 if [[ ! -d "$APP" ]]; then

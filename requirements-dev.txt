@@ -1,6 +1,7 @@
 # 开发 / CI 依赖：运行时依赖 + 测试与打包工具
 -r requirements.txt
 pytest>=8
-pyinstaller>=6.3
+# C3：加 <7 —— PyInstaller 7.0 会有破坏性变更，直接打穿 CI。
+pyinstaller>=6.3,<7
 pyyaml>=6.0
 ruff>=0.6

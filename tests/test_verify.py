@@ -116,3 +116,83 @@ class TestVolumeVerify:
         truncated = make_vols([data[:half][: 1], data[half:]])  # 第一段截成 1 字节
         ok2, msg2 = _verify_volumes(truncated, "zip")
         assert ok2 is False, f"截断分卷未检出（msg={msg2}）"
+
+
+class TestPy7zrPayloadVerify:
+    """A1 回归：无 7-Zip 时 7z 校验必须读**载荷**，不能只读头。
+
+    背景：旧实现只调 ``getnames()``，一个载荷被翻转字节的 300 KB 7z 也会返回
+    ``(True, 'py7zr 结构校验通过')``，而同一文件 ``py7zr.extractall()`` 抛 CrcError。
+    这是「skipped 不再当 passed」修复自己引入的**新假 passed**。
+    """
+
+    @staticmethod
+    def _make_7z(tmp_path, name="src.bin", size=64 * 1024):
+        py7zr = pytest.importorskip("py7zr")
+        payload = tmp_path / name
+        payload.write_bytes(os.urandom(size))
+        arc = tmp_path / "good.7z"
+        with py7zr.SevenZipFile(arc, "w") as z:
+            z.write(payload, name)
+        return arc
+
+    def test_corrupted_payload_is_failed_not_passed(self, tmp_path, no_7z):
+        """载荷中间翻转一个字节 → 必须 (False, ...)，绝不能 True。"""
+        from backupstudio.engine import verify_archive
+
+        arc = self._make_7z(tmp_path)
+        data = bytearray(arc.read_bytes())
+        mid = len(data) // 2
+        data[mid] ^= 0xFF
+        bad = tmp_path / "bad.7z"
+        bad.write_bytes(bytes(data))
+
+        ok, msg = verify_archive(bad, "7z")
+        assert ok is False, f"载荷损坏的 7z 被判 {ok!r}（msg={msg}）—— A1 未修复"
+        assert "CRC" in msg or "校验失败" in msg, msg
+
+    def test_good_payload_is_passed(self, tmp_path, no_7z):
+        """完好 7z 必须 True（不能为了修假通过而把好包误判失败）。"""
+        from backupstudio.engine import verify_archive
+
+        arc = self._make_7z(tmp_path)
+        ok, msg = verify_archive(arc, "7z")
+        assert ok is True, f"完好 7z 被判 {ok!r}（msg={msg}）"
+
+    def test_header_only_damage_is_not_passed(self, tmp_path, no_7z):
+        """截断到一半（头部不完整）→ 必须 False。"""
+        from backupstudio.engine import verify_archive
+
+        arc = self._make_7z(tmp_path)
+        data = arc.read_bytes()
+        trunc = tmp_path / "trunc.7z"
+        trunc.write_bytes(data[: len(data) // 2])
+        ok, msg = verify_archive(trunc, "7z")
+        assert ok is False, f"截断 7z 被判 {ok!r}（msg={msg}）"
+
+    def test_missing_testzip_degrades_to_skipped(self, tmp_path, no_7z, monkeypatch):
+        """py7zr 无 testzip() 时必须降级为 skipped（None），而不是 passed。"""
+        py7zr = pytest.importorskip("py7zr")
+        from backupstudio.engine import verify_archive
+
+        arc = self._make_7z(tmp_path)
+        monkeypatch.delattr(py7zr.SevenZipFile, "testzip", raising=False)
+        ok, msg = verify_archive(arc, "7z")
+        assert ok is None, f"无 testzip() 时应 skipped，实际 {ok!r}（msg={msg}）"
+        assert "testzip" in msg or "跳过" in msg, msg
+
+    def test_encrypted_without_password_is_skipped_not_failed(self, tmp_path, no_7z):
+        """加密 7z 未给密码 → skipped（None）；给了正确密码 → passed。"""
+        py7zr = pytest.importorskip("py7zr")
+        from backupstudio.engine import verify_archive
+
+        payload = tmp_path / "s.txt"
+        payload.write_text("secret", encoding="utf-8")
+        arc = tmp_path / "enc.7z"
+        with py7zr.SevenZipFile(arc, "w", password="pw") as z:
+            z.write(payload, "s.txt")
+
+        ok, _ = verify_archive(arc, "7z")
+        assert ok is None, f"加密包无密码应 skipped，实际 {ok!r}"
+        ok2, msg2 = verify_archive(arc, "7z", "pw")
+        assert ok2 is True, f"正确密码应 passed，实际 {ok2!r}（msg={msg2}）"

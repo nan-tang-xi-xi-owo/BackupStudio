@@ -109,3 +109,100 @@ class TestExtractEncrypted:
         elapsed = time.monotonic() - t0
         assert ok is False
         assert elapsed < 30, f"无密码读加密归档耗时 {elapsed:.1f}s（疑似挂起）"
+
+
+class TestBombGuardDoesNotSelfHarm:
+    """A4 回归：绝对上限为主，且必须能放宽 —— 不得拒绝本产品自己产的正常备份。
+
+    背景：旧实现 `limit = min(100 GiB, size × 1000)` 是硬拒绝且无逃生阀。
+    实测一个 8 MiB 全零日志用 deflate 压到 8 KB（1014×），恢复时被自己的防护挡住。
+    """
+
+    @staticmethod
+    def _zeros_zip(tmp_path, name="self.zip", size=8 * 1024 * 1024):
+        arc = tmp_path / name
+        with zipfile.ZipFile(arc, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("log.txt", b"\x00" * size)
+        return arc
+
+    def test_own_high_ratio_backup_is_extractable(self, tmp_path):
+        """1014× 的自有备份必须能解开（旧实现直接拒绝）。"""
+        from backupstudio.extract import extract_archive
+
+        arc = self._zeros_zip(tmp_path)
+        ratio = (8 * 1024 * 1024) / arc.stat().st_size
+        assert ratio > 1000, f"测试前提失败：压缩比只有 {ratio:.0f}x"
+        out = tmp_path / "out"
+        ok, msg = extract_archive(arc, out)
+        assert ok, f"{ratio:.0f}x 的自有备份被拒绝：{msg}"
+        restored = out / "log.txt"
+        assert restored.exists() and restored.stat().st_size == 8 * 1024 * 1024
+
+    def test_absolute_cap_still_blocks_real_bomb(self, tmp_path, monkeypatch):
+        """绝对上限压到 1 MiB 时，同一个包必须被拦（防护没被削弱成摆设）。"""
+        from backupstudio import extract as ex
+
+        arc = self._zeros_zip(tmp_path)
+        monkeypatch.setenv(ex.ENV_MAX_UNPACKED_BYTES, str(1024 * 1024))
+        ok, msg = ex.extract_archive(arc, tmp_path / "blocked")
+        assert ok is False
+        assert "炸弹" in msg or "超过上限" in msg, msg
+
+    def test_env_can_disable_absolute_cap(self, tmp_path, monkeypatch):
+        """BACKUPSTUDIO_MAX_UNPACKED_BYTES=0 = 关闭绝对上限，恢复必须成功。"""
+        from backupstudio import extract as ex
+
+        arc = self._zeros_zip(tmp_path)
+        monkeypatch.setenv(ex.ENV_MAX_UNPACKED_BYTES, "0")
+        ok, msg = ex.extract_archive(arc, tmp_path / "relaxed")
+        assert ok, f"放宽开关无效：{msg}"
+
+    def test_ratio_is_an_outer_bound_not_a_tight_cap(self, tmp_path, monkeypatch):
+        """比例默认 10000（而非 1000）；刻意调小到 2 时仍能兜住。"""
+        from backupstudio import extract as ex
+
+        assert ex._MAX_EXPANSION_RATIO >= 10000, "默认比例应放宽到 10000"
+        arc = self._zeros_zip(tmp_path)
+        monkeypatch.setenv(ex.ENV_MAX_UNPACKED_BYTES, "0")
+        monkeypatch.setenv(ex.ENV_MAX_UNPACK_RATIO, "2")
+        ok, msg = ex.extract_archive(arc, tmp_path / "ratio")
+        assert ok is False, "比例兜底失效"
+        assert "炸弹" in msg or "超过上限" in msg, msg
+
+    def test_cli_flag_overrides_limit(self, tmp_path, monkeypatch):
+        """--max-unpacked-bytes 必须能被 CLI 解析并生效（逃生阀存在性）。"""
+        from backupstudio import app as app_mod
+
+        p = app_mod._build_parser()
+        ns = p.parse_args(["extract", "a.zip", "--to", "o", "--max-unpacked-bytes", "0"])
+        assert ns.max_unpacked_bytes == 0
+        ns2 = p.parse_args(["extract", "a.zip", "--to", "o", "--max-unpack-ratio", "5"])
+        assert ns2.max_unpack_ratio == 5
+
+    def test_7z_external_has_cap_too(self, tmp_path, monkeypatch):
+        """7z 外部解压路径也必须有绝对上限（旧实现完全没有炸弹防护）。"""
+        from backupstudio import extract as ex
+        from backupstudio.tools import find_7z
+
+        seven = find_7z()
+        if not seven:
+            pytest.skip("本机无 7-Zip")
+        import subprocess
+
+        payload = tmp_path / "zeros.bin"
+        payload.write_bytes(b"\x00" * (4 * 1024 * 1024))
+        arc = tmp_path / "self.7z"
+        r = subprocess.run([seven, "a", "-t7z", "-mx9", str(arc), str(payload)],
+                           capture_output=True, stdin=subprocess.DEVNULL, timeout=300)
+        if r.returncode != 0 or not arc.exists():
+            # 某些受限环境（沙箱/杀软）里 7za 无法在临时目录建包，此时无法验证 7z 路径
+            pytest.skip(f"本机 7-Zip 无法创建压缩包，跳过 7z 炸弹预检用例：{(r.stdout or b'')[-160:]!r}")
+
+        monkeypatch.setenv(ex.ENV_MAX_UNPACKED_BYTES, str(1024 * 1024))
+        ok, msg = ex.extract_archive(arc, tmp_path / "blocked7z")
+        assert ok is False, f"7z 炸弹未被拦：{msg}"
+        assert "炸弹" in msg or "超过上限" in msg, msg
+
+        monkeypatch.delenv(ex.ENV_MAX_UNPACKED_BYTES)
+        ok2, msg2 = ex.extract_archive(arc, tmp_path / "ok7z")
+        assert ok2, f"正常 7z 被误拦：{msg2}"

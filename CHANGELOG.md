@@ -2,6 +2,43 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 1.1.0 — 2026-10-24
+
+信任批次（可信备份身份层）：只有「卷齐全 + 校验通过」的归档才算一份备份。
+
+### 修复（数据安全）
+- **7z 假通过**：无 7-Zip 时不再用 `getnames()`（只读头）冒充校验，改为 py7zr `testzip()`
+  读载荷并比对 CRC；API 不可用时返回「跳过」而不是「通过」。损坏的 7z 现在稳定判失败。
+- **分卷归组回退**：恢复 `stem.7z.001/.002` 与 `base.part1.rar/part2.rar` 两种分卷的归组
+  （此前 `.001` 完全不可见、`partN.rar` 被拆成多组，可能只删掉 part1 留下残缺包）。
+  同时保证 `a.7z` 与 `a.7z.bak` 不会被误并为一份。
+- **状态机修正**：`committing` 改为真实的两阶段提交（校验前先落盘一份临时清单），
+  崩溃不再留下"永不被淘汰"的无清单残包；校验失败 → `partial`、未校验 → `unverified`，
+  两者都不再算「可信备份」，且都会进入保留策略候选（不再永久占盘）。
+- **炸弹防护不再自伤**：解压上限从「1000× 比例硬拒」改为「绝对上限（默认 100 GiB）+ 可放宽」，
+  默认比例放宽到 10000×；新增 `--max-unpacked-bytes` / `--max-unpack-ratio` 与环境变量
+  `BACKUPSTUDIO_MAX_UNPACKED_BYTES` / `BACKUPSTUDIO_MAX_UNPACK_RATIO`。
+  8 MiB 全零日志（1014×）这类**本产品自己产出的正常备份**不再被拒绝。
+  同时给 7z / rar 外部解压补上同样的绝对上限预检（此前完全没有防护）。
+
+### 修复（CI / 打包）
+- Windows 打包脚本在 cp1252 控制台下崩溃（`UnicodeEncodeError`）：新增 `packaging/_console.py`，
+  在模块导入时即切换到 UTF-8；workflow 同时设 `PYTHONIOENCODING=utf-8`
+  （`PYTHONUTF8` 会被 `PYTHONIOENCODING` 覆盖，只设前者不够）。
+- `.desktop` 的 `Categories` 去掉未注册值 `Backup`，改用合法的 `Compression`（appimagetool 不再拒绝）。
+- AppImage 补 `/usr/bin/backupstudio` 启动器（此前 `Exec`/`TryExec` 指向的文件不存在），
+  `QT_QPA_PLATFORM` 改为 `wayland;xcb`。
+- macOS runner 迁移：`macos-14` → `macos-15`、`macos-13`（已退役）→ `macos-15-intel`。
+- Flatpak：镜像改用 `ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-24.08`
+  （原 tag 从未发布）；manifest 修掉 JSON 尾逗号、去掉 `--no-deps`、构建期允许网络。
+- dmg 产物名加架构后缀，避免 arm64 / x64 互相覆盖。
+- 版本号统一到 1.1.0，`packaging/build.py` 改为引用 `backupstudio.__version__`。
+- 依赖钉上界：`PySide6-Essentials>=6.8,<6.13`、`pyinstaller>=6.3,<7`（消除不可复现构建）。
+
+### 测试
+- 新增 A1–A4 的回归用例（见 `tests/test_verify.py`、`test_manifest.py`、`test_extract.py`）。
+
+
 ## 1.0.0 — 2026-10-18
 
 首个公开版本。

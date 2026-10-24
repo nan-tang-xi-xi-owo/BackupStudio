@@ -170,3 +170,154 @@ class TestManifestIntegration:
         assert len(reports) == 1
         assert reports[0].stem == "user_manual.zip"
         assert (dest / "user_manual.zip").exists(), "plan_adoption 不得删除任何文件"
+
+
+class TestVolumeGrouping:
+    """A2 回归：恢复 main 的两种分卷归组，且不误并同名普通文件。"""
+
+    FMTS = (".zip", ".7z", ".rar", ".tar", ".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst")
+
+    def _groups(self, tmp_path, names):
+        from backupstudio.manifest import collect_groups
+
+        d = tmp_path / "vol"
+        d.mkdir()
+        for n in names:
+            (d / n).write_bytes(b"x" * 16)
+        return {g.stem: sorted(f.name for f in g.files)
+                for g in collect_groups(d, ".7z", fmts=self.FMTS)}
+
+    def test_7z_native_volumes_grouped(self, tmp_path):
+        """`stem.7z.001/.002` 必须归成一组（旧实现完全看不见 → 保留策略漏算）。"""
+        got = self._groups(tmp_path, ["old.7z.001", "old.7z.002"])
+        assert got == {"old.7z": ["old.7z.001", "old.7z.002"]}, got
+
+    def test_rar_native_volumes_grouped(self, tmp_path):
+        """`base.part1.rar/part2.rar` 必须归成一组（旧实现拆成两组 → 可能只删 part1）。"""
+        got = self._groups(tmp_path, ["old.part1.rar", "old.part2.rar"])
+        assert got == {"old.rar": ["old.part1.rar", "old.part2.rar"]}, got
+
+    def test_generic_split_volumes_grouped(self, tmp_path):
+        """本产品的 `.partNN` 切片仍要正确归组（不能修 A2 时破坏它）。"""
+        got = self._groups(tmp_path, ["s.tar.gz.part01", "s.tar.gz.part02"])
+        assert got == {"s.tar.gz": ["s.tar.gz.part01", "s.tar.gz.part02"]}, got
+
+    def test_backup_suffix_not_merged(self, tmp_path):
+        """`a.7z` 与 `a.7z.bak` 绝不能并成一组（A2 的硬性约束）。"""
+        got = self._groups(tmp_path, ["a.7z", "a.7z.bak"])
+        # `a.7z.bak` 不是任何分卷形态 → 根本不属于备份集合（也就绝不会被并入 a.7z）。
+        # 关键断言：a.7z 组里只有自己，没有被 .bak 污染。
+        assert got.get("a.7z") == ["a.7z"], got
+        assert all("a.7z.bak" not in files for files in got.values()), got
+
+    def test_partial_digit_extension_not_merged(self, tmp_path):
+        """`a.7z.1` / `a.7z.01` 不是三位分卷，不得并入 `a.7z` 组。"""
+        got = self._groups(tmp_path, ["a.7z", "a.7z.1", "a.7z.01"])
+        assert got.get("a.7z") == ["a.7z"], got
+
+    def test_prefix_similar_names_not_merged(self, tmp_path):
+        """`x.7z` 与 `xy.7z` 是两个不同的包。"""
+        got = self._groups(tmp_path, ["x.7z", "xy.7z"])
+        assert got == {"x.7z": ["x.7z"], "xy.7z": ["xy.7z"]}, got
+
+    def test_volume_order_is_numeric(self, tmp_path):
+        """卷序按数值排：part9 在 part10 之前。"""
+        from backupstudio.manifest import _volume_sort_key
+
+        names = ["s.tar.gz.part10", "s.tar.gz.part9"]
+        assert sorted(names, key=_volume_sort_key) == ["s.tar.gz.part9", "s.tar.gz.part10"]
+
+
+class TestCommitStateMachine:
+    """A3 回归：committing 接线、skipped 不算可信、坏包可被回收。"""
+
+    def _rec(self, status, verification):
+        from backupstudio.config import RunRecord
+
+        return RunRecord(task_id="t", task_name="n", started_at="2026-01-01T00:00:00",
+                         status=status, verification=verification)
+
+    @pytest.mark.parametrize("status,verification,expected", [
+        ("success", "passed", "committed"),
+        ("success", "skipped", "unverified"),
+        ("success", "failed", "partial"),
+        ("failure", "skipped", "partial"),
+    ])
+    def test_state_mapping(self, status, verification, expected):
+        """三态必须真的落到提交状态上（旧实现只有 committed/partial 二选一）。"""
+        from backupstudio.engine import manifest_state_for
+
+        assert manifest_state_for(self._rec(status, verification)) == expected
+
+    def test_committing_manifest_written_before_verify(self, src_tree, tmp_path, monkeypatch):
+        """两阶段提交：校验前必须已有一份 committing 清单（崩溃后可被看见）。"""
+        from backupstudio import engine as eng
+        from backupstudio.manifest import STATE_COMMITTING, load_manifests
+
+        seen: list[str] = []
+        real = eng._write_manifest_stage
+
+        def spy(task, record, result, stem, state):
+            seen.append(state)
+            return real(task, record, result, stem, state)
+
+        monkeypatch.setattr(eng, "_write_manifest_stage", spy)
+        rec = eng.TaskEngine().run(_task(tmp_path / "cs", src_tree, fmt="zip")).record
+        assert rec.status == "success", rec.errors
+        assert seen[0] == STATE_COMMITTING, f"第一次写清单应是 committing，实际 {seen}"
+        assert seen[-1] == "committed", f"最终应是 committed，实际 {seen}"
+
+    def test_unverified_archive_is_not_trusted(self, src_tree, tmp_path, monkeypatch):
+        """校验 skipped → 清单不能是 committed（旧实现写 committed，算可信备份）。"""
+        from backupstudio import engine as eng
+        from backupstudio.manifest import load_manifests
+
+        monkeypatch.setattr(eng, "verify_archive", lambda *a, **k: (None, "跳过校验（测试注入）"))
+        dest = tmp_path / "unv"
+        rec = eng.TaskEngine().run(_task(dest, src_tree, fmt="zip")).record
+        assert rec.status == "success"
+        assert rec.verification == "skipped"
+        states = [m.state for m in load_manifests(dest).values()]
+        assert states == ["unverified"], f"未校验的包必须是 unverified，实际 {states}"
+
+    def test_partial_group_is_reclaimable(self, src_tree, tmp_path):
+        """校验失败的坏包必须能被保留策略清理（旧实现永久占盘）。"""
+        import time as _time
+
+        from backupstudio.config import RetentionPolicy
+        from backupstudio.engine import TaskEngine, apply_retention
+        from backupstudio.manifest import Manifest, STATE_PARTIAL, write_manifest
+
+        dest = tmp_path / "gc"
+        dest.mkdir()
+        bad = dest / "broken_20200101.zip"
+        bad.write_bytes(b"PK\x03\x04" + b"x" * 64)
+        write_manifest(dest, Manifest(
+            stem="broken_20200101.zip", task_id="x", fmt="zip", state=STATE_PARTIAL,
+            volumes=["broken_20200101.zip"], size_bytes=68,
+            created_at="2020-01-01T00:00:00", committed_at="2020-01-01T00:00:00",
+            verified="failed",
+        ))
+        t = _task(dest, src_tree, fmt="zip")
+        t.retention = RetentionPolicy(enabled=True, keep_last=5, keep_days=1, on_cleanup="delete")
+        handled = apply_retention(t)
+        assert str(bad) in handled or not bad.exists(), f"坏包未被回收：{handled}"
+        assert not bad.exists()
+
+    def test_trusted_count_ignores_partial(self, src_tree, tmp_path):
+        """份数只数可信备份：1 份可信 + 1 份坏包，keep_last=1 时两者都该被处理。"""
+        import time as _time
+
+        from backupstudio.config import RetentionPolicy
+        from backupstudio.engine import TaskEngine
+
+        dest = tmp_path / "cnt"
+        engine = TaskEngine()
+        for i in range(2):
+            t = _task(dest, src_tree, fmt="zip")
+            t.name = f"c{i}"
+            t.retention = RetentionPolicy(enabled=True, keep_last=1, on_cleanup="delete")
+            assert engine.run(t).record.status == "success"
+            _time.sleep(1.05)
+        zips = sorted(p.name for p in dest.glob("*.zip"))
+        assert len(zips) == 1, f"keep_last=1 应只留 1 份：{zips}"

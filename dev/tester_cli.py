@@ -58,8 +58,10 @@ def main() -> int:
     env = ctx["env"]
 
     # ---------- CLI 基础 ----------
+    from backupstudio import __version__ as _ver
+
     code, out, err = run(["--version"], env)
-    check("--version 输出且退出码 0", code == 0 and "1.0.0" in out, f"code={code} err={err[:200]}")
+    check("--version 输出且退出码 0", code == 0 and _ver in out, f"code={code} err={err[:200]}")
     check("--version 不打印 Traceback", "Traceback" not in err, err[:200])
 
     code, out, _ = run(["--help"], env)

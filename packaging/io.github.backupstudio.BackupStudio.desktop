@@ -10,7 +10,10 @@ Exec=backupstudio %U
 TryExec=backupstudio
 Icon=io.github.backupstudio.BackupStudio
 Terminal=false
-Categories=Utility;Archiving;Backup;
+# B3：`Backup` 不是 freedesktop 注册类别（appimagetool 直接报
+# `contains an unregistered value "Backup"` 并拒绝打包）。
+# Compression 是合法的 Additional Category（Related: Utility;Archiving）。
+Categories=Utility;Archiving;Compression;
 Keywords=backup;archive;compress;zip;7z;tar;备份;压缩;
 StartupWMClass=BackupStudio
 X-GNOME-UsesNotifications=true

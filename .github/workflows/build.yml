@@ -12,6 +12,15 @@ permissions:
 
 env:
   PYTHON_VERSION: "3.12"
+  APP_VERSION: "1.1.0"
+  # B2：**必须显式设 PYTHONIOENCODING=utf-8**，不能只靠 PYTHONUTF8。
+  # 原因（实测）：PYTHONUTF8=1 只把 *默认* 编码切到 UTF-8；一旦环境里同时存在
+  # PYTHONIOENCODING（本机/镜像预设、或 pyinstaller 子进程继承来的值），
+  # PYTHONIOENCODING **优先级更高并覆盖** UTF-8 模式对 stdio 的影响 ——
+  # 实测 `PYTHONUTF8=1 PYTHONIOENCODING=cp1252 python -c "print(sys.stdout.encoding)"`
+  # 输出 cp1252。所以只设 PYTHONUTF8 无法保证 runner 上 print 中文不炸。
+  PYTHONIOENCODING: "utf-8"
+  PYTHONUTF8: "1"
 
 jobs:
   test:
@@ -40,8 +49,17 @@ jobs:
         run: python -m pytest tests -q
       - name: pytest（无 7z 环境——模拟纯净安装机器）
         shell: pwsh
+        env:
+          # B8：光改目录名**不等于**无 7z —— find_7z() 还会回落到 PATH
+          # （tools.py:107 `_which_many`）与 Program Files（tools.py:110），而
+          # windows-latest 预装 7-Zip（实测 C:\ProgramData\chocolatey\bin\7z.EXE）。
+          # 这就是"两遍都 137 passed / 0 skip"、双环境门禁从未生效的原因。
+          # 这里用 BACKUPSTUDIO_DISABLE_7Z=1 让 find_7z() 在源头直接返回 None
+          #（比改 PATH 更可靠：7z 分散在 Chocolatey/PATH/Program Files 三处）。
+          BACKUPSTUDIO_DISABLE_7Z: "1"
         run: |
           Rename-Item -Path tools/win32/7z -NewName _7z_off
+          python -c "from backupstudio.tools import find_7z; import sys; got=find_7z(); print('find_7z ->', got); sys.exit(0 if got is None else 1)"
           python -m pytest tests -q
           Rename-Item -Path tools/win32/_7z_off -NewName 7z
 
@@ -81,7 +99,7 @@ jobs:
           ./packaging/make-windows-installer.ps1 -ISCC $iscc -SkipBuild
       - name: 便携 zip
         shell: pwsh
-        run: Compress-Archive -Path dist/BackupStudio/* -DestinationPath dist/BackupStudio-1.0.0-windows-x64.zip
+        run: Compress-Archive -Path dist/BackupStudio/* -DestinationPath dist/BackupStudio-${{ env.APP_VERSION }}-windows-x64.zip
       - name: 冒烟测试
         shell: pwsh
         run: |
@@ -91,12 +109,13 @@ jobs:
         with:
           name: windows
           path: |
-            dist/BackupStudio-1.0.0-windows-x64.zip
+            dist/BackupStudio-${{ env.APP_VERSION }}-windows-x64.zip
             dist/BackupStudio-Setup-*.exe
 
   macos-arm64:
     name: macOS arm64 dmg
-    runs-on: macos-14
+    # B5：macos-14 已 deprecated（2026-11-02 完全下线），迁到 macos-15
+    runs-on: macos-15
     needs: test
     steps:
       - uses: actions/checkout@v4
@@ -122,7 +141,9 @@ jobs:
 
   macos-x64:
     name: macOS x64 dmg
-    runs-on: macos-13
+    # B5：macos-13 已于 2025-12-08 退役（runner 永远排队 → 24h 后 cancelled），
+    # 官方指定迁移目标为 macos-15-intel（最后一个 x86_64 镜像）
+    runs-on: macos-15-intel
     needs: test
     steps:
       - uses: actions/checkout@v4
@@ -186,12 +207,16 @@ jobs:
     runs-on: ubuntu-22.04
     needs: test
     container:
-      image: bilelmoussaoui/flatpak-github-actions:kde-6.8
+      # B6：原镜像 bilelmoussaoui/flatpak-github-actions:kde-6.8 的 tag **从未发布**
+      # （实测 Docker Hub 27 个 tag，最大 kde-6.7），docker pull 直接 404 → job 必红。
+      # 官方迁移到 ghcr.io/flathub-infra/...，且 tag 必须与 manifest 的运行时
+      # （org.freedesktop.Platform 24.08）对齐，否则容器内没有对应 SDK。
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-24.08
       options: --privileged
     steps:
       - uses: actions/checkout@v4
       - name: 构建 Flatpak
-        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6.8
         with:
           bundle: BackupStudio.flatpak
           manifest-path: packaging/io.github.backupstudio.BackupStudio.yml
@@ -221,6 +246,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: BackupStudio ${{ github.ref_name }}
-          body_path: docs/RELEASE_NOTES_1.0.0.md
+          body_path: docs/RELEASE_NOTES_${{ env.APP_VERSION }}.md
           files: artifacts/**/*
           fail_on_unmatched_files: false

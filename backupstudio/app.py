@@ -338,6 +338,19 @@ def _build_parser() -> argparse.ArgumentParser:
     extract.add_argument("archive")
     extract.add_argument("--to", required=True)
     extract.add_argument("--password", default="")
+    # 炸弹防护逃生阀（审查 A4）：默认 100 GiB 绝对上限，灾难恢复时可显式放宽
+    extract.add_argument(
+        "--max-unpacked-bytes",
+        type=int,
+        default=None,
+        help="解压总量绝对上限（字节）；0 = 不限制，默认 100 GiB / 环境变量 BACKUPSTUDIO_MAX_UNPACKED_BYTES",
+    )
+    extract.add_argument(
+        "--max-unpack-ratio",
+        type=int,
+        default=None,
+        help="解压总量 / 包大小 的比例上限；0 = 不限制，默认 10000 / 环境变量 BACKUPSTUDIO_MAX_UNPACK_RATIO",
+    )
 
     daemon = sub.add_parser("daemon", help="后台守护进程")
     daemon.add_argument("--port", type=int, default=None)
@@ -660,9 +673,17 @@ def _cmd_run(store, args) -> int:  # noqa: ANN001
 
 
 def _cmd_extract(args) -> int:  # noqa: ANN001
-    from .extract import extract_archive
+    from . import extract as ex
 
-    ok, msg = extract_archive(Path(args.archive), Path(args.to), args.password or None)
+    # 命令行阈值覆盖环境变量（审查 A4：此前无任何逃生阀，灾难恢复会被自己的防护挡住）
+    if getattr(args, "max_unpacked_bytes", None) is not None:
+        ex._MAX_TOTAL_BYTES = max(0, int(args.max_unpacked_bytes))
+        os.environ[ex.ENV_MAX_UNPACKED_BYTES] = str(ex._MAX_TOTAL_BYTES)
+    if getattr(args, "max_unpack_ratio", None) is not None:
+        ex._MAX_EXPANSION_RATIO = max(0, int(args.max_unpack_ratio))
+        os.environ[ex.ENV_MAX_UNPACK_RATIO] = str(ex._MAX_EXPANSION_RATIO)
+
+    ok, msg = ex.extract_archive(Path(args.archive), Path(args.to), args.password or None)
     print(msg)
     return 0 if ok else 1
 
