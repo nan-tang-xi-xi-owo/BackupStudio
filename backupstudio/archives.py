@@ -515,6 +515,9 @@ class ZipCompressor:
         zi = zipfile.ZipInfo(arcname + ("/" if is_dir else ""), date_time=ts)
         zi.external_attr = (0o40755 if is_dir else 0o100644) << 16
         zi.create_system = 3
+        # ZipInfo 自带 compress_type，默认 0=STORED，会**覆盖** ZipFile(compression=...)；
+        # 不显式设置，整个内置 ZIP 后端就退化成「不压缩」（审查 Q6）。目录条目保持 STORED。
+        zi.compress_type = zipfile.ZIP_STORED if (is_dir or self.spec.level == 0) else zipfile.ZIP_DEFLATED
         return zi
 
     def add_dir(self, arcname: str, mtime: float | None = None) -> None:

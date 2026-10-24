@@ -206,3 +206,53 @@ class TestBombGuardDoesNotSelfHarm:
         monkeypatch.delenv(ex.ENV_MAX_UNPACKED_BYTES)
         ok2, msg2 = ex.extract_archive(arc, tmp_path / "ok7z")
         assert ok2, f"正常 7z 被误拦：{msg2}"
+
+
+class TestBuiltinZipActuallyCompresses:
+    """P1 回归：内置 ZIP 后端此前全是 STORED（ZipInfo.compress_type 覆盖 ZipFile 设置）。"""
+
+    def test_zip_compressor_uses_deflate(self, tmp_path):
+        from backupstudio.archives import ArchiveSpec, Progress, ZipCompressor
+
+        src = tmp_path / "big.txt"
+        src.write_bytes(b"compressible line of text for the builtin zip backend\n" * 100_000)
+        dest = tmp_path / "out.zip"
+        c = ZipCompressor(dest, ArchiveSpec(dest_path=dest, fmt="zip", level=5), Progress())
+        c.add_file(src, "big.txt")
+        c.close()
+
+        with zipfile.ZipFile(dest) as zf:
+            info = zf.getinfo("big.txt")
+        assert info.compress_type == zipfile.ZIP_DEFLATED, "内置 ZIP 仍未压缩（compress_type=STORED）"
+        ratio = dest.stat().st_size / src.stat().st_size
+        assert ratio < 0.05, f"压缩率异常（{ratio:.3f}）：产物 {dest.stat().st_size}B"
+
+    def test_zip_compressor_level_zero_is_stored(self, tmp_path):
+        from backupstudio.archives import ArchiveSpec, Progress, ZipCompressor
+
+        src = tmp_path / "big.txt"
+        src.write_bytes(b"x" * (1024 * 1024))
+        dest = tmp_path / "out0.zip"
+        c = ZipCompressor(dest, ArchiveSpec(dest_path=dest, fmt="zip", level=0), Progress())
+        c.add_file(src, "big.txt")
+        c.close()
+        with zipfile.ZipFile(dest) as zf:
+            assert zf.getinfo("big.txt").compress_type == zipfile.ZIP_STORED
+
+    def test_py7zr_zip_backends_use_deflate(self, tmp_path):
+        """``py7zr_backend`` 的另外两处 ZipInfo 构造同样必须设 compress_type。"""
+        pytest.importorskip("py7zr")
+        from backupstudio.archives import ArchiveSpec, Progress
+        from backupstudio.py7zr_backend import Py7zrCompressor, ZipFileCompressor
+
+        src = tmp_path / "big.txt"
+        src.write_bytes(b"compressible line of text for the builtin zip backend\n" * 100_000)
+        for cls in (Py7zrCompressor, ZipFileCompressor):
+            dest = tmp_path / f"{cls.__name__}.zip"
+            spec = ArchiveSpec(dest_path=dest, fmt="zip", level=5)
+            c = cls(dest, spec, Progress())
+            c.add_file(src, "big.txt")
+            c.close()
+            with zipfile.ZipFile(dest) as zf:
+                info = zf.getinfo("big.txt")
+            assert info.compress_type == zipfile.ZIP_DEFLATED, f"{cls.__name__} 仍未压缩"
