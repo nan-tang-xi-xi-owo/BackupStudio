@@ -1,0 +1,40 @@
+# 统一换行符策略（审查 P1-3）：避免补丁/检出在不同平台上漂移。
+#
+# 背景：PR#2 的补丁是基于 CRLF 工作区生成的，在 LF 工作区 `git apply` 会失败 14 个文件
+# （报 "patch does not apply"），只能靠 `--ignore-whitespace` 兜。根因是仓库此前**没有**
+# 任何换行符约束，同一文件在不同机器上字节不同。
+#
+# 约定：
+#   * 文本文件一律入库为 LF（`eol=lf`），检出也用 LF —— 与 Linux/macOS CI 一致；
+#   * Windows 专用脚本（PowerShell / 批处理）必须保持 CRLF，否则 cmd/pwsh 里
+#     多行字符串与 `#requires` 会出问题；
+#   * 二进制资产显式标记，避免 git 尝试做文本转换/合并。
+* text=auto eol=lf
+
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.svg text eol=lf
+*.exe binary
+*.dll binary
+*.pyd binary
+*.zip binary
+*.7z binary
+*.rar binary
+*.gz binary
+*.bz2 binary
+*.xz binary
+*.zst binary
+*.pyc binary
+
+# 补丁/差异文件保持原样，不做换行转换
+*.patch -text
+*.diff -text
