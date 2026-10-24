@@ -44,6 +44,18 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
 
 
+def _project_version() -> str:
+    """读取版本号（不 import 包：本脚本运行时 sys.path 不含项目根）。"""
+    import re
+
+    try:
+        text = (ROOT / "backupstudio" / "__init__.py").read_text(encoding="utf-8")
+    except OSError:
+        return "unknown"
+    m = re.search(r'__version__\s*=\s*"([^"]+)"', text)
+    return m.group(1) if m else "unknown"
+
+
 def _tool_dir() -> Path | None:
     if sys.platform == "win32":
         candidate = ROOT / "tools" / "win32" / "7z"
@@ -189,10 +201,8 @@ def _post_build() -> None:
             shutil.copy2(src, target / Path(name).name)
     readme = target / "README.md"
     if readme.exists():
-        from backupstudio import __version__ as _ver
-
         (target / "使用说明.txt").write_text(
-            f"BackupStudio 备份工坊 {_ver}\n\n"
+            f"BackupStudio 备份工坊 {_project_version()}\n\n"
             "1. 双击 BackupStudio.exe 启动，右下角托盘会出现图标。\n"
             "2. 点「新建任务」选择要备份的文件夹、备份位置、压缩格式（可选密码/分卷）。\n"
             "3. 「计划与保留」里设置自动备份时间，并可自动清理旧备份。\n"

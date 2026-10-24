@@ -228,7 +228,7 @@ jobs:
           cache-key: flatpak-${{ github.sha }}
           build-bundle: true
       # R-4：构建"成功"不等于包能用——此前 --no-deps 让 job 绿着产出
-      # ImportError 的坏包。下面两步都必须让 job 失败，不许 || true 吞掉。
+      # ImportError 的坏包。这一步必须让 job 失败，不许 || true 吞掉。
       - name: 冒烟测试（Flatpak）
         run: |
           set -euo pipefail
@@ -240,13 +240,16 @@ jobs:
 
           # 结构门禁：直接查装好的文件树，逐项确认运行期依赖真的进包了。
           # 这一步就是当初 --no-deps 会挂掉而"构建成功"却放过的地方。
+          # 注意 rarfile 是单文件模块（rarfile.py），不是目录，故单独判断。
           APP="$(flatpak info --show-location io.github.backupstudio.BackupStudio)/files"
           ls "$APP/bin"
           test -x "$APP/bin/backupstudio"
           test -x "$APP/bin/7zz"
-          for pkg in PySide6 py7zr zmq psutil Cryptodome zstandard pyzstd rarfile; do
-            ls -d "$APP"/lib/python3.*/site-packages/"$pkg"
+          SP="$(ls -d "$APP"/lib/python3.*/site-packages)"
+          for pkg in PySide6 py7zr zmq psutil Cryptodome zstandard pyzstd; do
+            test -e "$SP/$pkg" || { echo "缺少依赖：$pkg"; exit 1; }
           done
+          test -e "$SP/rarfile.py" -o -e "$SP/rarfile" || { echo "缺少依赖：rarfile"; exit 1; }
           echo "包结构 OK：入口、7zz 与全部运行期依赖均在包内"
 
           # 运行时门禁：真跑一遍（依赖缺失即非零退出）。
