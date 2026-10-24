@@ -39,3 +39,11 @@
 *.patch -text
 *.diff -text
 *.desktop text eol=lf
+
+# R-fixWSL?Linux/macOS ?????????? LF?
+# appimagetool ??? desktop-file-validate ? CR ????
+# AppStream?metainfo?? flatpak ? YAML ??? LF ????
+*.desktop text eol=lf
+*.metainfo.xml text eol=lf
+packaging/*.yml text eol=lf
+*.sh text eol=lf
