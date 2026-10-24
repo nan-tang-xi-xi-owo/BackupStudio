@@ -167,6 +167,11 @@ class ArchiveResult:
     elapsed: float = 0.0
     forced: bool = False
     notes: list[str] = field(default_factory=list)
+    #: 备份身份名（manifest 的 stem = 该文件的键）：由 create_archive 从 dest **正向**推导，
+    #: 调用方（engine）不得再从产物名反推 —— 反推用 `str.find(ext)` 首匹配，任务名里含
+    #: 扩展名（如任务名 `foo.zip`）时会命中第一个 `.zip`，导致多包共用同一个 manifest
+    #: 互相覆盖（审查 W-A2-2，S1）。
+    stem: str = ""
 
     @property
     def archive_bytes(self) -> int:
@@ -592,14 +597,17 @@ class TarStreamCompressor:
             return lzma.LZMAFile(self._raw, "wb", preset=level)
         if codec == "zst":
             if _zstd_mod is not None:
-                return _zstd_mod.ZstdCompressor(level=level).stream_writer(self._raw, closefd=False)
+                # write_checksum 必须开启：校验侧流式解压只有带帧校验和时才能检出内容损坏（审查 M18）
+                return _zstd_mod.ZstdCompressor(level=level, write_checksum=True).stream_writer(
+                    self._raw, closefd=False
+                )
             zstd = shutil.which("zstd")
             if not zstd:
                 raise BackendUnavailable(
                     "创建 tar.zst 需要 zstandard 模块或系统 zstd 程序",
                     fix="pip install zstandard 或安装 zstd（apt install zstd / brew install zstd）",
                 )
-            self._proc = subprocess.Popen([zstd, "-q", f"-{level}", "-c"], stdin=subprocess.PIPE, stdout=self._raw)
+            self._proc = subprocess.Popen([zstd, "-q", "--check", f"-{level}", "-c"], stdin=subprocess.PIPE, stdout=self._raw)
             return self._proc.stdin
         return self._raw
 
@@ -698,6 +706,34 @@ def human_volume(size: int, suffix: str = "") -> str:
     return f"{max(1, size // 1024)}k{suffix}"
 
 
+def product_stem(name: str) -> str:
+    """产物名 → 备份身份名（manifest 的 stem），由后端**正向**给出，绝不反推。
+
+    规则（审查 W-A2-2）：
+    * stem 的**唯一职责**是给出 manifest 文件名 `<stem>.json`（collect_groups 按 manifest
+      建组时以 `manifest.volumes` 为准，不参与 stem 匹配），所以 stem 必须在同一目的地目录内
+      **每份备份唯一**。
+    * 做法：先去掉**尾部**的卷序号后缀（`.001` / `.part01` / `.part1`），剩下就是主名。
+    * 关键：**不按扩展名长度做前缀截断**。任务名含扩展名时（任务名 `foo.zip` →
+      产物 `foo.zip_20261023_042116.zip`），旧的 `str.find(ext)` 首匹配会把 stem 截成
+      `foo.zip` → 该任务的所有备份共用一个 manifest 互相覆盖（实测 2 产物 1 清单）。
+      这里 `foo.zip_20261023_042116.zip` 的 stem = **完整文件名**，manifest 文件名 =
+      `stem + ".json"`，天然一包一清单。
+    * 分卷场景（`.partNN` / `.001`）stem 仍是"去掉卷后缀的主名"，与 manifest.volumes
+      里各卷的公共主名一致（`X.zip.001` → `X.zip`；`X.tar.gz.part01` → `X.tar.gz`）。
+    """
+    p = Path(name)
+    base = p.name
+    low = base.lower()
+    # 1) 尾部纯数字卷后缀：.001 / .0001 / .part01 / .part1
+    for sep in (".part", "."):
+        idx = low.rfind(sep)
+        if idx > 0 and low[idx + len(sep) :].isdigit():
+            return base[:idx]
+    # 2) 无卷后缀：主名就是整个文件名（不去扩展名——见 docstring）
+    return base
+
+
 def split_file(src: Path, dest_base: Path, volume_size: int) -> list[VolumeInfo]:
     """把整包切成 ``<dest_base>.partNN`` 分卷文件。
 
@@ -726,6 +762,11 @@ def split_file(src: Path, dest_base: Path, volume_size: int) -> list[VolumeInfo]
 
 class ExternalCompressor:
     """所有依赖外部可执行文件的压缩后端基类。"""
+
+    #: 是否给子进程追加 `-sccUTF-8`（仅 7-Zip 系可执行文件支持该开关）。
+    #: 中文 Windows 上 7za 的报错按 GBK 输出，而本产品一律 UTF-8 解码 → 乱码；
+    #: 加上本开关后 7za 全量输出 UTF-8，现有解码原样正确（审查 W-A3-2 / M2b）。
+    _SCC_UTF8 = False
 
     def __init__(self, dest_path: Path, spec: ArchiveSpec, progress: Progress) -> None:
         # 统一解析成绝对路径：本类会把子进程 cwd 切到别处（见 _popen/_pack_from），
@@ -862,12 +903,31 @@ class ExternalCompressor:
                 self._proc.kill()
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
+    def _with_scc(self, argv: list[str]) -> list[str]:
+        """在子命令后插入 `-sccUTF-8`（仅 7-Zip 系可执行文件）。
+
+        形如 `[exe, "a", ...]` → `[exe, "a", "-sccUTF-8", ...]`。已存在或形态不符
+        时原样返回，重复调用幂等。
+        """
+        if not (self._SCC_UTF8 and sys.platform == "win32"):
+            return argv
+        if len(argv) < 2 or "-sccUTF-8" in argv:
+            return argv
+        if not Path(argv[0]).name.lower().startswith("7z"):
+            return argv
+        return [argv[0], argv[1], "-sccUTF-8", *argv[2:]]
+
     def _popen(self, argv: list[str], cwd: str | None = None) -> subprocess.Popen:
         """启动外部压缩程序。
 
         部分受限环境（沙箱、低完整性）下 7z 子进程访问系统临时目录会被拒绝，
         这里给子进程显式设置 TMP/TEMP 到可写的暂存目录。
+
+        7-Zip 后端统一追加 `-sccUTF-8`（放在子命令之后、其它开关之前）：
+        否则中文 Windows 的错误输出是 GBK，而解码端是 UTF-8，用户看到的是乱码
+        （审查 W-A3-2）。RAR 系不支持该开关，由 `_SCC_UTF8=False` 排除。
         """
+        argv = self._with_scc(argv)
         kwargs: dict = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL}
         if sys.platform == "win32":
             kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -933,6 +993,8 @@ class ExternalCompressor:
 
 class SevenZipCompressor(ExternalCompressor):
     """7-Zip 后端，同时服务 zip 与 7z。"""
+
+    _SCC_UTF8 = True
 
     _METHOD = {0: "copy", 1: "lzma2:1", 3: "lzma2:5", 5: "lzma2:9", 7: "lzma2:12", 9: "lzma2:19"}
 
@@ -1078,12 +1140,13 @@ def probe_encrypted(path: Path, fmt: str, password: str | None = None) -> bool |
                     pass
             exe = find_7z()
             if exe:
-                import subprocess
-                import sys
-
                 argv = [exe, "l", "-slt", str(path)]
                 if password:
                     argv.insert(2, f"-p{password}")
+                # -sccUTF-8：让 7za 在中文 Windows 上按 UTF-8 输出（否则 GBK 字节被
+                # UTF-8 硬解成乱码，审查 W-A3-2）；插在子命令之后、其它参数之前。
+                if sys.platform == "win32" and Path(exe).name.lower().startswith("7z"):
+                    argv.insert(2, "-sccUTF-8")
                 kwargs: dict = {"capture_output": True, "timeout": 60, "stdin": subprocess.DEVNULL}
                 if sys.platform == "win32":
                     kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -1101,6 +1164,44 @@ def probe_encrypted(path: Path, fmt: str, password: str | None = None) -> bool |
     except Exception:  # noqa: BLE001 - 探测失败不给结论
         return None
     return None
+
+
+#: 分卷拼接实测的最大体积（超出则不拼接，直接判为"未实测"）——避免为大归档制造
+#: 一份完整副本的磁盘峰值。拼接口径与 engine._verify_volumes 一致。
+_PROBE_JOIN_MAX_BYTES = 2 * 1024 ** 3
+
+
+def probe_encrypted_volumes(volumes: list, fmt: str, password: str | None = None) -> bool | None:
+    """对（可能是分卷的）产物实测加密状态，返回 None 表示无法判定。
+
+    首卷（`.partNN` / `.001`）不是合法容器，直接 probe 只会得到 None——旧代码因此
+    回退"声明值"，于是分卷 + 密码组合能把明文记成已加密（审查 W-A3-3，S0）。
+    这里先按卷序拼接成临时整包再 probe，把三态变成"实测"而不是"猜测"。
+    """
+    paths = [Path(getattr(v, "path", v)) for v in (volumes or [])]
+    if not paths:
+        return None
+    if len(paths) == 1:
+        return probe_encrypted(paths[0], fmt, password)
+    # 原生 7z 卷（.001 集）：7za 能自动串联，先就地试一次
+    first = probe_encrypted(paths[0], fmt, password)
+    if first is not None:
+        return first
+    try:
+        total = sum(p.stat().st_size for p in paths)
+        if total > _PROBE_JOIN_MAX_BYTES:
+            return None
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="bs-probe-") as td:
+            joined = Path(td) / f"joined{FORMAT_EXTENSIONS.get(fmt, '.bin')}"
+            with open(joined, "wb") as out:
+                for p in paths:
+                    with open(p, "rb") as fh:
+                        shutil.copyfileobj(fh, out, 1 << 20)
+            return probe_encrypted(joined, fmt, password)
+    except OSError:
+        return None
 
 
 class RarCompressor(ExternalCompressor):
@@ -1341,6 +1442,38 @@ def create_archive(
     if fmt not in SUPPORTED_FORMATS:
         raise BackendUnavailable(f"不支持的压缩格式：{fmt}")
 
+    # ---- 加密前置守卫：在挑选后端、创建任何文件之前完成。这样 CLI / GUI / JSON 导入
+    #      全路径拿到同一个明确文案，而不是各自撞出乱码或"静默产出明文包"。
+    encrypt_mode = spec.encrypt_mode if spec.password else None
+    if spec.password and not encrypt_mode:
+        raise PasswordRequired("设置了密码但未指定加密方式", fix="选择 AES-256 或 ZipCrypto")
+    if spec.password and encrypt_mode == "gpg":
+        # gpg 加密尚未实现（fail-closed：静默产出明文比报错更危险）
+        raise BackendUnavailable(
+            "GPG 加密尚未实现：本次未创建归档（不会产出明文包）",
+            fix="改用 AES-256（7z/zip/rar）加密，或关闭密码保护",
+        )
+    # 7z 容器没有 ZipCrypto 概念（那是 ZIP 的传统算法）。此前 `SevenZipCompressor._args`
+    # 只在 aes256 时加 -p，zipcrypto 请求被静默丢密码 → 产出**明文**包；分卷形态下
+    # probe 打不开首卷返回 None，旧代码又按"声明"回填 encrypted=True，
+    # 记录撒谎（用户以为已加密，实际无密码可解）。审查 W-A3-3，S0：创建前直接拒绝。
+    if spec.password and fmt == "7z" and encrypt_mode not in (None, "", "aes256"):
+        raise PasswordRequired(
+            "7z 容器不支持 ZipCrypto 加密（ZipCrypto 是 ZIP 的传统算法），"
+            "本次未创建归档（不会产出未加密的冒名包），请使用 AES-256 或改用 zip 格式",
+            fix="把加密方式改为 AES-256，或把格式改为 zip 再选 ZipCrypto",
+        )
+    # 7-Zip 对 ZIP 密码取 ANSI/GBK 单字节口径：任何含非 ASCII 字符的 zip 密码在
+    # 创建时必然 rc=2 失败（`é` 单字符即败，与代码页/长度无关），且错误信息是乱码。
+    # 与其等到子进程失败抛乱码，不如在选后端之前统一拦截，CLI/GUI/导入全路径同文案。
+    # 审查 W-A3-1（M2 真因），S1。
+    if spec.password and fmt == "zip" and not spec.password.isascii():
+        raise PasswordRequired(
+            "ZIP 格式的密码不支持中文/非 ASCII 字符（7-Zip 限制），"
+            "请改用 ASCII 密码，或把格式改为 7z（支持任意密码）",
+            fix="改用 7z 格式，或使用纯英文数字密码",
+        )
+
     choice = backend_for_format(fmt, force=spec.force)
     if choice.factory is None:  # 理论上不会发生
         raise BackendUnavailable("未选择到可用后端")
@@ -1360,16 +1493,6 @@ def create_archive(
 
     dest = Path(spec.dest_path)
     dest.parent.mkdir(parents=True, exist_ok=True)
-
-    encrypt_mode = spec.encrypt_mode if spec.password else None
-    if spec.password and not encrypt_mode:
-        raise PasswordRequired("设置了密码但未指定加密方式", fix="选择 AES-256 或 ZipCrypto")
-    if spec.password and encrypt_mode == "gpg":
-        # gpg 加密尚未实现（fail-closed：静默产出明文比报错更危险）
-        raise BackendUnavailable(
-            "GPG 加密尚未实现：本次未创建归档（不会产出明文包）",
-            fix="改用 AES-256（7z/zip/rar）加密，或关闭密码保护",
-        )
 
     def _spec_for(f: str, mode_value: str | None) -> ArchiveSpec:
         return ArchiveSpec(
@@ -1445,6 +1568,8 @@ def create_archive(
         volume_size=spec.volume_size if mode else 0,
         forced=bool(spec.force),
         notes=([choice.note] if choice.note else []) + fallback_notes,
+        # 备份身份名由 dest 正向推导（审查 W-A2-2）：engine 不再从产物名反推
+        stem=product_stem(dest.name),
     )
     def _register_cancel(b) -> None:  # noqa: ANN001
         setter = getattr(b, "set_cancel", None)
@@ -1533,7 +1658,13 @@ def create_archive(
 
         # 加密状态事后实测回填（不撒谎）：声明有密码但实测无加密 → 修正 + warning
         if spec.password:
-            actual = probe_encrypted(result.path, fmt, spec.password or None)
+            # 分卷产物必须先拼接后实测：首卷无法解析 → probe 返 None，
+            # 旧代码在 None 时保留声明的 encrypted=True，等于让记录替产物撒谎
+            # （审查 W-A3-3）。单卷走原路径，多卷走拼接路径。
+            if len(result.volumes) > 1:
+                actual = probe_encrypted_volumes(result.volumes, fmt, spec.password or None)
+            else:
+                actual = probe_encrypted(result.path, fmt, spec.password or None)
             if actual is False:
                 result.encrypted = False
                 result.secure = False
@@ -1543,7 +1674,13 @@ def create_archive(
             elif actual is True:
                 result.encrypted = True
             else:
-                result.notes.append("提示：无法自动验证该归档的加密状态（工具不可用）")
+                # None = 无法实测。fail-closed：宁可少报加密，绝不把"没验证"写成"已加密"。
+                result.encrypted = False
+                result.secure = False
+                result.notes.append(
+                    "警告：未能实测该归档的加密状态（分卷无法拼接或工具不可用）——"
+                    "请勿视为已加密，需手动确认（本次记录 encrypted=False）"
+                )
 
         result.notes.extend(getattr(backend, "notes", []))
         for w in getattr(backend, "warnings", []):

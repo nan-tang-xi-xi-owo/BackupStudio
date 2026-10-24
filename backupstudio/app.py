@@ -184,6 +184,17 @@ def _run_gui_inner(start_minimized: bool = False, open_new: bool = False) -> int
 
     # ---- 配置：损坏/不可写都不应阻止启动
     store = TaskStore(config_dir() / "tasks.json")
+    # ---- 崩溃残包清扫（审查 M23）：本配置所有任务的备份目录各扫一次，
+    #      清掉崩溃/强杀留下的 .bs-tmp-* 与 bs-stage-*（可达成整包体积、永不被清理）。
+    #      清扫失败绝不阻塞启动，因此整块包 try/except。
+    try:
+        from .engine import sweep_orphans
+
+        gone = sweep_orphans([t.destination for t in store.list_tasks()])
+        if gone:
+            log.info("启动清扫：移除 %d 个崩溃残包：%s", len(gone), ", ".join(p.name for p in gone[:8]))
+    except Exception:  # noqa: BLE001
+        log.debug("启动清扫崩溃残包失败（忽略）", exc_info=True)
     state = AppState(store)
     window = MainWindow(state)
     app.setStyleSheet(stylesheet(state.palette))

@@ -149,14 +149,32 @@ def write_manifest(destination: Path | str, manifest: Manifest) -> Path:
 
 
 def read_manifest(path: Path) -> Manifest | None:
-    """读单份清单；损坏返回 None（由调用方决定提示）。"""
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except FileNotFoundError:
-        return None
-    except (OSError, json.JSONDecodeError) as exc:
-        log.warning("清单读取失败 %s：%s", path, exc)
+    """读单份清单；损坏返回 None（由调用方决定提示）。
+
+    **PermissionError 短暂重试**（审查 W-A2-3，S3）：Windows 上 `os.replace` 发布新清单
+    的瞬间、或杀软/索引器持有句柄时，读者会撞 `PermissionError`（实测并发读 31% 为
+    PermissionError → 返回 None）。清单"读成 None"不是无害的：该组在 collect_groups 里
+    降级为"无清单旧包"（managed=False）→ 保留策略本轮不认它、keep_last 计数少一组
+    （多留一份）。故对权限类瞬态错误重试 3 次（间隔 20ms）再放弃。
+    JSONDecodeError/结构无效是**确定性**损坏，不重试。
+    """
+    last_exc: OSError | None = None
+    for attempt in range(3):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            break
+        except FileNotFoundError:
+            return None
+        except PermissionError as exc:  # 瞬态：写者正在 replace / 句柄被占
+            last_exc = exc
+            time.sleep(0.02)
+            continue
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning("清单读取失败 %s：%s", path, exc)
+            return None
+    else:
+        log.warning("清单读取失败（权限重试 3 次仍不可读）%s：%s", path, last_exc)
         return None
     if not isinstance(data, dict):
         return None
@@ -331,7 +349,20 @@ def collect_groups(destination: Path | str, fmt_ext: str, *, fmts: Iterable[str]
 
 
 def _stem_of(name: str, exts: tuple[str, ...]) -> str:
-    """从文件名提取主名：整包返回自身，分卷返回其组主名（不再靠 find 猜扩展名位置）。"""
+    """从文件名提取主名：整包返回自身，分卷返回其组主名。
+
+    W-A2-2（上游）与 A2（本分支）修的是同一个缺陷：旧实现用 `str.find(ext)` **首匹配**
+    扩展名，任务名本身含扩展名时（任务名 `foo.zip` → 产物
+    `foo.zip_20260101_120000.zip`）会把主名截成 `foo.zip`，于是同任务的不同备份被并成
+    一个启发式组 —— 该组一旦参与淘汰就是整组删除（include_legacy=True 时会连带删掉
+    有清单的好包）。
+
+    融合取舍：这里采用本分支基于 ``_match_volume`` 的实现，因为它同时满足上游的三条
+    断言（`X.7z.001`→`X.7z`、`Y.zip.part02`→`Y.zip`、`Z.tar.gz.part03`→`Z.tar.gz`，
+    且与 ``archives.product_stem`` 一致），**并且**覆盖上游按"最后一个扩展名切"会漏掉
+    的 RAR 原生卷 `base.part1.rar` → `base.rar`（末尾是 `.rar`，没有可切的体序号）。
+    上游的 `rfind` 思路已由 ``_match_volume`` 的正则（严格尾部锚定）等价实现。
+    """
     hit = _match_volume(name, exts)
     if hit is not None:
         return hit[0]

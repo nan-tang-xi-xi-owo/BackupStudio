@@ -1,4 +1,4 @@
-# Inno Setup 模板：由 packaging/make-windows-installer.ps1 填充 __VERSION__ / __ROOT__ 后编译
+; Inno Setup 模板：由 packaging/make-windows-installer.ps1 填充 __VERSION__ / __ROOT__ 后编译
 #define MyAppName "BackupStudio"
 #define MyAppVersion "__VERSION__"
 #define MyAppPublisher "BackupStudio contributors"
@@ -30,7 +30,8 @@ SetupLogging=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
-Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+; 中文语言待 Inno 7 随包后再启用（Inno Setup 6.7.1 官方包不含 ChineseSimplified.isl，该文件仅在 Unofficial 目录）
+; Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务:"
