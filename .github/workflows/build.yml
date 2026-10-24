@@ -207,7 +207,7 @@ jobs:
           cache-key: flatpak-${{ github.sha }}
           build-bundle: true
       # R-4：构建"成功"不等于包能用——此前 --no-deps 让 job 绿着产出
-      # ImportError 的坏包。下面两步都必须让 job 失败，不许 || true 吞掉。
+      # ImportError 的坏包。这一步必须让 job 失败，不许 || true 吞掉。
       - name: 冒烟测试（Flatpak）
         run: |
           set -euo pipefail
@@ -284,5 +284,4 @@ jobs:
           name: BackupStudio ${{ github.ref_name }}
           generate_release_notes: true
           files: artifacts/**/*
-          fail_on_unmatched_files: false
           fail_on_unmatched_files: false
