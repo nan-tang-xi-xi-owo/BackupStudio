@@ -25,15 +25,15 @@
       "name": "p7zip",
       "buildsystem": "simple",
       "build-commands": [
-        "ls -la",
-        "install -Dm755 7zz /app/bin/7zz",
-        "install -Dm755 7zzs /app/bin/7zzs || true",
+        "tar xf 7z2301-linux-x64.tar.xz -C /tmp",
+        "install -Dm755 /tmp/7zz /app/bin/7zz",
+        "install -Dm755 /tmp/7zzs /app/bin/7zzs || true",
         "ln -sf /app/bin/7zz /app/bin/7z",
         "ln -sf /app/bin/7zz /app/bin/7za"
       ],
       "sources": [
         {
-          "type": "archive",
+          "type": "file",
           "url": "https://www.7-zip.org/a/7z2301-linux-x64.tar.xz",
           "sha256": "23babcab045b78016e443f862363e4ab63c77d75bc715c0b3463f6134cbcf318"
         }

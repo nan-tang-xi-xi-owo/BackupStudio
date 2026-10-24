@@ -197,15 +197,6 @@ jobs:
           manifest-path: packaging/io.github.backupstudio.BackupStudio.yml
           cache-key: flatpak-${{ github.sha }}
           build-bundle: true
-      - name: 诊断（仅失败时）查看 p7zip 构建目录
-        if: failure()
-        run: |
-          echo "=== .flatpak-builder/build ==="
-          ls -la .flatpak-builder/build/ || true
-          echo "=== p7zip 构建目录内容 ==="
-          ls -la .flatpak-builder/build/p7zip-*/ 2>/dev/null || echo "(无 p7zip 目录)"
-          echo "=== 缓存中的 p7zip 目录 ==="
-          find .flatpak-builder -name "7zz*" -o -name "7z2301*" 2>/dev/null | head -20 || true
       - uses: actions/upload-artifact@v4
         with:
           name: linux-flatpak
