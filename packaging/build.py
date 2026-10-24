@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -142,6 +143,11 @@ def build(include_tools: bool = True, clean: bool = True, console: bool = False)
             print("警告：未找到 tools 目录，将依赖用户系统的 7-Zip")
 
     entry = ROOT / "run_backupstudio.py"
+    # macOS：让 PyInstaller 把正确的反向域名标识写进 Info.plist。
+    # 不传这个参数时 PyInstaller 会 fallback 到 appname（裸 "BackupStudio"），
+    # 与 Flatpak / LaunchAgent / metainfo 的 io.github.backupstudio.BackupStudio 不一致。
+    if sys.platform == "darwin":
+        args += ["--osx-bundle-identifier", BUNDLE_IDENTIFIER]
     # 收集整个 Cryptodome 包（里面全是按需加载的原生扩展）
     try:
         import Cryptodome  # noqa: F401
@@ -160,17 +166,116 @@ def build(include_tools: bool = True, clean: bool = True, console: bool = False)
     print(f"打包完成，用时 {time.time() - started:.0f}s → {DIST}")
     _post_build()
     _verify_assets()
+    if sys.platform == "darwin":
+        # 必须在 PyInstaller 之后、make-dmg.sh 之前把 Info.plist 修正，
+        # 否则 dmg 里的 .app 版本号恒为 0.0.0（文件名却是 1.1.0）。
+        if not _fix_macos_plist():
+            return 1
     return 0
 
 
-def _app_version() -> str:
-    """读取包版本（唯一真源 backupstudio/__init__.py::__version__），避免版本号写死。"""
-    try:
-        import backupstudio
+def _macos_plist_path() -> Path:
+    return DIST / f"{APP_NAME}.app" / "Contents" / "Info.plist"
 
-        return backupstudio.__version__
-    except Exception:  # noqa: BLE001 - 打包脚本不应因读不到版本而失败
-        return "0.0.0"
+
+def _fix_macos_plist() -> bool:
+    """把 ``CFBundleShortVersionString`` / ``CFBundleIdentifier`` 改成本项目的真值。
+
+    R-fix4 根因说明：PyInstaller 的 BUNDLE 模板（``PyInstaller/building/templates.py``）
+    只把 ``bundle_identifier`` 传进 spec，**从不传 ``version=``**，于是
+    ``BUNDLE.__init__`` 里的 ``kwargs.get("version", "0.0.0")`` 永远取默认值，
+    Info.plist 的 ``CFBundleShortVersionString`` 恒为 ``0.0.0``。
+    本仓库旧代码里的 ``_app_version()`` 从未被调用（死代码），因此「import 失败 →
+    0.0.0」并不是唯一原因，真正原因是这条值根本没被喂给 PyInstaller。
+    这里在打包完成后直接改写 plist，是跨 PyInstaller 版本都稳定的做法。
+    """
+    import plistlib  # noqa: PLC0415 - 仅 macOS 分支需要
+
+    plist = _macos_plist_path()
+    if not plist.is_file():
+        print(f"✗ 未找到 Info.plist：{plist}", file=sys.stderr)
+        return False
+    version = _app_version()
+    try:
+        with open(plist, "rb") as fh:
+            data = plistlib.load(fh)
+        data["CFBundleShortVersionString"] = version
+        data["CFBundleVersion"] = version
+        data["CFBundleIdentifier"] = BUNDLE_IDENTIFIER
+        with open(plist, "wb") as fh:
+            plistlib.dump(data, fh)
+    except Exception as exc:  # noqa: BLE001 - 任何失败都必须让构建失败，不能静默
+        print(f"✗ 改写 Info.plist 失败：{type(exc).__name__}: {exc}", file=sys.stderr)
+        return False
+    print(f"✓ Info.plist 已修正：CFBundleShortVersionString={version} "
+          f"CFBundleIdentifier={BUNDLE_IDENTIFIER}")
+    return True
+
+
+def _verify_macos_plist() -> bool:
+    """校验 Info.plist 的版本号与包标识，供 CI 门禁复用。"""
+    import plistlib  # noqa: PLC0415
+
+    plist = _macos_plist_path()
+    try:
+        with open(plist, "rb") as fh:
+            data = plistlib.load(fh)
+    except Exception as exc:  # noqa: BLE001
+        print(f"✗ 读取 Info.plist 失败：{exc}", file=sys.stderr)
+        return False
+    version = str(data.get("CFBundleShortVersionString", ""))
+    ident = str(data.get("CFBundleIdentifier", ""))
+    expected = _app_version()
+    ok = version == expected and version != "0.0.0" and ident == BUNDLE_IDENTIFIER
+    print(f"{'✓' if ok else '✗'} Info.plist: version={version} (期望 {expected}), "
+          f"identifier={ident} (期望 {BUNDLE_IDENTIFIER})")
+    return ok
+
+
+def _app_version() -> str:
+    """读取包版本，供 ``Info.plist`` 的 ``CFBundleShortVersionString`` 使用。
+
+    R-fix4 订正：旧实现 ``import backupstudio`` 失败时静默 ``return "0.0.0"``，
+    而本脚本运行时 ``sys.path[0]`` 是 ``packaging/``、不含仓库根，import **必然**
+    失败（已实测 ``ModuleNotFoundError``）→ 兜底值成了实际值，macOS 包内版本恒为
+    0.0.0，与 dmg 文件名（1.1.0，由 make-dmg.sh 独立 import 得来）自相矛盾。
+
+    现在改为三级取法，且**不再有静默兜底**：
+      1. ``import backupstudio``（装了包 / PYTHONPATH 含仓库根时）；
+      2. 正则读 ``pyproject.toml``（仓库根必存在，打包时一定可读）；
+      3. 正则读 ``backupstudio/__init__.py``（与 ``_project_version()`` 同源）；
+    三者全失败 → 显式 raise：打包脚本不该产出「版本号是 0.0.0」的坏包。
+    """
+    try:
+        import backupstudio  # noqa: PLC0415 - 延迟导入：导入失败正是要兜底的场景
+
+        version = str(getattr(backupstudio, "__version__", "")).strip()
+        if version:
+            return version
+    except Exception:  # noqa: BLE001 - 见 docstring：失败要走下一级兜底
+        pass
+
+    for path, pattern in (
+        (ROOT / "pyproject.toml", r'^\s*version\s*=\s*"([^"]+)"'),
+        (ROOT / "backupstudio" / "__init__.py", r'__version__\s*=\s*"([^"]+)"'),
+    ):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        m = re.search(pattern, text, re.MULTILINE)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+
+    raise RuntimeError(
+        "无法确定应用版本号：import backupstudio 失败，且 pyproject.toml 与 "
+        "backupstudio/__init__.py 均读不到 version。拒绝产出 0.0.0 的坏包。"
+    )
+
+
+# macOS 包标识：必须与 Flatpak / LaunchAgent / metainfo 的 app-id 完全一致，
+# 否则 Gatekeeper 公证、LaunchAgent 归属与「应用身份」都对不上。
+BUNDLE_IDENTIFIER = "io.github.backupstudio.BackupStudio"
 
 
 def platform_key() -> str:

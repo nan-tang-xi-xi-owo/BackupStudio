@@ -252,6 +252,59 @@ GUI 全流程（新建/运行/编辑/复制/删除/主题/设置）、托盘图�
 
 ---
 
+## 平台信任提示（未签名 / 未公证，请先读这段）
+
+**本项目当前所有平台的发布产物都没有代码签名证书，macOS 版也没有经过公证（notarization）。**
+这不是配置失误，而是项目没有购买 Apple Developer Program（99 USD/年）与 Windows
+代码签名证书（OV/EV，数百至上千元/年）。我们**不会**用自签名证书伪装成已签名版本
+——那样只会让系统提示更混乱。
+
+因此各平台第一次运行时会看到系统级安全提示，属**预期行为**，按下表处理即可。
+前提是：你从本仓库的 GitHub Releases 页面下载，并已用同页的 `SHA256SUMS.txt` 核对过
+文件校验值。**校验值对不上就不要运行。**
+
+### Windows 10/11
+
+- 双击 `BackupStudio-Setup-1.1.0.exe`（或便携 zip 里的 `BackupStudio.exe`）时，
+  可能弹出蓝色的 **「Windows 已保护你的电脑」**（SmartScreen）。
+- 处理：点 **「更多信息」→「仍要运行」**。
+- 若被 Windows Defender 直接拦截，可在「Windows 安全中心 → 病毒和威胁防护 →
+  保护历史记录」里找到该文件，选择「允许在设备上运行」。
+- 校验签名状态（会显示 `NotSigned`，属预期）：
+  ```powershell
+  Get-AuthenticodeSignature .\BackupStudio.exe | Format-List Status, StatusMessage
+  ```
+
+### macOS 12+
+
+- 首次打开会提示 **「无法打开 BackupStudio，因为 Apple 无法检查其是否包含恶意软件」**
+  或「无法验证开发者」。
+- 处理（任选其一）：
+  1. **右键**（或按住 Control 点按）`BackupStudio.app` → **打开** → 在弹窗里再点 **「打开」**；
+  2. 或移除下载隔离标记后再打开：
+     ```bash
+     xattr -dr com.apple.quarantine /Applications/BackupStudio.app
+     open /Applications/BackupStudio.app
+     ```
+  3. 或在「系统设置 → 隐私与安全性」页面底部点 **「仍要打开」**。
+- 校验签名状态（会显示 `code object is not signed at all`，属预期）：
+  ```bash
+  codesign -dv --verbose=2 /Applications/BackupStudio.app
+  spctl -a -vvv /Applications/BackupStudio.app
+  ```
+
+### Linux
+
+- AppImage：先 `chmod +x BackupStudio-1.1.0-x86_64.AppImage`，且需要 `libfuse2`。
+  若提示 FUSE 相关错误，可用 `--appimage-extract-and-run` 参数运行。
+- Flatpak：用 `flatpak install --user ./BackupStudio.flatpak` 安装；未签名不影响 Flatpak 运行
+  （Flatpak 的信任模型基于仓库/来源，而非二进制签名）。
+
+> **给分发者**：如果你要转分发这些产物，请保留本段说明与 `SHA256SUMS.txt`，
+> 并在你自己的渠道里明确标注「未签名」。详见 `docs/RELEASE_NOTES_1.1.0.md` 的「已知限制」。
+
+---
+
 ## 发布流程（维护者）
 
 ```bash

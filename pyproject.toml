@@ -44,7 +44,18 @@ backupstudio-gui = "backupstudio.app:main"
 packages = ["backupstudio", "backupstudio.gui"]
 
 [tool.setuptools.package-data]
-backupstudio = ["py.typed"]
+# R-fix4：Flatpak 走 `pip3 install --prefix=/app`，非代码数据**不会**自动入包。
+# 此前这里只有 py.typed，导致 Flatpak 版托盘图标（assets/tray/*.png）全缺，
+# GUI 只能回退到内存里现场渲染 SVG（或干脆没有托盘图标）。
+# 显式声明后 wheel / pip install 才会把资源带进 site-packages。
+backupstudio = [
+    "py.typed",
+    "assets/tray/*.png",
+    "assets/*.png",
+    "assets/*.ico",
+    "assets/*.icns",
+    "assets/*.svg",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

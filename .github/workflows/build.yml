@@ -110,6 +110,36 @@ jobs:
         run: |
           ./dist/BackupStudio/BackupStudio.exe --version
           ./dist/BackupStudio/BackupStudio.exe selftest
+
+          # R-fix4 门禁①：托盘图标资源必须随包存在（7 个 PNG）。
+          # PyInstaller 路线靠 --add-data，理论上不会缺，但一旦 build.py 的
+          # _verify_assets() 被绕过就会静默产出无图标版本，故在此二次硬校验。
+          $tray = "dist/BackupStudio/_internal/backupstudio/assets/tray"
+          if (-not (Test-Path $tray)) { throw "托盘资源目录不存在：$tray" }
+          $pngs = @(Get-ChildItem $tray -Filter *.png)
+          if ($pngs.Count -lt 7) { throw "托盘 PNG 不足：$($pngs.Count)/7 -> $tray" }
+          "托盘 PNG 数量：$($pngs.Count)"
+
+          # R-fix4 门禁②：自启动命令必须能被 argparse 接受。
+          # 历史缺陷：安装包写入 "--tray --minimized"（tray 是子命令不是选项）
+          # → 登录后 rc=2 立即退出，开机自启完全失效且无提示。
+          # 注意：不能用 `<exe> start --minimized --help` 当探针——windowed 版
+          # exe 的 --help 退出码不可靠（本机实测 -1），会误报失败。
+          # 契约校验脚本同时覆盖「模板写法」与「argparse 正向/反向用例」。
+          python packaging/check_autostart_args.py
+          if ($LASTEXITCODE -ne 0) { throw "自启动参数契约校验失败（rc=$LASTEXITCODE）" }
+
+          # R-fix4 门禁③：真跑一次备份（不是只看 --version）。
+          $env:BACKUPSTUDIO_CONFIG_DIR = "$PWD/smoke-cfg"
+          New-Item -ItemType Directory -Force "$PWD/smoke-src","$PWD/smoke-dst",$env:BACKUPSTUDIO_CONFIG_DIR | Out-Null
+          Set-Content "$PWD/smoke-src/hello.txt" "windows smoke"
+          ./dist/BackupStudio/BackupStudio.exe task add --name smoke --source "$PWD/smoke-src" --dest "$PWD/smoke-dst" --format zip
+          if ($LASTEXITCODE -ne 0) { throw "task add 失败（rc=$LASTEXITCODE）" }
+          ./dist/BackupStudio/BackupStudio.exe run --all
+          if ($LASTEXITCODE -ne 0) { throw "真跑备份失败（rc=$LASTEXITCODE）" }
+          $zip = @(Get-ChildItem "$PWD/smoke-dst" -Filter *.zip)
+          if ($zip.Count -lt 1) { throw "备份未产出 zip：$PWD/smoke-dst" }
+          "真跑备份 OK：$($zip[0].Name) ($($zip[0].Length) B)"
       - uses: actions/upload-artifact@v4
         with:
           name: windows
@@ -137,8 +167,42 @@ jobs:
           tar -xf /tmp/7z-mac.tar.xz -C tools/darwin/7z
       - name: 打包 .app
         run: python packaging/build.py
+      - name: 校验 Info.plist（版本号 / 包标识）
+        run: |
+          set -euo pipefail
+          # R-fix4 门禁：Info.plist 的 CFBundleShortVersionString 必须是 1.1.0，
+          # 不能是 0.0.0。历史缺陷：PyInstaller 的 BUNDLE 模板从不传 version=，
+          # Info.plist 恒为 0.0.0，而 dmg 文件名却是 1.1.0（两个 dmg 都中招）。
+          PLIST="dist/BackupStudio.app/Contents/Info.plist"
+          test -f "$PLIST" || { echo "缺少 $PLIST"; exit 1; }
+          got="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")"
+          ident="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")"
+          echo "CFBundleShortVersionString=$got"
+          echo "CFBundleIdentifier=$ident"
+          if [ "$got" = "0.0.0" ] || [ -z "$got" ]; then
+            echo "版本号无效（$got）：Info.plist 未取到真实版本"; exit 1
+          fi
+          if [ "$ident" != "io.github.backupstudio.BackupStudio" ]; then
+            echo "CFBundleIdentifier 应为 io.github.backupstudio.BackupStudio，实际 $ident"; exit 1
+          fi
+          # 与包自身版本对齐（dmg 文件名用的是同一真源）
+          pkgver="$(python -c 'import backupstudio; print(backupstudio.__version__)')"
+          if [ "$got" != "$pkgver" ]; then
+            echo "Info.plist 版本 $got != 包版本 $pkgver"; exit 1
+          fi
+          echo "Info.plist OK"
       - name: 生成 DMG
         run: bash packaging/make-dmg.sh
+      - name: 校验 DMG 文件名与 Info.plist 版本一致
+        run: |
+          set -euo pipefail
+          # R-fix4 门禁：dmg 文件名里的版本号与 .app 内部版本号必须一致。
+          # 历史缺陷正是「文件名 1.1.0、内部 0.0.0」，两个 dmg 都中招。
+          pkgver="$(python -c 'import backupstudio; print(backupstudio.__version__)')"
+          ls -la dist/*.dmg
+          test -f "dist/BackupStudio-${pkgver}-arm64.dmg" || {
+            echo "未找到预期产物 dist/BackupStudio-${pkgver}-arm64.dmg"; exit 1; }
+          echo "DMG 命名 OK: BackupStudio-${pkgver}-arm64.dmg"
       - uses: actions/upload-artifact@v4
         with:
           name: macos-arm64
@@ -165,8 +229,37 @@ jobs:
           tar -xf /tmp/7z-mac.tar.xz -C tools/darwin/7z
       - name: 打包 .app
         run: python packaging/build.py
+      - name: 校验 Info.plist（版本号 / 包标识）
+        run: |
+          set -euo pipefail
+          # R-fix4 门禁：与 arm64 job 相同，两个架构都必须过。
+          PLIST="dist/BackupStudio.app/Contents/Info.plist"
+          test -f "$PLIST" || { echo "缺少 $PLIST"; exit 1; }
+          got="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")"
+          ident="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")"
+          echo "CFBundleShortVersionString=$got"
+          echo "CFBundleIdentifier=$ident"
+          if [ "$got" = "0.0.0" ] || [ -z "$got" ]; then
+            echo "版本号无效（$got）：Info.plist 未取到真实版本"; exit 1
+          fi
+          if [ "$ident" != "io.github.backupstudio.BackupStudio" ]; then
+            echo "CFBundleIdentifier 应为 io.github.backupstudio.BackupStudio，实际 $ident"; exit 1
+          fi
+          pkgver="$(python -c 'import backupstudio; print(backupstudio.__version__)')"
+          if [ "$got" != "$pkgver" ]; then
+            echo "Info.plist 版本 $got != 包版本 $pkgver"; exit 1
+          fi
+          echo "Info.plist OK"
       - name: 生成 DMG
         run: bash packaging/make-dmg.sh
+      - name: 校验 DMG 文件名与 Info.plist 版本一致
+        run: |
+          set -euo pipefail
+          pkgver="$(python -c 'import backupstudio; print(backupstudio.__version__)')"
+          ls -la dist/*.dmg
+          test -f "dist/BackupStudio-${pkgver}-x64.dmg" || {
+            echo "未找到预期产物 dist/BackupStudio-${pkgver}-x64.dmg"; exit 1; }
+          echo "DMG 命名 OK: BackupStudio-${pkgver}-x64.dmg"
       - uses: actions/upload-artifact@v4
         with:
           name: macos-x64
@@ -258,6 +351,25 @@ jobs:
             -c "import PySide6, py7zr, zmq, psutil, Cryptodome, zstandard, pyzstd, rarfile; print('deps ok')"
           flatpak run --command=python3 io.github.backupstudio.BackupStudio \
             -c "import backupstudio; print('app ok', backupstudio.__version__)"
+
+          # R-fix4 门禁①：托盘图标资源必须真的进包。
+          # 此前 pyproject.toml 只声明了 py.typed，而 Flatpak 走
+          # `pip3 install --prefix=/app`（非代码数据不入包）→ site-packages 内
+          # 没有 backupstudio/assets/tray/*.png，Flatpak 版托盘图标全缺。
+          # 故光测「deps ok」不够：依赖齐了、资源仍可能缺。这里做硬断言。
+          # 注：必须写成单行——run: | 块标量里出现顶格 Python 会破坏 YAML 解析。
+          flatpak run --command=python3 io.github.backupstudio.BackupStudio -c "import backupstudio, pathlib; p = pathlib.Path(backupstudio.__file__).parent / 'assets' / 'tray'; pngs = sorted(p.glob('*.png')); print('tray png count:', len(pngs)); assert len(pngs) >= 7, f'托盘资源缺失: {len(pngs)}/7 -> {p}'; print('tray assets ok')"
+
+          # R-fix4 门禁②：.desktop 必须真的被装上且字段完整。
+          # 之前只 build 不校验，桌面项写错也不会有任何 job 变红。
+          DESKTOP="$(flatpak info --show-location io.github.backupstudio.BackupStudio)/files/share/applications/io.github.backupstudio.BackupStudio.desktop"
+          test -f "$DESKTOP" || { echo "缺少 .desktop：$DESKTOP"; exit 1; }
+          grep -q '^\[Desktop Entry\]' "$DESKTOP" || { echo ".desktop 缺 [Desktop Entry]"; exit 1; }
+          grep -q '^Exec=backupstudio' "$DESKTOP" || { echo ".desktop 的 Exec 未指向 backupstudio"; exit 1; }
+          # CRLF 会让 GLib 解析失败的 keyfile；DPKG/Flatpak 桌面项必须是 LF。
+          if grep -q $'\r' "$DESKTOP"; then echo ".desktop 含 CR（应为 LF）"; exit 1; fi
+          echo ".desktop OK:"
+          cat "$DESKTOP"
       - uses: actions/upload-artifact@v4
         with:
           name: linux-flatpak

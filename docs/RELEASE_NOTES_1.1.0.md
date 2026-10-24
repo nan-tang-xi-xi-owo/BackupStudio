@@ -73,7 +73,17 @@
 ## 已知限制
 
 - 裸 `.tar` 格式本身不带校验信息，位翻转检测需要逐文件哈希，留待后续版本。
-- macOS 版本尚未签名与公证（需要付费开发者证书），首次打开请右键 → 打开。
+- **全平台产物均未做代码签名；macOS 版未公证（notarization）。**
+  本版 Windows 的 `BackupStudio.exe` / `7za.exe` / `7zr.exe` 与安装包经
+  `Get-AuthenticodeSignature` 检查均为 `NotSigned`；macOS CI 日志明示「跳过签名
+  （未设置 CODESIGN_IDENTITY）」。原因是没有购买 Apple Developer Program 与
+  Windows 代码签名证书，**并非构建配置遗漏**。
+  我们不会用自签名证书伪装已签名版本，而是如实告知。首次运行的预期提示：
+  - Windows：SmartScreen「Windows 已保护你的电脑」→ 点「更多信息」→「仍要运行」。
+  - macOS：「Apple 无法检查是否包含恶意软件」→ 右键（Control 点按）→「打开」，
+    或执行 `xattr -dr com.apple.quarantine /Applications/BackupStudio.app`。
+  - Linux/Flatpak：不受二进制签名影响，AppImage 需先 `chmod +x` 并安装 `libfuse2`。
+  运行前请用本页 `SHA256SUMS.txt` 核对校验值；详见 README 的「平台信任提示」章节。
 - Split 分卷、加密包等组合对旧版本产物的兼容性以实际格式为准，导入旧包前建议先在
   副本上验证。
 
