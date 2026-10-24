@@ -54,7 +54,17 @@ BackupStudio（备份工坊）
 EOF
 
 echo "==> 生成 DMG"
-hdiutil create -volname "BackupStudio" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+# hdiutil 偶发 "Resource busy"：多为残留挂载点或 Spotlight 索引占用。
+# 先卸载与本卷同名的残留挂载，失败则退避重试（CI 上实测出现过一次）。
+for _ in 1 2 3; do
+  if hdiutil create -volname "BackupStudio" -srcfolder "$STAGE" -ov -format UDZO "$DMG"; then
+    break
+  fi
+  echo "==> hdiutil 失败，清理残留挂载后重试（第 $_ 次）" >&2
+  hdiutil detach "/Volumes/BackupStudio" -force 2>/dev/null || true
+  sleep 3
+done
+[[ -f "$DMG" ]] || { echo "DMG 创建失败：$DMG" >&2; exit 1; }
 
 if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
   codesign --force --timestamp --sign "$CODESIGN_IDENTITY" "$DMG"
