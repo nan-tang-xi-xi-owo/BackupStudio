@@ -906,13 +906,126 @@ class ExternalCompressor:
         """把 staging.tar 解开为目录（7-Zip 不会自动展开 tar，必须先解再打包）。
 
         返回解包目录；随后删除 staging.tar 控制磁盘峰值（解包后即释源包）。
+
+        **优先用 Python ``tarfile``，只在它失败时才回退到 7-Zip**——原因（实测）：
+
+        p7zip 16.02（Debian/Ubuntu 的 ``p7zip-full``，CI 的 ubuntu-22.04 就是它）
+        用 ``7z x staging.tar`` 解包时，会把**非 ASCII 文件名替换成 ``?``**：
+
+            Python tarfile 建包    → data/sub/中文 emoji 🎈.txt
+            7z x staging.tar       → data/sub/?? emoji ?.txt      ← 中文变 ?，不可逆
+            7z x -sccUTF-8 ...     → data/sub/?? emoji ?.txt      ← 同样丢
+            Python tarfile.extract → data/sub/中文 emoji 🎈.txt    ← 正确
+
+        后果：备份产物里的中文文件名全部损坏，用户恢复后文件名不可读。
+        ``-sccUTF-8`` 只影响**控制台输出**编码，不影响文件名，所以治不了这个问题。
+
+        7-Zip 21+（官方）正常，本机 24.09 / VM 25.01 都测不出问题，因此长期未被发现。
+
+        staging.tar 是**我们自己用 ``tarfile`` 写的**，格式确定，``tarfile`` 必然能读；
+        回退到 7-Zip 只为止损（比如未来的 tar 变体 tarfile 解析不了）。
         """
         unpacked = self.tmpdir / "unpacked"
         unpacked.mkdir(parents=True, exist_ok=True)
+        if self._unpack_with_tarfile(tar_path, unpacked):
+            with contextlib.suppress(OSError):
+                tar_path.unlink()
+            return unpacked
+        # 回退：tarfile 解不开（格式意外）时仍用 7-Zip，至少能出产物
         self._run([self.exe, "x", str(tar_path), f"-o{unpacked}", "-y", "-bso0", "-bsp0"])
         with contextlib.suppress(OSError):
             tar_path.unlink()
         return unpacked
+
+    @staticmethod
+    def _unpack_with_tarfile(tar_path: Path, dest: Path) -> bool:
+        """用 tarfile 解 staging.tar；成功返回 True。
+
+        为什么要自己实现而不用 ``tf.extractall``：
+        * ``filter="data"`` 是 Python 3.12+ 才有（本产品声明支持 >=3.10）；
+        * 需要**完整保留**符号链接、硬链接、权限位、mtime —— 这些都是
+          用户备份的一部分，丢了就是静默的数据/元数据丢失。
+
+        安全要点：staging.tar 是我们自己写的，理论上不会有越界成员，
+        但解包前仍逐个校验收敛到 dest 内（防御 tar-slip）。链接另做
+        落点校验：``linkname`` 解析后必须仍在 dest 内。
+        """
+        try:
+            with tarfile.open(tar_path, "r") as tf:
+                base = dest.resolve()
+                for member in tf.getmembers():
+                    target = (dest / member.name).resolve()
+                    try:
+                        target.relative_to(base)
+                    except ValueError:
+                        # 越界成员：跳过而不是让整次解包失败
+                        continue
+
+                    if member.isdir():
+                        target.mkdir(parents=True, exist_ok=True)
+                        SevenZipCompressor._restore_meta(target, member)
+                        continue
+
+                    # 符号链接 / 硬链接：**必须保留**（审计 P0）——
+                    # 早期版本这里 `continue` 静默丢弃，导致 7z/zip/rar
+                    # 三种后端的产物里链接全部消失，用户恢复后链接指向的
+                    # 文件不可达，而记录显示 success。
+                    if member.issym():
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        with contextlib.suppress(OSError, NotImplementedError):
+                            if target.is_symlink() or target.exists():
+                                target.unlink()
+                            # 落点校验：相对 linkname 相对 target 的父目录解析
+                            link_dest = (target.parent / member.linkname).resolve()
+                            try:
+                                link_dest.relative_to(base)
+                            except ValueError:
+                                continue  # 指向 dest 之外：跳过该链接
+                            os.symlink(member.linkname, target)
+                            SevenZipCompressor._restore_meta(target, member, follow=False)
+                        continue
+
+                    if member.islnk():
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        src_rel = (dest / member.linkname).resolve()
+                        try:
+                            src_rel.relative_to(base)
+                        except ValueError:
+                            continue
+                        with contextlib.suppress(OSError, NotImplementedError):
+                            if target.exists() or target.is_symlink():
+                                target.unlink()
+                            os.link(src_rel, target)
+                        continue
+
+                    if member.isfile():
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        src = tf.extractfile(member)
+                        if src is None:
+                            continue
+                        with open(target, "wb") as out:
+                            shutil.copyfileobj(src, out, 1 << 20)
+                        SevenZipCompressor._restore_meta(target, member)
+            return True
+        except Exception:  # noqa: BLE001 - 任何失败都交给 7-Zip 回退
+            return False
+
+    @staticmethod
+    def _restore_meta(target: Path, member: tarfile.TarInfo, *, follow: bool = True) -> None:
+        """还原权限位与 mtime（审计 P0：不还原会让 0600 私钥变 0644）。
+
+        失败时静默忽略：某些文件系统（FAT/exFAT/部分网络盘）不支持 chmod，
+        不能因此中断整次备份。
+        """
+        mode = member.mode & 0o7777
+        if mode:
+            with contextlib.suppress(OSError, NotImplementedError):
+                if follow:
+                    os.chmod(target, mode)
+                elif hasattr(os, "lchmod"):
+                    os.lchmod(target, mode)
+        with contextlib.suppress(OSError, NotImplementedError, ValueError):
+            os.utime(target, (member.mtime, member.mtime), follow_symlinks=follow)
 
     def _pack_from(self, src_dir: Path, out_path: Path, *, extra_args: list[str] | None = None) -> None:
         """从解包目录打包到 out_path（cwd=源目录保证归档内路径与 arcname 一致）。
