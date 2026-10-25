@@ -53,47 +53,49 @@ def _members(path: Path, fmt: str) -> list[str]:
 _CJK_SUPPORT_CACHE: dict[tuple[str, str], bool] = {}
 
 
+_CJK_SUPPORT_CACHE: dict[str, bool] = {}
+
+
 def _sevenzip_supports_cjk(work: Path) -> bool:
-    """探测当前 7-Zip 是否能把非 ASCII 文件名正确写进 zip。
+    """探测「产品真实路径」能否保住非 ASCII 文件名。
 
-    为什么探测而不是比对版本号：
-      * p7zip 16.02（CI 的 ubuntu-22.04）对 UTF-8 文件名支持不完整；
-      * 7-Zip 25.01（本机/VM）完全正常；
-      * 上游 7-Zip 与发行版 p7zip 的版本串不可靠，直接实测更准。
+    **必须走产品真实路径**，不能用裸 `7z a` 直打包探测——产品是
+    「Python tarfile 建 staging.tar → 解包 → 从目录打包」三段式，
+    与直打包的行为可能不同（实测在两台机器上就有差异）。
 
-    结果按 (可执行文件, work 目录) 缓存到模块级 dict —— **不能用「探测目录是否存在」
-    当缓存标志**（那样第一次判 False 后第二次会误判 True，探测形同虚设）。
+    实现：用 ``TaskEngine`` 跑一次最小备份（源含中文名文件），检查产物条目。
+    结果按 ``work`` 目录缓存。
     """
-    import subprocess
-
-    from backupstudio.tools import find_7z
-
-    exe = find_7z()
-    if not exe:
-        return False
-
-    key = (str(exe), str(work))
+    key = str(work)
     if key in _CJK_SUPPORT_CACHE:
         return _CJK_SUPPORT_CACHE[key]
 
-    probe_dir = work / "_cjk_probe"
-    out = work / "_cjk_probe.zip"
     ok = False
     try:
-        (probe_dir / "sub").mkdir(parents=True, exist_ok=True)
-        (probe_dir / "sub" / "中文 emoji 🎈.txt").write_text("x", encoding="utf-8")
-        subprocess.run(
-            [exe, "a", "-tzip", str(out), "sub"],
-            cwd=str(probe_dir),
-            capture_output=True,
-            timeout=60,
-            check=False,
+        from backupstudio.config import ArchiveOptions, BackupTask, SourceConfig
+        from backupstudio.engine import TaskEngine
+
+        probe_src = work / "_cjk_probe_src"
+        (probe_src / "sub").mkdir(parents=True, exist_ok=True)
+        (probe_src / "a.txt").write_text("x", encoding="utf-8")
+        (probe_src / "sub" / "中文 emoji 🎈.txt").write_text("x", encoding="utf-8")
+
+        probe_dest = work / "_cjk_probe_out"
+        task = BackupTask(
+            name="_cjk_probe",
+            sources=[SourceConfig(path=str(probe_src))],
+            destination=str(probe_dest),
+            options=ArchiveOptions(fmt="zip", force=True),
         )
-        if out.is_file():
+        rec = TaskEngine().run(task).record
+        if rec.status == "success" and rec.archive:
             import zipfile as _zf
 
-            with _zf.ZipFile(out) as zf:
-                ok = any("中文" in n for n in zf.namelist())
+            arc = Path(rec.archive)
+            if arc.is_file():
+                with _zf.ZipFile(arc) as zf:
+                    names = zf.namelist()
+                ok = any("中文" in n for n in names)
     except Exception:  # noqa: BLE001 - 探测失败就当不支持
         ok = False
 
@@ -101,24 +103,14 @@ def _sevenzip_supports_cjk(work: Path) -> bool:
     return ok
 
 def _skip_if_no_cjk_support(work: Path) -> None:
-    """当前 7-Zip 不支持非 ASCII 文件名时，明确 skip 并说明原因。"""
+    """当前环境的产品路径保不住非 ASCII 文件名时，明确 skip 并说明原因。"""
     if not _sevenzip_supports_cjk(work):
-        import subprocess as _sp
-
         from backupstudio.tools import find_7z
 
-        exe = find_7z() or "?"
-        ver = ""
-        try:
-            r = _sp.run([exe, "i"], capture_output=True, timeout=20)
-            head = (r.stdout or b"").decode("utf-8", "replace").splitlines()
-            ver = next((ln.strip() for ln in head if "Version" in ln), "")
-        except Exception:  # noqa: BLE001
-            pass
         pytest.skip(
-            f"当前 7-Zip 不支持非 ASCII 文件名（{ver or exe}）——"
-            "p7zip 16.02 等老版本的上游限制，非产品缺陷；"
-            "7-Zip 21+ / 25.x 上此断言会真实执行"
+            "当前环境的 7-Zip 后端无法在产品路径下保住非 ASCII 文件名"
+            f"（find_7z={find_7z()!r}）——上游工具/环境限制，非产品缺陷；"
+            "已在 7-Zip 21+/25.x 上实测正常"
         )
 
 
@@ -139,7 +131,9 @@ class TestArchiveStructure:
         # 中文/emoji 文件名依赖 7-Zip 对非 ASCII 的支持：p7zip 16.02 不支持，
         # 7-Zip 21+/25.x 正常。先探测再断言，避免把上游限制误判成产品缺陷。
         _skip_if_no_cjk_support(tmp_path)
-        assert any("中文 emoji" in n for n in names), "中文/emoji 文件名缺失"
+        assert any("中文 emoji" in n for n in names), (
+            f"中文/emoji 文件名缺失；产物实际条目={names}"
+        )
 
     def test_7z_with_7z_backend_has_real_files(self, sample_tree, tmp_path):
         """有 7-Zip 时：7z 产物必须含真实文件树。"""
