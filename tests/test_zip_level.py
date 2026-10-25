@@ -54,6 +54,18 @@ if str(ROOT) not in sys.path:
 _WORDS = " ".join(f"word{i:04d}" for i in range(400))
 
 
+
+def zi_level(zi) -> int | None:
+    """读 ``ZipInfo`` 的压缩级别，跨 Python 版本。
+
+    Python 3.13+ 属性名是 ``compress_level``，3.10–3.12 是 ``_compresslevel``。
+    **测试本身也必须兼容**，否则 3.12 的 CI runner 上直接 AttributeError
+    （run #40 实证：Linux/macOS/Windows 三个 job 都因此红）。
+    """
+    if hasattr(zi, "compress_level"):
+        return zi.compress_level
+    return getattr(zi, "_compresslevel", None)
+
 def _write_corpus(src: Path) -> int:
     src.mkdir(parents=True, exist_ok=True)
     for i in range(6):
@@ -171,15 +183,15 @@ def test_compress_level_field_is_actually_set(tmp_path, cls_name):
     try:
         make_info = getattr(c, "_info", None) or getattr(c, "_zip_info")
         zi = make_info("probe.txt", None, False)
-        assert zi.compress_level == 3, (
-            f"{cls_name}: ZipInfo.compress_level 应为 3，实际 {zi.compress_level!r}"
+        assert zi_level(zi) == 3, (
+            f"{cls_name}: ZipInfo 压缩级别应为 3，实际 {zi_level(zi)!r}"
             f"（None = 落到 zlib 默认 6，级别设置被忽略）"
         )
         assert zi.compress_type == zipfile.ZIP_DEFLATED
         # 目录条目：STORED，且不设 compress_level
         dir_info = make_info("probe_dir", None, True)
         assert dir_info.compress_type == zipfile.ZIP_STORED
-        assert dir_info.compress_level is None, (
+        assert zi_level(dir_info) is None, (
             "目录条目是 STORED，不该带无意义的 compress_level"
         )
     finally:
@@ -192,15 +204,15 @@ def test_zip_info_level_helper_contract():
 
     zi = zipfile.ZipInfo("a.txt")
     zip_info_level(zi, 9)
-    assert (zi.compress_type, zi.compress_level) == (zipfile.ZIP_DEFLATED, 9)
+    assert (zi.compress_type, zi_level(zi)) == (zipfile.ZIP_DEFLATED, 9)
 
     zi = zipfile.ZipInfo("b.txt")
     zip_info_level(zi, 0)
-    assert zi.compress_type == zipfile.ZIP_STORED and zi.compress_level is None
+    assert zi.compress_type == zipfile.ZIP_STORED and zi_level(zi) is None
 
     zi = zipfile.ZipInfo("c/")
     zip_info_level(zi, 9, is_dir=True)
-    assert zi.compress_type == zipfile.ZIP_STORED and zi.compress_level is None, (
+    assert zi.compress_type == zipfile.ZIP_STORED and zi_level(zi) is None, (
         "目录条目必须 STORED 且不带 compress_level"
     )
 
