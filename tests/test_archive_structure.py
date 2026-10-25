@@ -50,17 +50,19 @@ def _members(path: Path, fmt: str) -> list[str]:
         return z.getnames()
 
 
+_CJK_SUPPORT_CACHE: dict[tuple[str, str], bool] = {}
+
+
 def _sevenzip_supports_cjk(work: Path) -> bool:
     """探测当前 7-Zip 是否能把非 ASCII 文件名正确写进 zip。
 
-    为什么需要探测而不是比对版本号：
-      * p7zip 16.02（CI 的 ubuntu-22.04）对 UTF-8 文件名支持不完整，
-        实测会把 `中文 emoji 🎈.txt` 丢掉或转义；
+    为什么探测而不是比对版本号：
+      * p7zip 16.02（CI 的 ubuntu-22.04）对 UTF-8 文件名支持不完整；
       * 7-Zip 25.01（本机/VM）完全正常；
-      * 版本号字符串在不同发行版之间不可靠（上游 7-Zip vs 发行版 p7zip），
-        直接探测更准。
+      * 上游 7-Zip 与发行版 p7zip 的版本串不可靠，直接实测更准。
 
-    返回 True 表示支持（可以严格断言 CJK 文件名）。
+    结果按 (可执行文件, work 目录) 缓存到模块级 dict —— **不能用「探测目录是否存在」
+    当缓存标志**（那样第一次判 False 后第二次会误判 True，探测形同虚设）。
     """
     import subprocess
 
@@ -70,13 +72,16 @@ def _sevenzip_supports_cjk(work: Path) -> bool:
     if not exe:
         return False
 
+    key = (str(exe), str(work))
+    if key in _CJK_SUPPORT_CACHE:
+        return _CJK_SUPPORT_CACHE[key]
+
     probe_dir = work / "_cjk_probe"
-    if probe_dir.exists():
-        return True  # 已探测过
-    (probe_dir / "sub").mkdir(parents=True, exist_ok=True)
-    (probe_dir / "sub" / "中文 emoji 🎈.txt").write_text("x", encoding="utf-8")
     out = work / "_cjk_probe.zip"
+    ok = False
     try:
+        (probe_dir / "sub").mkdir(parents=True, exist_ok=True)
+        (probe_dir / "sub" / "中文 emoji 🎈.txt").write_text("x", encoding="utf-8")
         subprocess.run(
             [exe, "a", "-tzip", str(out), "sub"],
             cwd=str(probe_dir),
@@ -84,15 +89,16 @@ def _sevenzip_supports_cjk(work: Path) -> bool:
             timeout=60,
             check=False,
         )
-        if not out.is_file():
-            return False
-        import zipfile as _zf
+        if out.is_file():
+            import zipfile as _zf
 
-        with _zf.ZipFile(out) as zf:
-            return any("中文" in n for n in zf.namelist())
+            with _zf.ZipFile(out) as zf:
+                ok = any("中文" in n for n in zf.namelist())
     except Exception:  # noqa: BLE001 - 探测失败就当不支持
-        return False
+        ok = False
 
+    _CJK_SUPPORT_CACHE[key] = ok
+    return ok
 
 def _skip_if_no_cjk_support(work: Path) -> None:
     """当前 7-Zip 不支持非 ASCII 文件名时，明确 skip 并说明原因。"""
@@ -132,7 +138,6 @@ class TestArchiveStructure:
         assert any(n.endswith("a.txt") for n in names), names
         # 中文/emoji 文件名依赖 7-Zip 对非 ASCII 的支持：p7zip 16.02 不支持，
         # 7-Zip 21+/25.x 正常。先探测再断言，避免把上游限制误判成产品缺陷。
-        _skip_if_no_cjk_support(tmp_path)
         _skip_if_no_cjk_support(tmp_path)
         assert any("中文 emoji" in n for n in names), "中文/emoji 文件名缺失"
 
