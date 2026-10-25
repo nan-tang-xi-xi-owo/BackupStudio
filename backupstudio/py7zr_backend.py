@@ -189,7 +189,7 @@ class Py7zrCompressor:
         zi.external_attr = (0o40755 if is_dir else 0o100644) << 16
         # ZipInfo.compress_type 默认 STORED，会覆盖 ZipFile(compression=...)；
         # 不显式设置则「强制压缩」的 ZIP 产物完全不压缩（审查 Q6）。目录条目保持 STORED。
-        # S3：**还必须设 compress_level**（Python 3.12+ 只读 zinfo.compress_level，
+        # S3：**还必须设 compress_level**（Python 3.13+ 才叫 zinfo.compress_level；3.12 及更早是 _compresslevel，
         # 默认 None → 恒用 zlib 默认 6 → level 1..9 产出完全相同）。
         _zip_info_level(zi, self.spec.level, is_dir=is_dir)
         try:
@@ -368,7 +368,7 @@ class ZipFileCompressor:
         zi = zipfile.ZipInfo(arcname + ("/" if is_dir else ""), date_time=ts)
         zi.external_attr = (0o40755 if is_dir else 0o100644) << 16
         # 同 Py7zrCompressor._zip_info：必须显式设置，否则 STORED 会覆盖全局 compression；
-        # 且必须连 compress_level 一起设（S3：Python 3.12+ 只读 zinfo.compress_level）。
+        # 且必须连 compress_level 一起设（S3：Python 3.13+ 才叫 zinfo.compress_level；3.12 及更早是 _compresslevel）。
         _zip_info_level(zi, self.spec.level, is_dir=is_dir)
         try:
             zi.flag_bits |= 0x800

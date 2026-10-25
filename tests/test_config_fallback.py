@@ -58,38 +58,46 @@ def _clean_paths():
 
 
 def _block_preferred_config(tmp_path, monkeypatch):
-    """按平台把「首选配置目录」变成不可用（用普通文件占位使 mkdir 失败）。
+    """按平台把「首选配置目录的**父目录**」变成不可用，返回该父目录路径。
 
-    返回该"占位文件"路径，供断言 ``preferred`` 使用。
+    做法：用一个**普通文件**占住父目录的位置，使 `mkdir` 必然失败。
 
-    各平台的首选目录来源不同，所以必须设对应的环境变量：
-      win32  → APPDATA
-      darwin → HOME（首选 = ~/Library/Application Support/<app>）
-      其它   → XDG_CONFIG_HOME
+    各平台的首选目录来源不同，必须设对应环境变量：
+      win32  → APPDATA            → 首选 = $APPDATA/BackupStudio
+      darwin → HOME               → 首选 = $HOME/Library/Application Support/BackupStudio
+      其它   → XDG_CONFIG_HOME    → 首选 = $XDG_CONFIG_HOME/backupstudio
+
+    **返回值语义统一为「首选目录的父目录」**，这样断言可以写成
+    `preferred.parent == blocker`，跨平台一致。
+    （此前 darwin/Linux 分支返回的是首选目录**本身**，与断言自相矛盾，
+      macOS runner 上必红。）
     """
     import sys
 
     monkeypatch.delenv("BACKUPSTUDIO_CONFIG_DIR", raising=False)
     if sys.platform == "win32":
-        blocker = tmp_path / "appdata"
-        blocker.write_text("x", encoding="utf-8")
-        monkeypatch.setenv("APPDATA", str(blocker))
+        parent = tmp_path / "appdata"
+        parent.write_text("x", encoding="utf-8")
+        monkeypatch.setenv("APPDATA", str(parent))
         monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
-        return blocker
+        return parent
     if sys.platform == "darwin":
         home = tmp_path / "home"
-        appsup = home / "Library" / "Application Support"
-        appsup.mkdir(parents=True, exist_ok=True)
-        blocker = appsup / "BackupStudio"
-        blocker.write_text("x", encoding="utf-8")
-        monkeypatch.setenv("HOME", str(home))
-        return blocker
+        parent = home / "Library" / "Application Support"
+        parent.mkdir(parents=True, exist_ok=True)
+        # 把「父目录」本身换成文件是做不到的（已 mkdir），所以换个做法：
+        # 让 HOME 指向一个**文件**，使 ~/Library/... 无法创建。
+        fake_home = tmp_path / "fake-home"
+        fake_home.write_text("x", encoding="utf-8")
+        monkeypatch.setenv("HOME", str(fake_home))
+        # 返回「本应作为父目录」的路径，供 preferred.parent 断言
+        return fake_home / "Library" / "Application Support"
     # Linux / 其它 POSIX
-    blocker = tmp_path / "xdg"
-    blocker.write_text("x", encoding="utf-8")
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(blocker))
+    parent = tmp_path / "xdg"
+    parent.write_text("x", encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(parent))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    return blocker
+    return parent
 
 def _prime_writable_preferred(tmp_path, monkeypatch):
     """按平台把「首选配置目录」指向 tmp_path 下的可写位置。

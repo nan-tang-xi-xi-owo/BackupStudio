@@ -494,26 +494,48 @@ def zip_deflate_level(level: int) -> int:
 
 
 def zip_info_level(zi: zipfile.ZipInfo, level: int, *, is_dir: bool = False) -> None:
-    """给 ``ZipInfo`` 同时设好 compress_type 与 compress_level（S3 的修复点）。
+    """给 ``ZipInfo`` 同时设好 compress_type 与压缩级别（S3 的修复点）。
 
     **两条都必须设，缺一即错**：
 
     * ``compress_type`` —— ``ZipInfo`` 自带该字段，默认 ``0 = STORED``，会**覆盖**
       ``ZipFile(compression=...)``；不设就整包不压缩（审查 Q6）。
-    * ``compress_level`` —— Python 3.12+ 的 ``_ZipWriteFile`` 直接读
-      ``zinfo.compress_level`` 交给 ``zlib.compressobj``；``ZipInfo`` 的默认值是
-      ``None`` → 落到 ``zlib.Z_DEFAULT_COMPRESSION``（恒 6）。**只设 compress_type
-      的话，level=1 与 level=9 产出的字节完全相同**（实测均 231809 B）——
-      用户以为自己在调压缩级别，实际永远是 6。全项目此前 `compress_level` 零命中。
+    * 压缩级别 —— ``zipfile`` 写入时从 ``ZipInfo`` 上取级别交给 ``zlib.compressobj``；
+      默认 ``None`` → 落到 ``zlib.Z_DEFAULT_COMPRESSION``（恒 6）。**只设
+      compress_type 的话，level=1 与 level=9 产出的字节完全相同**（实测均 231809 B）
+      —— 用户以为自己在调压缩级别，实际永远是 6。
 
-    STORED（目录条目、``level == 0``）不设 ``compress_level``：zlib 不参与，
-    设了也没有意义，还会让产物多一个与事实不符的字段。
+    **属性名在 Python 3.13 变过**（这是 CI 在 3.12 上 AttributeError 的根因）：
+
+    * Python **3.10–3.12**：``ZipInfo.__slots__`` 里是 ``_compresslevel``（私有）
+    * Python **3.13+**：改名为 ``compress_level``（公开属性）
+
+    所以必须按运行时**实际拥有的属性名**去设，不能写死。CI 用的是 Python 3.12，
+    写死 ``zi.compress_level`` 会在三个 runner 上全部
+    ``AttributeError: 'ZipInfo' object has no attribute 'compress_level'``
+    （run #39 实证：Windows 15 条、Linux 15 条、macOS 15 条因此失败）。
+
+    STORED（目录条目、``level == 0``）不设级别：zlib 不参与，设了也没有意义。
     """
     if is_dir or level == 0:
         zi.compress_type = zipfile.ZIP_STORED
         return
     zi.compress_type = zipfile.ZIP_DEFLATED
-    zi.compress_level = zip_deflate_level(level)
+    _set_zipinfo_level(zi, zip_deflate_level(level))
+
+
+def _set_zipinfo_level(zi: zipfile.ZipInfo, level: int) -> None:
+    """按当前 Python 版本设置 ``ZipInfo`` 的压缩级别。
+
+    3.13+ 用 ``compress_level``，3.12 及更早用 ``_compresslevel``。
+    用 ``hasattr`` 探测而非比对版本号——对 PyPy、对未来改名都更稳。
+    """
+    if hasattr(zi, "compress_level"):
+        zi.compress_level = level  # Python 3.13+
+    elif hasattr(zi, "_compresslevel"):
+        zi._compresslevel = level  # Python 3.10–3.12
+    # 两者都没有（极老版本）：静默跳过。此时 zipfile 本就不支持按条目设级别，
+    # 强行 setattr 在带 __slots__ 的类上会抛 AttributeError，比"用默认级别"更糟。
 
 
 class ZipCompressor:
@@ -565,7 +587,7 @@ class ZipCompressor:
         zi.create_system = 3
         # ZipInfo 自带 compress_type，默认 0=STORED，会**覆盖** ZipFile(compression=...)；
         # 不显式设置，整个内置 ZIP 后端就退化成「不压缩」（审查 Q6）。目录条目保持 STORED。
-        # S3：**还必须设 compress_level** —— Python 3.12+ 只读 zinfo.compress_level，
+        # S3：**还必须设 compress_level** —— Python 3.13+ 才叫 zinfo.compress_level；3.12 及更早是 _compresslevel，
         # 默认 None → 恒用 zlib 默认级别 6，级别 1..9 全部产出同样的字节。
         zip_info_level(zi, self.spec.level, is_dir=is_dir)
         return zi

@@ -76,14 +76,20 @@ jobs:
       run: 'python -m pip install --upgrade pip
 
         pip install -r requirements.txt -r requirements-dev.txt'
-    - name: 准备 7-Zip（系统包）
-      run: 'sudo apt-get update -qq
-
-        sudo apt-get install -y -qq p7zip-full
-
+    - name: 准备 7-Zip 与 Qt 运行时（系统包）
+      run: |
+        sudo apt-get update -qq
+        # PySide6 的 wheel 自带 Qt 库，但依赖系统的 libEGL/libGL/xkbcommon/xcb-*。
+        # GitHub 的 ubuntu runner 不像桌面版装了这些；不装的话所有依赖 qapp
+        # fixture 的测试会在 setup 阶段 ImportError: libEGL.so.1。
+        sudo apt-get install -y -qq p7zip-full libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libdbus-1-3 libfontconfig1 libxrender1 libxi6 libxtst6 libnss3 libasound2
+        echo '--- 7-Zip ---'
         command -v 7z 7za 7zz || true
-
-        7z i 2>/dev/null | head -3 || 7za i 2>/dev/null | head -3 || true'
+        7z i 2>/dev/null | head -3 || 7za i 2>/dev/null | head -3 || true
+        echo '--- Qt 关键库 ---'
+        for lib in libEGL.so.1 libGL.so.1 libxkbcommon-x11.so.0; do
+          if ldconfig -p | grep -q "$lib"; then echo "  [有] $lib"; else echo "  [缺] $lib"; fi
+        done
     - name: 版本一致性门禁（env.APP_VERSION == backupstudio.__version__）
       run: |
         pkg_ver="$(python -c 'import backupstudio; print(backupstudio.__version__)')"
@@ -97,7 +103,11 @@ jobs:
         echo "版本一致：$env_ver"
 
     - name: pytest（Linux + 系统 7z）
-      run: python -m pytest tests -q --basetemp="$PWD/build-bt" -rs
+      env:
+        # CI 无显示器：Qt 必须用 offscreen 平台插件
+        QT_QPA_PLATFORM: offscreen
+      run: |
+        python -m pytest tests -q --basetemp="$PWD/build-bt" -rs
 
   test-macos:
     name: 单元测试（macOS arm64）
@@ -117,7 +127,10 @@ jobs:
 
         command -v 7z 7za 7zz || true'
     - name: pytest（macOS + 系统 7z）
-      run: python -m pytest tests -q --basetemp="$PWD/build-bt" -rs
+      env:
+        QT_QPA_PLATFORM: offscreen
+      run: |
+        python -m pytest tests -q --basetemp="$PWD/build-bt" -rs
 
   windows:
     name: Windows exe / 安装包
@@ -276,7 +289,7 @@ jobs:
     name: macOS arm64 dmg
     # B5：macos-14 已 deprecated（2026-11-02 完全下线），迁到 macos-15
     runs-on: macos-15
-    needs: test
+    needs: [test, test-macos]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -338,7 +351,7 @@ jobs:
     # B5：macos-13 已于 2025-12-08 退役（runner 永远排队 → 24h 后 cancelled），
     # 官方指定迁移目标为 macos-15-intel（最后一个 x86_64 镜像）
     runs-on: macos-15-intel
-    needs: test
+    needs: [test, test-macos]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -393,7 +406,7 @@ jobs:
   linux-appimage:
     name: Linux AppImage
     runs-on: ubuntu-22.04
-    needs: test
+    needs: [test, test-linux]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -428,7 +441,7 @@ jobs:
   linux-flatpak:
     name: Flatpak
     runs-on: ubuntu-22.04
-    needs: test
+    needs: [test, test-linux]
     container:
       # B6：原镜像 bilelmoussaoui/flatpak-github-actions:kde-6.8 的 tag **从未发布**
       # （实测 Docker Hub 27 个 tag，最大 kde-6.7），docker pull 直接 404 → job 必红。
@@ -571,7 +584,7 @@ jobs:
     name: 发布 Release
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
-    needs: [windows, macos-arm64, macos-x64, linux-appimage, linux-flatpak]
+    needs: [windows, macos-arm64, macos-x64, linux-appimage, linux-flatpak, test-linux, test-macos]
     steps:
       - uses: actions/checkout@v4
         with:
