@@ -582,16 +582,25 @@ jobs:
 
   release:
     name: 发布 Release
-    if: startsWith(github.ref, 'refs/tags/')
+    # `!cancelled()` 是必须的：macOS arm64 runner 容量不足时 GitHub 会把
+    # test-macos 判为 cancelled（runner_id=0、steps=0、排队 901 秒后放弃），
+    # 而 needs 里含它 → 默认的 success 语义会让本 job 永久 skip。
+    # `!cancelled()` 覆盖的只是「上游未成功」，workflow 自身被取消时仍不跑。
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
-    # **不含 macOS**：macOS arm64 runner 容量不足时（GitHub 平台侧 cancel，
-    # 排队 901 秒后放弃）会让 test-macos cancelled → 两个 dmg skipped，
-    # 而 release 的 needs 若含它们就**永远不会跑**。
-    # Windows/Linux 的门禁一条没丢：windows 已 needs: test，
-    # linux-appimage / linux-flatpak 已 needs: [test, test-linux]。
+    # **needs 必须保留 macOS 三项**，即使它们可能被取消。
     #
-    # 缺 macOS 产物由下面的「产物清单门禁」显式拦住（绝不静默发残缺版）。
-    needs: [windows, linux-appimage, linux-flatpak]
+    # 为什么不能删（红队实测的依赖闭包）：GitHub 文档说 needs 承担两件事 ——
+    # 「成功后」**和**「之后」（"must complete successfully **before this job
+    # will run**"）。删掉 macOS 的 needs 不只解除门禁，还**删掉了排序**：
+    # macos-arm64/macos-x64 会与 release 并行 → **即使 macOS 完全正常**，
+    # release 也可能抢先 download 到「缺 2 个 dmg」→ 门禁 B 误报红。
+    #
+    # 正确做法是保留 needs（保住顺序）+ 用 `!cancelled()` 解除「必须成功」：
+    # 上游被 cancelled/skipped 时 release 仍运行，同样不被 macOS 阻塞，且无竞态。
+    #
+    # 缺硬件产物由「门禁 B」显式拦住（绝不静默发残缺版）。
+    needs: [windows, macos-arm64, macos-x64, linux-appimage, linux-flatpak, test-linux, test-macos]
     steps:
       # 门禁 A 要读 backupstudio/__init__.py，所以不能只 sparse-checkout docs。
       # 仓库本身不大，全量 checkout 更省心。
@@ -605,12 +614,17 @@ jobs:
       # 打 v1.2.0 而源码仍是 1.1.1 时，会发出「标题是 v1.2.0、文件名全是 1.1.1」
       # 的 release —— 用户完全无法从文件名看出问题。
       - name: 门禁 A —— tag 与源码版本号一致
+        shell: bash
         run: |
           set -eu
           tag="${GITHUB_REF_NAME#v}"
-          ver=$(python3 -c "import re,sys; \
-            print(re.search(r'__version__\s*=\s*\"([^\"]+)\"', \
-            open('backupstudio/__init__.py', encoding='utf-8').read()).group(1))")
+          # **必须 import 取真值，不能用正则扫文件**（红队实测的 fail-open）：
+          # `re.search` 无行首锚定，会匹配到注释行 ——
+          #     # __version__ = "1.1.1"     ← 注释抢先匹配
+          #     __version__ = "1.1.0"      ← 真值
+          # tag=v1.1.1 时 rc=0 放行并打印 ✅，而实际版本是 1.1.0。
+          # import 是唯一真源，也与 test-linux job 与 packaging/build.py 一致。
+          ver=$(python3 -c 'import backupstudio; print(backupstudio.__version__)')
           echo "tag=$tag  源码 __version__=$ver"
           if [ "$tag" != "$ver" ]; then
             echo "::error::tag（$tag）与源码版本（$ver）不一致 —— 拒绝发版"
@@ -628,6 +642,7 @@ jobs:
       #
       # 所以必须显式比对期望清单。缺任何一个都**硬失败**，把静默变成显式。
       - name: 门禁 B —— 产物清单齐全
+        shell: bash
         run: |
           set -eu
           ver="${GITHUB_REF_NAME#v}"
@@ -662,6 +677,7 @@ jobs:
           echo "✅ 6 个产物齐全"
 
       - name: 生成校验值
+        shell: bash
         run: |
           cd artifacts
           ls -la
