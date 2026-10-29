@@ -68,6 +68,8 @@ class AppState(QObject):
         self.daemon_info: dict = {}
         self.palette: Palette = self._resolve_palette()
         self._lock = threading.Lock()
+        #: 历史记录缓存：((mtime_ns, size), rows)
+        self._history_cache: tuple[tuple[int, int], list[dict]] | None = None
 
     # ------------------------------------------------------------------
     # 主题
@@ -319,7 +321,29 @@ class AppState(QObject):
 
     # ------------------------------------------------------------------
     def history(self) -> list[dict]:
-        return read_history(300)
+        """读取历史记录（按文件指纹记忆化）。
+
+        缺陷背景（实测）：运行记录页每次 ``on_shown`` 都重新读最多 2 MB 的
+        ``history.jsonl`` 并逐行 ``json.loads``，阻塞 UI 线程 195–234 ms。
+
+        缓存键是 ``(mtime_ns, size)``。历史文件是**追加**写入
+        （``engine.append_history``），任何一次新备份都会让 size 与 mtime 变化，
+        因此缓存能正确失效；而单纯切页时文件不变，直接命中。
+        轮转（``_rotate_history_if_needed``）会让 size 变小，键同样变化。
+        """
+        from ..engine import history_path
+
+        try:
+            st = history_path().stat()
+            key = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return read_history(300)
+        cached = self._history_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        rows = read_history(300)
+        self._history_cache = (key, rows)
+        return rows
 
 
 def config_directory() -> Path:

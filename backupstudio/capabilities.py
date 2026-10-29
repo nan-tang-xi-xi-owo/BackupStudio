@@ -209,8 +209,17 @@ def environment_report() -> dict:
 
 
 def reset_cache() -> None:
+    """清空所有与"环境探测"相关的缓存。
+
+    **必须同时清 tools 模块的缓存**：``probe_7z`` / ``find_7z_gui`` / ``probe_rar``
+    / ``probe_unrar_trial`` 各自带 ``@lru_cache``，只清本文件的两个缓存会让
+    「重新检测」看不到新装的 7-Zip（实测：装完后仍显示旧结果）。
+    """
     environment_report.cache_clear()
     _codec_support.cache_clear()
+    from .tools import reset_tools_cache
+
+    reset_tools_cache()
 
 
 def package_hint(requirement: str) -> str:
