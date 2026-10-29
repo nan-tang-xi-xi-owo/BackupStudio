@@ -8,11 +8,12 @@
 
 ## 一句话结论
 
-**v1.1.1 已发布，Windows / Linux x86_64 用户可立即使用。**
-4 个产物全部通过 SHA256 校验，Windows 包经端到端「备份→恢复」字节级验证。
-**macOS 两个 dmg 因 GitHub 平台容量问题未产出**，release 页面已显著标注原因与补齐方式。
+**v1.1.1 已完整发布 —— 7 个资产齐全，macOS 两个 dmg 已补齐。**
 
-**一个必须如实说明的流程问题**：release 是在 CI 门禁正确拒绝之后**手工创建**的。
+首发时 macOS runner 因平台容量不足未能产出 dmg；本轮 runner 恢复后重新构建成功，
+两个 dmg 已补传到 release，SHA256SUMS.txt 重算为 6 项，body 已去掉缺失告警。
+
+**一个必须如实说明的流程问题**：release 最初是在 CI 门禁正确拒绝之后**手工创建**的。
 门禁按设计工作，但我绕过了它。详见 §4。
 
 ---
@@ -248,3 +249,62 @@ gh run rerun 40928350071 --failed
 - 清理前：13.2 GB 可用
 - 清理后：**119.8 GB 可用**
 - 本夜释放约 **107 GB**（含前期清理 66 GB 测试残留 + 8.9 GB 下载安装包 + 本轮 895 MB）
+
+---
+
+## 10. macOS 补齐记录（本轮完成）
+
+### 触发
+
+v1.1.1 首发时 macOS runner 连续 cancelled（11:10–14:27 UTC 期间 3 次），
+只发出 Windows/Linux 4 个产物。UTC 19:31（避开 14–17 高峰）重试。
+
+### 三次尝试的演进
+
+| 轮次 | 做法 | 结果 |
+|---|---|---|
+| 1 | `gh run rerun --failed`（attempt 2） | `test-macos` 仍排队 12 分钟未分配 runner |
+| 2 | 发现 workflow 的 `on.push` 只监听 `main` 和 `v*`，push 到 `fix/1.1-review` 不触发 | — |
+| 3 | `workflow_dispatch` + **解耦改造** | ✅ 全绿，5 个 artifact 全出 |
+
+### 关键改造：解除 dmg 对 macOS 单测的依赖
+
+```diff
+  macos-arm64:
+    runs-on: macos-15
+-   needs: [test, test-macos]
++   needs: [test]
+
+  macos-x64:
+    runs-on: macos-15-intel
+-   needs: [test, test-macos]
++   needs: [test]
+```
+
+**理由**：`macos-15-intel` 是**另一个资源池**（调查 Agent 实测历史 30 次 0 取消），
+却因为 `needs` 含 `test-macos` 陪着 arm64 一起等 —— 一挂全挂。
+
+`release` 的 `needs` **不动**（仍 7 项含 `test-macos`）+ `!cancelled()` 保留，
+发版门禁不放松。
+
+### 结果
+
+run #56（`workflow_dispatch`）：**8 个 job 全 success**，
+5 个 artifact 全部产出（含 macos-arm64 42.2 MB / macos-x64 45.3 MB）。
+
+随后 `build/backfill_macos.py` 完成补齐：
+1. 下载两个 macOS artifact
+2. 解出 `BackupStudio-1.1.1-arm64.dmg` (45,198,455 B) / `-x64.dmg` (48,542,400 B)
+3. 上传到 release
+4. **重算全部 6 个产物的 SHA256**（用 GitHub asset digest，避免重复下载）
+5. 覆盖 `SHA256SUMS.txt`（578 B / 6 行）
+6. 更新 body，去掉 macOS 缺失告警
+
+### 一个方法论收获
+
+**「一挂全挂」是可以消除的**。原来的依赖图里，
+一个池子的容量问题会让三个 job（arm64 dmg / x64 dmg / release）全部失败。
+把「测试」与「打包」解耦后，任一池子有容量就能出对应产物。
+
+这个改动对未来的价值大于本次发版本身 —— 下次 macOS 池再抖动时，
+intel 池仍能产出 x64 dmg，不至于全部卡住。
