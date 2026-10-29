@@ -320,7 +320,15 @@ class TaskStore:
 
     def _save_locked(self) -> None:
         """真正的保存逻辑（调用方必须已持有跨进程锁）。"""
-        # 加载曾失败且原文件仍在：先保全迁移，禁绝不覆盖（防数据丢失链）
+        # 加载曾失败且原文件仍在：先保全迁移，**再从保全文件回读合并**（P0）。
+        #
+        # 旧实现只做 `path.replace(rescue)` 然后写自己内存里的内容 ——
+        # 而内存是空的（正是"加载失败"导致的），于是 **10 个任务只剩本次这 1 个**。
+        # 红队实测：一次瞬态 OSError（Windows 上 os.replace 与 open 的共享冲突，
+        # `save_json_atomic` 自己都为此重试 12 次，说明这个瞬态是**已知会发生的**）
+        # 就能让用户任务整库消失，且 rc=0。
+        #
+        # 保全方向（不覆写）是对的，但**保全之后必须把能读出来的都读回来**。
         if self._load_error is not None and self.path.exists():
             stamp = datetime.now().strftime("%Y%m%d%H%M%S")
             rescue = self.path.with_name(self.path.name + f".rescue-{stamp}")
@@ -331,6 +339,18 @@ class TaskStore:
                 log.error("配置读取曾失败且无法保全原文件，取消本次保存以避免覆写 %s", self.path)
                 raise
             self._load_error = None
+            # **关键：从保全文件回读，把用户原有的任务救回来**
+            try:
+                recovered = load_json(rescue, {})
+                if isinstance(recovered, dict) and isinstance(recovered.get("tasks"), list):
+                    self._merge_locked(recovered)
+                    log.warning(
+                        "已从保全文件 %s 回读并合并 %d 个任务（避免整库丢失）",
+                        rescue.name,
+                        len(recovered.get("tasks") or []),
+                    )
+            except Exception as exc:  # noqa: BLE001 - 回读失败也不能阻止保存
+                log.error("从保全文件回读失败（任务可能仍需人工从 %s 恢复）：%s", rescue.name, exc)
             self._disk_stamp = self._stat_stamp()
         else:
             # **锁内无条件重读磁盘再合并**（TOCTOU 修复，并发 Agent 验证的形状）。

@@ -295,10 +295,39 @@ def _safe_readlink(p: Path) -> str:
 
 
 def _build_matcher(patterns: Iterable[str]):
+    """构造排除匹配器。
+
+    ## 关键修复：目录被排除后，其**子文件**也必须被排除（P0，CLI Agent 实测）
+
+    `--help` 与 README 给的示例是 ``--exclude '*.tmp,node_modules'``。
+    旧实现只拿**当前条目**的 name / rel 去 fnmatch：
+
+        node_modules/skip.txt  →  name='skip.txt'  rel='node_modules/skip.txt'
+        对模式 'node_modules'  →  两个都不匹配  →  **文件仍被完整打包**
+
+    实测 6 种模式对照：``node_modules``❌ / ``node_modules*``✅ /
+    ``*node_modules*``✅ / ``**/node_modules/**``✅ / ``*/node_modules/*``❌。
+
+    也就是说**官方示例本身不生效** —— 用户照抄文档，以为排除了 node_modules，
+    实际备份包塞满 node_modules。
+
+    ## 修法：对路径的**每一个前缀**都试一遍
+
+    把 ``a/b/c.txt`` 展开成 ``a``、``a/b``、``a/b/c.txt`` 分别匹配。
+    这样 ``node_modules`` 能命中前缀 ``node_modules``，子文件自然被排除。
+    同时保留原有语义（name 匹配、rel 匹配、``**/`` 特殊处理、``re:`` 正则）。
+    """
     import fnmatch
     import re
 
-    pats = [p.strip().replace("\\", "/") for p in patterns if p and p.strip()]
+    # **`re:` 模式不能做反斜杠→斜杠转换**（P0）：正则里的 `\.` `\d` `\s` 都是
+    # 有意义转义，被替换成 `/.` `/d` 后正则就废了。实测 `re:\.log$` → `re:/.log$`
+    # → 永不匹配。只对普通 glob 做 Windows 路径分隔符归一。
+    pats = [
+        (p.strip() if p.strip().startswith("re:") else p.strip().replace("\\", "/"))
+        for p in patterns
+        if p and p.strip()
+    ]
     regexes = []
     for p in pats:
         if p.startswith("re:"):
@@ -307,18 +336,56 @@ def _build_matcher(patterns: Iterable[str]):
             except re.error:
                 continue
 
+    def _hit(prefix: str, pattern: str) -> bool:
+        """单个前缀是否命中单个模式。
+
+        除了「整个前缀匹配」，还支持**路径中任一段**匹配 —— 这是
+        `node_modules` 这种「纯目录名」模式能排除任意深度的关键：
+        `a/b/node_modules` 的末段是 `node_modules`，fnmatch 整体比会 False，
+        但按段比就命中。用户写 `--exclude node_modules` 的意图正是这个。
+        """
+        if fnmatch.fnmatchcase(prefix, pattern):
+            return True
+        # 模式里没有 `/` → 按路径段逐个比（任一段匹配即排除）
+        if "/" not in pattern:
+            for seg in prefix.split("/"):
+                if seg and fnmatch.fnmatchcase(seg, pattern):
+                    return True
+        if pattern.startswith("**/") and fnmatch.fnmatchcase(prefix, pattern[3:]):
+            return True
+        # `dir/**` 应排除 dir 本身及全部后裔
+        if pattern.endswith("/**") and fnmatch.fnmatchcase(prefix, pattern[:-3]):
+            return True
+        if pattern.endswith("/*") and fnmatch.fnmatchcase(prefix, pattern[:-2]):
+            return True
+        return False
+
     def match(name: str, rel: str) -> bool:
         rel_norm = rel.replace("\\", "/")
+        if not rel_norm and not name:
+            return False
+        # 正则先判（`re:` 模式直接搜 rel / name）
         for rgx in regexes:
             if rgx.search(rel_norm) or rgx.search(name):
                 return True
+
+        # 候选前缀：相对路径的**各级祖先**（含最深一级目录）+ 完整路径 + 文件名
+        # 例 `a/b/node_modules/y.js` →
+        #   ['a', 'a/b', 'a/b/node_modules', 'a/b/node_modules/y.js', 'y.js']
+        prefixes: list[str] = []
+        if rel_norm:
+            parts = rel_norm.split("/")
+            for i in range(1, len(parts) + 1):
+                prefixes.append("/".join(parts[:i]))
+        if name:
+            prefixes.append(name)
+
         for p in pats:
             if p.startswith("re:"):
                 continue
-            if fnmatch.fnmatchcase(name, p) or fnmatch.fnmatchcase(rel_norm, p):
-                return True
-            if p.startswith("**/") and fnmatch.fnmatchcase(rel_norm, p[3:]):
-                return True
+            for pref in prefixes:
+                if pref and _hit(pref, p):
+                    return True
         return False
 
     return match
@@ -720,7 +787,18 @@ class TarStreamCompressor:
         self._warnings: list[str] = []
         self.notes: list[str] = []
         self.codec = spec.fmt.split(".", 1)[1] if "." in spec.fmt else ""
-        self._raw = open(dest_path, "wb")
+        # **必须写到 `.bs-tmp-<pid>` 事务名，不能直接写最终文件名**（P0，红队 F3）。
+        #
+        # 直接写最终名的两个后果：
+        #  1. 强杀后残包**文件名完全正常**地躺在备份目录里，而
+        #     `sweep_orphans` 只认 `.bs-tmp-` / `bs-stage-` 前缀 → 永远清不掉，
+        #     保留策略也不回收（它只处理有清单的包）→ 永久占盘。
+        #  2. 那个残包是**截断的**，而裸 tar 边界截断后 `verify_archive` 会误判
+        #     `passed`（红队 F1）→ 用户以为有备份，实际尾部文件全丢。
+        #
+        # 与 `ExternalCompressor` 统一（它早已用 `.bs-tmp-<pid>`）。
+        self._tmp_dest = dest_path.with_name(f"{dest_path.name}.bs-tmp-{os.getpid()}")
+        self._raw = open(self._tmp_dest, "wb")
         self._proc: subprocess.Popen | None = None
         self._cancel: Callable[[], bool] | None = None
         # **必须在实例上初始化**：类体里的 `skipped_busy: list[str] = []`
@@ -829,6 +907,19 @@ class TarStreamCompressor:
                 self._proc.wait(timeout=30)
         with contextlib.suppress(Exception):
             self._raw.close()
+        # 事务性落地：临时名 → 最终名（P0，红队 F3）。
+        # 只有走到这里（全部数据写完、流已正确收尾）才改名，
+        # 强杀/异常时 `.bs-tmp-<pid>` 会被 `sweep_orphans` 认出来并清掉。
+        tmp = getattr(self, "_tmp_dest", None)
+        if tmp is not None and tmp.exists():
+            try:
+                os.replace(tmp, self.dest)
+            except OSError as exc:
+                raise CompressionError(
+                    f"tar 产物落地失败（{tmp.name} → {self.dest.name}）：{exc}",
+                    backend=self.name,
+                    fix="检查目标目录是否有写权限，或杀毒软件是否锁住了文件",
+                ) from exc
 
     def abort(self) -> None:
         with contextlib.suppress(Exception):
@@ -840,8 +931,11 @@ class TarStreamCompressor:
         if self._proc is not None and self._proc.poll() is None:
             with contextlib.suppress(Exception):
                 self._proc.kill()
-        with contextlib.suppress(OSError):
-            self.dest.unlink()
+        # 清理临时产物（不要留下半截 `.bs-tmp-<pid>`）
+        for p in (getattr(self, "_tmp_dest", None), self.dest):
+            if p is not None:
+                with contextlib.suppress(OSError):
+                    Path(p).unlink()
 
     def split_volumes(self) -> None:
         """通用分卷：整包生成后切成 ``.partNN``（7-Zip 执行失败时会退回这里）。"""
