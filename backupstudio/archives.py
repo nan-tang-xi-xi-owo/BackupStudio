@@ -24,6 +24,7 @@ import io
 import lzma
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -44,7 +45,7 @@ except Exception:  # pragma: no cover
     py7zr = None
 
 from .platform_info import get_platform_info
-from .staging import make_staging_dir, same_volume
+from .staging import force_rmtree, make_staging_dir, same_volume
 from .tools import find_7z, find_rar, probe_unrar_trial
 
 # --------------------------------------------------------------------------
@@ -157,6 +158,10 @@ class ArchiveResult:
     dirs: int = 0
     source_bytes: int = 0
     skipped: int = 0
+    #: 因「被占用 / 无权限」被跳过的条目（归档内名 + 原因）。
+    #: 非空时 engine 会把任务标成 ``partial`` 而不是 ``success``
+    #: （用户测试 P0：Excel/PSD 打开的文件被静默跳过却报成功）。
+    skipped_busy: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     backend: str = ""
     encrypted: bool = False
@@ -343,6 +348,35 @@ def _auto_skip(path: Path) -> bool:
     return False
 
 
+#: 最近一次 `plan_items` 跳过的「非普通文件」（FIFO/设备/socket）。
+#: 这些无法备份（FIFO 会永久阻塞），必须让上层能告知用户。
+_LAST_SPECIAL_SKIPPED: list[str] = []
+
+
+def _notify_skipped(backend, reason: str) -> None:
+    """把「这个条目没能写进包」登记到后端的 skipped_busy。
+
+    为什么需要它（红队 F2/F4/F5，都是 P0 级假绿）：
+    历史上「跳过一个文件」有**三条互不相通的记账路径**：
+      * 后端自己 catch OSError → 只有 ExternalCompressor/TarStreamCompressor 会登记
+      * create_archive 的 except → 只 append 到 result.errors
+      * plan_items 的 stat/scandir 失败 → 只有一个 skipped 计数器，**从不影响 status**
+    而 engine 的 partial 判定**只看 skipped_busy** → 后两条都是静默丢数据却报 success。
+
+    这个函数统一收口：无论哪个后端（包括没有 skipped_busy 属性的内置 zip/py7zr），
+    都用 setattr 补一个列表再登记，保证「丢了一个文件」一定能反映到 status。
+    """
+    try:
+        bucket = getattr(backend, "skipped_busy", None)
+        if bucket is None:
+            bucket = []
+            setattr(backend, "skipped_busy", bucket)
+        if reason not in bucket:
+            bucket.append(reason)
+    except Exception:  # noqa: BLE001 - 记账失败不能影响备份主流程
+        pass
+
+
 def plan_items(
     sources: Iterable[Item],
     exclude_globs: Iterable[str] = (),
@@ -370,6 +404,7 @@ def plan_items(
 
     items: list[Item] = []
     skipped = 0
+    special_skipped: list[str] = []
     for root in sources:
         src = Path(root.source)
         if not src.exists() and not src.is_symlink():
@@ -389,23 +424,55 @@ def plan_items(
             except OSError:
                 skipped += 1
                 continue
+            # 只处理**普通文件 / 目录 / 符号链接**，其余类型一律跳过（S0）。
+            #
+            # 元数据专家实测：FIFO 让**三个后端全部永久挂死**（faulthandler 栈停在
+            # `add_file` 的 `open()` / `read()`）。原因是 FIFO 的 `stat()` 正常返回、
+            # `st_size` 是 0，于是被当成普通文件放行；随后 `open(path,"rb")` 会
+            # **阻塞到有写端出现**——备份进程就此挂住，用户只能强杀。
+            # 同类还有字符/块设备（`/dev/zero` 会把备份撑爆）、socket。
+            #
+            # 这些都不是「可备份的数据」，跳过是唯一正确处理。
+            if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode)):
+                skipped += 1
+                special_skipped.append(str(path))
+                continue
             size = 0 if (is_dir or is_link) else st.st_size
             collected.append(Item(path, arc, size, st.st_mtime, is_dir, is_link, target))
 
-        # 目录字节数 = 子树内文件字节之和，让进度条按真实数据量推进
+        # 目录条目保留「子树内文件字节之和」（供进度条与既有契约使用），
+        # 但**每一级祖先只加自己的直接子树，不重复累加**。
+        #
+        # 旧实现那层 `while True` 让每个文件向**每一级祖先（含源根）各贡献一次**，
+        # 于是把目录与文件一起求和会重复计数 → 虚高公式 `倍数 = 目录层数 + 2`：
+        #   文件在源根下 → 2×；+1 层 → 3×；+4 层 → 6×；+5 层 → 7×
+        #
+        # 现在目录 size 只用于「进度条估算」，而 `source_bytes` 与 `engine` 的
+        # 空间预检**只累加非目录条目**，两者不再互相污染。
         dir_bytes: dict[str, int] = {}
+        # 1) 先把所有**目录**登记为 0，保证每个目录都存在于字典里
         for it in collected:
-            if it.size and "/" in it.arcname:
-                parent = it.arcname.rsplit("/", 1)[0]
-                while True:
+            if it.is_dir:
+                dir_bytes.setdefault(it.arcname, 0)
+        # 2) 每个文件的字节记到它的**直接父目录**
+        for it in collected:
+            if it.size and not it.is_dir:
+                arc = it.arcname
+                parent = arc.rsplit("/", 1)[0] if "/" in arc else None
+                if parent is not None:
                     dir_bytes[parent] = dir_bytes.get(parent, 0) + it.size
-                    if "/" not in parent:
-                        break
-                    parent = parent.rsplit("/", 1)[0]
+        # 3) 自底向上：把每个子目录的累计值加到它的父目录（深者先处理）
+        for arc in sorted(dir_bytes, key=lambda s: s.count("/"), reverse=True):
+            if "/" in arc:
+                parent = arc.rsplit("/", 1)[0]
+                dir_bytes[parent] = dir_bytes.get(parent, 0) + dir_bytes[arc]
         for it in collected:
             if it.is_dir and it.arcname in dir_bytes:
                 it.size = dir_bytes[it.arcname]
             items.append(it)
+    # 把「非普通文件被跳过」的清单暴露给上层（让用户知道 FIFO/设备文件没进包）
+    if special_skipped:
+        _LAST_SPECIAL_SKIPPED[:] = special_skipped
     return items, skipped
 
 
@@ -549,6 +616,8 @@ class ZipCompressor:
     name = "python-zipfile"
 
     def __init__(self, dest_path: Path, spec: ArchiveSpec, progress: Progress) -> None:
+
+        self.skipped_busy: list[str] = []  # 被占用/无权限的条目（P0：不能假绿）
         self.spec = spec
         self.progress = progress
         self.dest = dest_path
@@ -601,6 +670,14 @@ class ZipCompressor:
     def add_file(self, src: Path, arcname: str, mtime: float | None = None) -> int:
         self._check_cancel()
         st = src.stat()
+        # 先探测可读性：失败则登记并跳过（P0：不能假绿）
+        try:
+            _probe = open(src, "rb")
+        except PermissionError:
+            self.skipped_busy.append(f"{arcname}（被占用或无权限）")
+            return 0
+        else:
+            _probe.close()
         with open(src, "rb") as fh, self._zip.open(self._info(arcname, mtime or st.st_mtime, False), "w") as out:
             while True:
                 self._check_cancel()
@@ -646,6 +723,11 @@ class TarStreamCompressor:
         self._raw = open(dest_path, "wb")
         self._proc: subprocess.Popen | None = None
         self._cancel: Callable[[], bool] | None = None
+        # **必须在实例上初始化**：类体里的 `skipped_busy: list[str] = []`
+        # 是类级别共享列表，所有实例共用同一个对象 → 上一个备份跳过的文件
+        # 会累加到后续所有备份（实测导致 9 个测试失败；GUI/daemon 常驻进程里
+        # 会让第 2 个任务误报 partial）。
+        self.skipped_busy = []
         self._comp = self._make_compressor(self.codec)
         self._tar = tarfile.open(fileobj=self._comp, mode="w|", format=tarfile.PAX_FORMAT, bufsize=1 << 20)
 
@@ -696,13 +778,34 @@ class TarStreamCompressor:
         ti.linkname = target
         self._tar.addfile(ti)
 
+    #: 因「被占用 / 无权限」被跳过的条目（与 ExternalCompressor 同契约）。
+    #: 用户测试 P0 回归：早前只给 ExternalCompressor 加了 skipped_busy，
+    #: tar/tar.gz/tar.bz2/tar.xz/tar.zst **全都没加** → 被占用文件静默丢失，
+    #: 仍报 status=success。实测（4 文件锁 1 个）：包内只有 3 个，errors=[]。
+    skipped_busy: list[str] = []
+
     def add_file(self, src: Path, arcname: str, mtime: float | None = None) -> int:
         if src.is_symlink():
             self.add_symlink(arcname, _safe_readlink(src), mtime)
             return 0
         # 先开文件后写头（审查 E1-1.4）：若 open 失败而头已写出，tar 流会
         # 永久错位（后续所有条目都读不出来）；顺序反了就只是一次可跳过的条目。
-        fh = open(src, "rb")
+        #
+        # 被占用/无权限时**登记到 skipped_busy 并跳过**（与 ExternalCompressor 同契约）：
+        # 让其余文件照常备份，上层据此把任务标 partial 并列出清单——不再假绿。
+        #
+        # **必须先排除「目录被当成文件」**：Windows 上 `open(目录, "rb")` 抛的正是
+        # `PermissionError`（EACCES），与「文件被 Excel 独占」同一个异常类型，
+        # 只按异常类型分不开。所以先 stat 判断是不是目录 —— 目录属于**调用方错误**，
+        # 必须让异常冒泡（测试 test_tar_open_failure_does_not_corrupt_stream
+        # 明确要求它抛出，且该断言同时验证 tar 流不错位）。
+        try:
+            fh = open(src, "rb")
+        except PermissionError:
+            if src.is_dir():
+                raise  # 目录不该走 add_file：交给调用方记错误，别当"被占用"吞掉
+            self.skipped_busy.append(f"{arcname}（被占用或无权限）")
+            return 0
         try:
             st = os.fstat(fh.fileno())
             ti = self._ti(arcname, mtime or st.st_mtime, (st.st_mode & 0o7777) or 0o644, tarfile.REGTYPE, st.st_size)
@@ -840,6 +943,8 @@ class ExternalCompressor:
         self.progress = progress
         self._warnings: list[str] = []
         self.notes: list[str] = []
+        # 同上：类体里的 skipped_busy 是共享列表，必须在实例上重建
+        self.skipped_busy = []
         self.volumes: list[VolumeInfo] = []
         # 暂存目录放在目标同卷，规避 7z 跨卷写入失败并节省一次整包复制
         self.tmpdir = make_staging_dir(dest_path.parent)
@@ -878,16 +983,53 @@ class ExternalCompressor:
         ti.mode = 0o777
         self._tar.addfile(ti)
 
+    #: 记录「因被占用而跳过」的文件（供上层汇总到 warnings/errors）
+    skipped_busy: list[str] = []
+
     def add_file(self, src: Path, arcname: str, mtime: float | None = None) -> int:
+        """把文件写进 tar 暂存流。
+
+        **必须在写 TarInfo 头之前确认文件可读**（用户测试 P0）：
+
+        ``_chunks_of()`` 是惰性迭代器，``tarfile.addfile()`` 会**先写 512 字节头**
+        再消费它。若 ``open(src)`` 此时抛 ``PermissionError``（文件被 Excel/PSD/IDE
+        独占），头已经写进流里、而数据一个字节都没写，**整条 tar 流从此错位**：
+        后续所有条目偏移，解包后表现为「中间文件名配下一个文件的内容」+
+        「后面若干文件凭空消失」，而外层 ``status=success / verification=passed``。
+
+        实测（锁住 5 个文件中的第 3 个，修复前）：产物只剩 3 条，
+        file3 内容是 ``b'src/file4.txt\\x00...'``（下一个文件的名字），
+        file4/file5 完全消失。
+
+        **修法**：先 ``open()`` 试探。
+        * 成功 → 用同一个句柄写数据（不留 TOCTOU 窗口）；
+        * 失败（被占用/无权限）→ **跳过该文件并登记到 ``skipped_busy``**，
+          让其余文件照常备份。上层据此把任务标为 ``partial`` 并列出缺失清单
+          ——既不会假绿，也不会因为一个打开着的 Excel 让整次备份白跑。
+        """
         if self._cancel is not None and self._cancel():
             raise ArchiveCancelled()
         if src.is_symlink():
             self.add_symlink(arcname, _safe_readlink(src), mtime)
             return 0
-        st = src.stat()
-        ti = self._ti(arcname, mtime or st.st_mtime, st.st_size)
-        ti.mode = st.st_mode & 0o7777
-        self._tar.addfile(ti, _Reader(_chunks_of(src, self.progress, cancel=self._cancel)))
+        try:
+            st = src.stat()
+        except OSError as exc:
+            self.skipped_busy.append(f"{arcname}（无法读取属性：{type(exc).__name__}）")
+            return 0
+        # 探测可读性：失败必须在写 tar 头之前发生
+        try:
+            probe = open(src, "rb")
+        except OSError:
+            self.skipped_busy.append(f"{arcname}（被占用或无权限）")
+            return 0
+        try:
+            ti = self._ti(arcname, mtime or st.st_mtime, st.st_size)
+            ti.mode = st.st_mode & 0o7777
+            self._tar.addfile(ti, _Reader(_chunks_of_fh(probe, self.progress, cancel=self._cancel)))
+        finally:
+            with contextlib.suppress(OSError):
+                probe.close()
         return st.st_size
 
     def add_bytes(self, data: bytes, arcname: str, mtime: float | None = None) -> int:
@@ -1034,11 +1176,17 @@ class ExternalCompressor:
         若 ``out_path`` 是相对路径，产物会写进 ``src_dir`` **内部**，随后 ``_commit()``
         在最终路径上找不到文件 → 抛 CompressionError → 上层 ``force`` 回退到内置引擎，
         但记录里的 ``backend`` 仍写 ``7z:7za.exe``（账实不符，审查 D）。
+
+        **必须加 ``-snl``（S0，元数据专家实测）**：不加时 7-Zip 会把符号链接
+        **解引用成内容副本**；更糟的是**断链让整次备份直接失败**（rc=1，产物不生成）。
+        元数据专家抓到了产品喂给 7z 的中间 staging.tar，确认链接在 tar 里是对的
+        （``type="2", issym=True, linkname="target.txt"``）—— 问题全在这一步。
+        Linux 上断链极常见（包管理器残留 / 临时目录被清），从 tar 换 7z 就突然失败。
         """
         if self._cancel is not None and self._cancel():
             raise ArchiveCancelled()
         out_path = Path(out_path).resolve()
-        argv = [self.exe, "a", *self._args(), *(extra_args or []), str(out_path), "."]
+        argv = [self.exe, "a", "-snl", *self._args(), *(extra_args or []), str(out_path), "."]
         self._run(argv, cwd=src_dir)
 
     def _commit(self, tmp_dest: Path) -> None:
@@ -1058,6 +1206,14 @@ class ExternalCompressor:
     def close(self) -> None:
         try:
             tar_path = self._finish_staging()
+            # 被占用而跳过的文件：写进 warnings，让上层能如实告知用户
+            # （不能静默吞掉——用户会以为全部备份成功）
+            if self.skipped_busy:
+                self._warnings.append(
+                    f"有 {len(self.skipped_busy)} 个文件因被占用/无权限而未备份："
+                    + "；".join(self.skipped_busy[:5])
+                    + ("…" if len(self.skipped_busy) > 5 else "")
+                )
             self.progress.describe("compress")
             src_dir = self._unpack_staging(tar_path)
             mode = self.spec.multivolume
@@ -1067,7 +1223,7 @@ class ExternalCompressor:
                 self._run_single(src_dir)
             # 通用分卷：由 create_archive 在收尾时调用 split_volumes
         finally:
-            shutil.rmtree(self.tmpdir, ignore_errors=True)
+            force_rmtree(self.tmpdir)
 
     def abort(self) -> None:
         with contextlib.suppress(Exception):
@@ -1077,7 +1233,7 @@ class ExternalCompressor:
         if self._proc is not None and self._proc.poll() is None:
             with contextlib.suppress(Exception):
                 self._proc.kill()
-        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        force_rmtree(self.tmpdir)
 
     def _with_scc(self, argv: list[str]) -> list[str]:
         """在子命令后插入 `-sccUTF-8`（仅 7-Zip 系可执行文件）。
@@ -1650,6 +1806,19 @@ def create_archive(
             fix="改用 7z 格式，或使用纯英文数字密码",
         )
 
+    # 密码里的双引号会被 7-Zip 当命令行引号语法消化（用户测试 + 审计双重确认）：
+    # `-p{password}` 直接拼进 argv，7za 侧实际密码串与字面量不一致，
+    # 导致**产出的加密包在另一套工具里用同一密码打不开**——而记录显示
+    # status=success / verification=passed（py7zr 侧能开，7za 侧不能）。
+    # 这是「备份实质不可恢复」，必须在创建前拦截。
+    # 同类危险字符：`"`（引号）与换行（argv 无法表达）。
+    if spec.password and any(ch in spec.password for ch in ('"', "\n", "\r")):
+        raise PasswordRequired(
+            "密码不能包含双引号或换行符（7-Zip 命令行解析会吃掉它们，"
+            "导致产出的加密包用同一密码打不开）",
+            fix='请改用不含 `"` 和换行的密码（如把引号换成单引号或去掉）',
+        )
+
     choice = backend_for_format(fmt, force=spec.force)
     if choice.factory is None:  # 理论上不会发生
         raise BackendUnavailable("未选择到可用后端")
@@ -1665,7 +1834,9 @@ def create_archive(
     item_list = list(sources)
     files = sum(1 for it in item_list if not it.is_dir)
     dirs = sum(1 for it in item_list if it.is_dir)
-    source_bytes = sum(it.size for it in item_list)
+    # 只累加非目录条目：目录 size 是子树合计，加进来会重复计数
+    # （实测虚高 目录层数+2 倍，污染空间预检与压缩比）
+    source_bytes = sum(it.size for it in item_list if not it.is_dir)
 
     dest = Path(spec.dest_path)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1770,7 +1941,13 @@ def create_archive(
                 elif it.source.exists():
                     backend.add_file(it.source, it.arcname, it.mtime)
                 else:
+                    # 源文件在「扫描时存在 → 写入时消失」（红队 F2，P0）。
+                    # 旧实现只 `result.errors.append`，而 engine 只把 errors 并进
+                    # warnings、`partial` 判定只看 `skipped_busy` → 实测
+                    # `status=success / passed / committed / errors=[]`，文件根本不在包里。
+                    # 登记到 skipped_busy 才会让任务降级成 partial。
                     result.errors.append(f"源文件不存在：{it.source}")
+                    _notify_skipped(backend, f"{it.arcname}（扫描后消失）")
             except ArchiveCancelled:
                 raise
             except (OSError, PermissionError) as exc:
@@ -1808,6 +1985,14 @@ def create_archive(
             backend.close()
         if cancel is not None and cancel():
             raise ArchiveCancelled()
+
+        # 有文件因「被占用 / 无权限」被跳过时，把清单带到 result 上，
+        # 让 engine 把任务标成 partial（而不是假绿 success）。用户测试 P0：
+        # Excel/PSD 打开着的文件被跳过、其余照常备份，旧实现仍报「成功/校验通过」。
+        _busy = list(getattr(backend, "skipped_busy", []) or [])
+        if _busy:
+            result.skipped_busy = _busy
+            result.skipped = max(result.skipped, len(_busy))
 
         splitter = getattr(backend, "split_volumes", None)
         if mode != "native" and spec.volume_size and callable(splitter):

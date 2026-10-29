@@ -97,6 +97,8 @@ class Py7zrCompressor:
     name = "py7zr"
 
     def __init__(self, dest_path: Path, spec, progress) -> None:  # noqa: ANN001
+
+        self.skipped_busy: list[str] = []  # 被占用/无权限的条目（P0：不能假绿）
         if py7zr is None:
             raise RuntimeError("py7zr 未安装：pip install py7zr")
         self.dest = Path(dest_path)
@@ -231,6 +233,14 @@ class Py7zrCompressor:
         st = src.stat()
         if self._zip is not None:
             self._check()
+            # 先探测可读性：失败则登记并跳过（P0：不能假绿）
+            try:
+                _probe = open(src, "rb")
+            except PermissionError:
+                self.skipped_busy.append(f"{arcname}（被占用或无权限）")
+                return 0
+            else:
+                _probe.close()
             with open(src, "rb") as fh, self._zip.open(self._zip_info(arcname, mtime or st.st_mtime, False), "w") as out:
                 while True:
                     self._check()
@@ -320,6 +330,8 @@ class ZipFileCompressor:
     name = "zipfile-builtin"
 
     def __init__(self, dest_path: Path, spec, progress) -> None:  # noqa: ANN001
+
+        self.skipped_busy: list[str] = []  # 被占用/无权限的条目（P0：不能假绿）
         import dataclasses
         import zipfile
 
@@ -390,6 +402,14 @@ class ZipFileCompressor:
 
         self._check()
         st = src.stat()
+        # 先探测可读性：失败则登记并跳过（P0：不能假绿）
+        try:
+            _probe = open(src, "rb")
+        except PermissionError:
+            self.skipped_busy.append(f"{arcname}（被占用或无权限）")
+            return 0
+        else:
+            _probe.close()
         with open(src, "rb") as fh, self._zip.open(self._info(arcname, mtime or st.st_mtime, False), "w") as out:
             while True:
                 self._check()

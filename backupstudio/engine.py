@@ -10,6 +10,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import threading
@@ -518,6 +519,26 @@ def find_backup_blobs(task: BackupTask) -> list[CleanupItem]:
     from .util import sanitize_component
 
     task_prefix = sanitize_component(task.name or "").lower()
+    # 同目录下**其它任务**的名字：用来排除「前缀相同但其实是别人」的包
+    # （P0：ackup 不能吞 ackup_photos_2026…。仅靠名字形状无法区分，
+    #  必须知道「另一个任务叫什么」才能判准。）
+    other_prefixes: tuple[str, ...] = ()
+    try:
+        from .paths import config_dir
+        from .store import TaskStore
+
+        _all = TaskStore(config_dir() / "tasks.json").list_tasks()
+        other_prefixes = tuple(
+            sorted(
+                {
+                    sanitize_component(t.name or "").lower()
+                    for t in _all
+                    if t.id != task.id and t.name
+                }
+            )
+        )
+    except Exception:  # noqa: BLE001 - 拿不到任务列表就退化为「只看自己前缀」
+        other_prefixes = ()
     blobs: list[CleanupItem] = []
     for g in collect_groups(folder, ext, fmts=all_exts):
         # 只保留与该任务格式匹配的组（后缀启发式组）；manifest 组按 fmt 字段过滤
@@ -528,7 +549,7 @@ def find_backup_blobs(task: BackupTask) -> list[CleanupItem]:
             if g.manifest.task_id:
                 if g.manifest.task_id != task.id:
                     continue
-            elif not _group_belongs_to_name(g, task_prefix):
+            elif not _group_belongs_to_name(g, task_prefix, other_prefixes):
                 continue
             mtime = g.committed_at or (min(f.stat().st_mtime for f in g.files) if g.files else 0.0)
         else:
@@ -536,7 +557,7 @@ def find_backup_blobs(task: BackupTask) -> list[CleanupItem]:
                 continue
             # 无清单旧包：按归档名前缀归属（`{name}_{datetime}` 模板保证前缀可判；
             # 同秒重名的 `_N` 后缀与分卷 `.partNN` 都在前缀之后，天然满足）
-            if task_prefix and not _group_belongs_to_name(g, task_prefix):
+            if task_prefix and not _group_belongs_to_name(g, task_prefix, other_prefixes):
                 continue
             mtime = g.committed_at
         blobs.append(
@@ -557,13 +578,60 @@ def find_backup_blobs(task: BackupTask) -> list[CleanupItem]:
     return sorted(blobs, key=lambda b: b.mtime)
 
 
-def _group_belongs_to_name(g, task_prefix: str) -> bool:
-    """归档组是否属于该任务（按主文件名前缀判断）。
+#: 产物主名尾部的时间戳形状：``YYYYMMDD_HHMMSS``（可选 ``_序号`` 去重后缀）。
+#: `_group_belongs_to_name` 用它做**精确**归属判定，而不是裸前缀匹配。
+_STAMP_RE = re.compile(r"^_(\d{8}_\d{6})(?:_\d+)?$")
 
-    前缀匹配用组内文件的主名（collect_groups 已去掉分卷/重名后缀）；任务名
-    互为前缀（Task / TaskA）时要求前缀后紧跟分隔符 `_`，避免 Task 任务误认领
-    TaskA_2026… 的包。
+
+def _group_belongs_to_name(g, task_prefix: str, other_prefixes: tuple[str, ...] = ()) -> bool:
+    """归档组是否属于该任务。
+
+    ## 为什么不能用裸前缀 + `_` 判定（P0，保留策略 Agent 实测）
+
+    旧实现：
+
+        base == prefix or (base.startswith(prefix) and base[len(prefix)] == "_")
+
+    对 `Task` / `TaskA` 有效（次字符是 `A`），但对**下划线分隔的多段名无效**：
+
+        task_prefix = "backup"
+        base        = "backup_photos_20261029_120000"
+        startswith("backup") → True
+        base[6]              → "_"     ← 命中！
+
+    实测后果：`backup` 任务跑一次保留策略，就按自己的配额把 `backup_photos`
+    的包（**包括它唯一的一份**）删掉，`backup_photos` 归零。
+
+    触发窗口正是**升级用户**：`task_id` 是 1.1 才引入的清单字段，历史清单没有，
+    只能靠名字判定归属。两个任务共用备份目录 + 名字有公共前缀即命中。
+
+    ## 修法：前缀之后**不能是「另一个任务的名字 + 分隔符」**
+
+    产物名恒为 ``<任务名>_<后缀>``。真正要排除的是「剩余部分其实是**别的任务名**
+    的开头」，这才是 `backup` 吞掉 `backup_photos_2026…` 的机理。
+
+    因此判定改为：
+      1. 剩余部分 == ``_YYYYMMDD_HHMMSS[_序号]`` → **归属**（产品标准形状）
+      2. 剩余部分的**第一段**（到下一个 ``_`` 为止）全部是数字 → **归属**
+         （``mt`` + ``_legacy0`` 例外？不 —— 见下）
+      3. 否则 → **不归属**（`backup` 对 `backup_photos_…`：首段 `photos` 非数字）
+
+    但 ``mt_legacy0.zip`` 相对任务 ``mt`` 的剩余是 ``_legacy0``，首段 ``legacy0``
+    也不是数字 —— 而它**确实是 ``mt`` 任务的旧包**（测试与升级用户都依赖这个）。
+
+    → 所以仅靠名字无法区分 ``mt`` 的 ``mt_legacy0`` 与 ``backup`` 的
+      ``backup_photos_2026``。二者形状相同，**信息不足**。
+
+    ## 最终判据：**用已知任务名做排除**（信息最全，且不误伤）
+
+    调用方（`find_backup_blobs`）能拿到「同一目录下所有任务的 name」。
+    判据改为：剩余部分若以**另一个任务名**开头（后接 ``_`` 或结束），
+    且那个名字比本任务名更长 → 判为别人的包。
     """
+    return _belongs(g, task_prefix, other_prefixes)
+
+
+def _belongs(g, task_prefix: str, others: tuple[str, ...]) -> bool:  # noqa: ANN001
     if not task_prefix:
         return True
     for f in g.files:
@@ -573,8 +641,25 @@ def _group_belongs_to_name(g, task_prefix: str) -> bool:
             if i >= 0:
                 base = base[:i]
                 break
-        if base == task_prefix or (base.startswith(task_prefix) and base[len(task_prefix) : len(task_prefix) + 1] == "_"):
-            return True
+        if not base.startswith(task_prefix):
+            continue
+        rest = base[len(task_prefix) :]
+        if not rest:
+            continue
+        # 若剩余部分其实是**另一个任务的完整名**开头 → 别人的包（P0 修复核心）
+        stolen = False
+        for other in others:
+            if not other or other == task_prefix or len(other) <= len(task_prefix):
+                continue
+            if not other.startswith(task_prefix):
+                continue
+            tail = other[len(task_prefix) :]
+            if rest == tail or rest.startswith(tail + "_"):
+                stolen = True
+                break
+        if stolen:
+            continue
+        return True
     return False
 
 
@@ -948,7 +1033,12 @@ def sweep_orphans(destinations: Iterable[Path | str]) -> list[Path]:
                 continue  # 原则 2：还可能是活的，或没到兜底年龄
             try:
                 if entry.is_dir() and not entry.is_symlink():
-                    shutil.rmtree(entry)
+                    # force_rmtree 而非裸 rmtree：暂存目录里可能有只读文件，
+                    # 裸 rmtree 遇 WinError 5 会静默失败 → 明文永久残留
+                    # （用户测试 P0：源含只读文件时，加密备份旁永久留明文副本）
+                    from .staging import force_rmtree
+
+                    force_rmtree(entry)
                 else:
                     entry.unlink()
                 removed.append(entry)
@@ -1229,7 +1319,8 @@ class TaskEngine:
         # 3b. 空间检查（审查 E1-1.8/D-f6）：按后端形态估磁盘峰值——
         # 外部 7z/rar 需 源tar + 成品 两份（≈2×）；内置引擎 ≈1×；
         # 通用分卷再乘一份完整成品的余量。不足时阻止（不再只 warning）。
-        needed = sum(i.size for i in items)
+        # 只累加非目录条目：目录 size 是子树合计，加进来会重复计数
+        needed = sum(i.size for i in items if not i.is_dir)
         avail = free_space(dest_dir)
         if avail and needed:
             external = engine_choice.name.startswith(("7z:", "rar"))
@@ -1345,6 +1436,20 @@ class TaskEngine:
         record.duration = round(time.monotonic() - started, 2)
         if record.status != "failure":
             record.status = "success" if record.verification != "failed" else "failure"
+
+        # 6b. 有文件因「被占用 / 无权限」被跳过时，**不能报 success**（用户测试 P0）：
+        #     实测：Excel/PSD 打开着的文件会被跳过，其余文件正常备份，但旧实现
+        #     仍然 status=success + verification=passed。用户看到绿勾就去睡觉，
+        #     真出事时才发现那几份关键文档根本不在包里。
+        #     语义上这是「部分完成」——用 partial，并把清单留在 warnings/errors 里。
+        _busy = getattr(result, "skipped_busy", None) or []
+        if _busy and record.status == "success":
+            record.status = "partial"
+            record.errors.append(
+                f"有 {len(_busy)} 个文件未备份（被占用或无权限）："
+                + "；".join(_busy[:5])
+                + ("…" if len(_busy) > 5 else "")
+            )
 
         # 7. 保留策略（只用「是否刚生成」作保护，旧的同名包照常淘汰）
         #    仅在**本轮成功**时执行（审查 W-A1-4 c9，数据丢失级）：

@@ -214,27 +214,99 @@ def _extract_zip(archive: Path, target: Path, password: str | None = None) -> No
 
 
 def _extract_tar(archive: Path, target: Path) -> None:
+    """解 tar；遇到越界/外部链接时**跳过该成员**，不废掉整包。
+
+    ## 为什么不能整包拒绝（S0，元数据专家实测）
+
+    旧实现对任何 `issym()/islnk()` 成员都做：
+        link_target = (dest.parent / m.linkname).resolve()
+        if not _is_within(target, link_target): raise
+
+    **绝对路径的 linkname 必然越界**（`dest.parent / "/abs/path"` → `/abs/path`），
+    于是一个绝对符号链接就让**整包一个文件都解不出来**。
+
+    这在 Linux/WSL 上极其常见 —— 脚本里 `ln -s $PWD/xxx` 就是绝对链接。
+    用户实测：`extract links.tar` → 「包含指向外部的链接，已拒绝解压」→
+    连旁边无关的普通文件都没落地。
+
+    ## 修法
+
+    * 越界的**普通文件成员**（tar-slip）：仍然拒绝整包（这是真攻击，且不该静默跳过）
+    * 越界的**链接成员**：只跳过该链接，其余照解，并把跳过的清单回报给用户。
+
+    理由：链接本身不写入数据，跳过它不会产生「半截文件」；而整包拒绝会让
+    用户拿不到本来完好的数据 —— 安全收益为零、可用性损失极大。
+    """
     with tarfile.open(archive, "r:*") as tf:
         members = []
+        dropped_links: list[str] = []
         for m in tf.getmembers():
             dest = target / m.name
             if not _is_within(target, dest):
                 raise ExtractionError(f"压缩包内包含不安全路径，已拒绝解压：{m.name}")
             if m.issym() or m.islnk():
-                link_target = (dest.parent / m.linkname).resolve()
+                raw = m.linkname
+                # 绝对链接：按「它指向包外」处理，跳过但不算攻击
+                if raw.startswith(("/", "\\")) or (len(raw) > 1 and raw[1] == ":"):
+                    dropped_links.append(f"{m.name} -> {raw}（绝对路径）")
+                    continue
+                link_target = (dest.parent / raw).resolve()
                 if not _is_within(target, link_target):
-                    raise ExtractionError(f"压缩包内包含指向外部的链接，已拒绝解压：{m.name} -> {m.linkname}")
+                    dropped_links.append(f"{m.name} -> {raw}（指向包外）")
+                    continue
             members.append(m)
         try:
             archive_size = archive.stat().st_size
         except OSError:
             archive_size = 0
         _check_bomb(archive_size, len(members), sum(m.size for m in members if m.isfile()))
-        # Python 3.12+ 支持 filter；3.14+ 默认 data 过滤器，这里显式指定更稳妥
+        if dropped_links:
+            _note_dropped_links(dropped_links)
+        # Python 3.12+ 支持 filter；3.14+ 默认 data 过滤器，这里显式指定更稳妥。
+        # 用 "tar"（=fully_trusted 的旧名语义）而非 "data"：data 会
+        # `mode &= 0o755; mode |= 0o600`，把只读位与 setuid 位强制抹掉
+        # （元数据专家实测：0444→0644、4755→0755）。越界校验收敛到 dest 内、
+        # 链接落点另行校验，安全性不依赖 data 过滤器。
         try:
-            tf.extractall(target, members=members, filter="data")  # type: ignore[arg-type]
-        except TypeError:  # pragma: no cover - 老版本 Python
+            tf.extractall(target, members=members, filter="tar")  # type: ignore[arg-type]
+        except TypeError:  # pragma: no cover - 3.10/3.11 无 filter 参数
             tf.extractall(target, members=members)
+        # 部分平台 filter="tar" 仍不还原 mode（Windows chmod 语义受限），
+        # 显式再补一遍，保证 0600/0444 这类关键位不丢。
+        _restore_tar_modes(target, members)
+
+
+def _note_dropped_links(items: list[str]) -> None:
+    """把「因指向包外而被跳过」的链接记进日志，让用户知道少了什么。"""
+    try:
+        logging.getLogger(__name__).warning(
+            "已跳过 %d 个指向包外的链接（其余文件正常解出）：%s",
+            len(items),
+            "；".join(items[:5]) + ("…" if len(items) > 5 else ""),
+        )
+    except Exception:  # noqa: BLE001 - 日志失败不影响解压
+        pass
+
+
+def _restore_tar_modes(target: Path, members: list[tarfile.TarInfo]) -> None:
+    """按 tar 头里的 mode 还原权限位（补 filter 不足）。
+
+    只处理普通文件与目录；符号链接在 Windows 上无法 chmod，静默跳过。
+    失败一律忽略：某些文件系统（FAT/exFAT/网络盘）不支持 chmod，
+    不能因此让整次恢复失败。
+    """
+    for m in members:
+        if m.issym() or m.islnk():
+            continue
+        mode = m.mode & 0o7777
+        if not mode:
+            continue
+        p = target / m.name
+        try:
+            if p.exists():
+                os.chmod(p, mode)
+        except (OSError, NotImplementedError):
+            continue
 
 
 def _declared_unpacked_7z(exe: str, archive: Path, password: str | None) -> int | None:
@@ -638,7 +710,13 @@ def extract_archive(archive: Path, target: Path, password: str | None = None) ->
             escapes = _scan_escape(staging)
             if escapes:
                 raise ExtractionError(f"压缩包含指向外部的链接，已拒绝：{escapes[:3]}")
-            _merge_into(staging, target)
+            _mc: list[str] = []
+            _merge_into(staging, target, _mc)
+            if _mc:
+                logging.getLogger(__name__).warning(
+                    "解压时遇到 %d 处类型冲突，你的原有文件已改名保留：%s",
+                    len(_mc), "；".join(_mc[:5]),
+                )
             return _finish(kind)
         except ExtractionError as exc:
             return False, str(exc)
@@ -649,14 +727,39 @@ def extract_archive(archive: Path, target: Path, password: str | None = None) ->
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
-    # 7z / rar：由外部程序直接解到目标目录
+    # 7z / rar：**也必须先解到暂存目录再合并**（审计 P0）。
+    #
+    # 早期实现直接把目标目录交给外部程序（`-o{target}` / `{target}\`），
+    # 实测后果（审计用 12MiB 损坏 7z 复现）：
+    #   ① 解压到一半失败 → 半截文件永久留在用户目录里（"半包污染"）；
+    #   ② 更糟：目标里已有同名**已恢复好的文件**会被覆盖成损坏字节
+    #      （实测 movie.mkv: 28B 好文件 → 12582912B 坏字节，md5 全变），
+    #      而返回信息只说"解压失败"，不会告知目标已被改写。
+    #   对照：zip/tar 路径走暂存目录，失败时目标目录一个字节都没动。
+    #
+    # 现在统一为「解到 staging → 扫链接/越界 → 合并到 target」，与 zip/tar 同构。
+    staging = Path(tempfile.mkdtemp(prefix="bs-extract-", dir=str(target)))
     try:
-        kind = _extract_external(archive, target, password)
+        kind = _extract_external(archive, staging, password)
+        escapes = _scan_escape(staging)
+        if escapes:
+            raise ExtractionError(f"压缩包含指向外部的链接，已拒绝：{escapes[:3]}")
+        _mc: list[str] = []
+        _merge_into(staging, target, _mc)
+        if _mc:
+            logging.getLogger(__name__).warning(
+                "解压时遇到 %d 处类型冲突，你的原有文件已改名保留：%s",
+                len(_mc), "；".join(_mc[:5]),
+            )
         return _finish(kind)
     except ExtractionError as exc:
         return False, str(exc)
+    except (zipfile.BadZipFile, tarfile.TarError) as exc:
+        return False, f"压缩包损坏或格式不匹配：{exc}"
     except Exception as exc:  # noqa: BLE001
         return False, f"{type(exc).__name__}: {exc}"
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def _split_group(archive: Path) -> tuple[str, list[tuple[int, Path]], list[tuple[int, Path]]] | None:
@@ -813,20 +916,61 @@ def _join_and_extract(base: str, volumes: list[tuple[int, Path]], archive: Path,
             staging.rmdir()
 
 
-def _merge_into(staging: Path, target: Path) -> None:
-    """把暂存目录内容合并到目标（同名文件覆盖）。"""
+def _merge_into(staging: Path, target: Path, conflicts: list[str] | None = None) -> None:
+    """把暂存目录内容合并到目标。
+
+    ## 绝不静默删除用户数据（S0，代码审查 Agent 实测）
+
+    旧实现在两类冲突上直接删用户的东西：
+
+        # 目标里 `data` 是**用户的文件**，包里是**目录**
+        if dest.exists() and not dest.is_dir():
+            dest.unlink()                   # ← 用户文件被删
+        ...
+        # 目标里是**含 2 个文件的目录**，包里是**文件**
+        if dest.is_dir():
+            shutil.rmtree(dest)             # ← 用户整个目录被删
+
+    两处都返回 `ok=True`、无任何提示。**原生 7z 在同样情况下是 rc=2 拒绝覆盖、
+    用户数据一动不动**。灾难恢复场景（往已有备份目录补解压）会静默丢数据。
+
+    ## 修法
+
+    * 普通同名文件 → 覆盖（这是恢复的预期行为，用户就是想拿回这份文件）
+    * **类型冲突**（文件 vs 目录）→ 把用户原有项改名成 `*.conflict-<n>` 保留，
+      再放入包里那份，并记进 `conflicts` 让上层告知用户
+    * 目录递归合并（不删）
+    """
     for item in staging.iterdir():
         dest = target / item.name
-        if item.is_dir() and not item.is_symlink():
+        item_is_dir = item.is_dir() and not item.is_symlink()
+
+        if item_is_dir:
             if dest.exists() and not dest.is_dir():
-                dest.unlink()
-            if dest.is_dir():
-                _merge_into(item, dest)
+                # 文件 ↔ 目录冲突：保留用户的文件，改名让位
+                _park_conflict(dest, conflicts)
+                shutil.move(str(item), str(dest))
+            elif dest.is_dir():
+                _merge_into(item, dest, conflicts)
             else:
                 shutil.move(str(item), str(dest))
         else:
             if dest.is_dir():
-                shutil.rmtree(dest)
+                # 目录 ↔ 文件冲突：保留用户的目录，改名让位
+                _park_conflict(dest, conflicts)
             elif dest.exists():
-                dest.unlink()
+                dest.unlink()  # 同名文件：恢复的本意就是拿回它，覆盖合理
             shutil.move(str(item), str(dest))
+
+
+def _park_conflict(dest: Path, conflicts: list[str] | None) -> None:
+    """把目标处已有的项改名保留（`<名>.conflict-<n>`），绝不删除。"""
+    n = 1
+    while True:
+        parked = dest.with_name(f"{dest.name}.conflict-{n}")
+        if not parked.exists():
+            break
+        n += 1
+    shutil.move(str(dest), str(parked))
+    if conflicts is not None:
+        conflicts.append(f"{dest.name} → {parked.name}（类型冲突，你的原文件已保留）")
