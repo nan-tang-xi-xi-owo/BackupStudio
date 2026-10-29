@@ -176,8 +176,11 @@ class TestRealUnknownSizeContainer:
         arc = _make_unknown_size_container(tmp_path, b"A" * (2 * 1024 * 1024))
         with pytest.raises(ex.ExtractionError) as ei:
             ex._check_external_bomb(_seven(), arc, None)
-        assert "无法预读" in str(ei.value), (
-            f"拒绝原因应是「无法预读」（可行动提示），实际：{ei.value}"
+        # 新文案必须说清「读不出包信息」这个真实原因（CLI Agent 实证：
+        # 4 种病因的旧文案除文件名外字节级完全相同，用户无法判断该怎么办）
+        text = str(ei.value)
+        assert "无法读取" in text and "压缩包信息" in text, (
+            f"拒绝原因应说明读不出包信息，实际：{text}"
         )
 
     @requires_7z
@@ -198,21 +201,21 @@ class TestRealUnknownSizeContainer:
         ok, msg = ex.extract_archive(disguised, out)
 
         assert ok is False, f"无 Size 容器在 256 KiB 上限下仍被解压（S1 fail-open）：{msg}"
-        assert "无法预读" in msg or "炸弹" in msg or "超过上限" in msg, msg
+        assert "无法读取" in msg or "炸弹" in msg or "超过上限" in msg, msg
         leaked = [p for p in out.rglob("*") if p.is_file()]
         assert sum(p.stat().st_size for p in leaked) < len(payload), (
             f"预检虽拒绝，但内容已被写出 {[p.name for p in leaked]}"
         )
 
     @requires_7z
-    def test_disabling_cap_is_the_documented_escape_hatch(self, tmp_path, monkeypatch):
-        """``=0`` 关闭上限后必须能解（证明修复不是"一律拒绝"）。
+    def test_no_dead_end_advice_in_unknown_size_rejection(self, tmp_path, monkeypatch):
+        """拒绝文案**不得**再给走不通的环境变量建议（CLI Agent 的 P1）。
 
-        产品文案明确承诺 ``BACKUPSTUDIO_MAX_UNPACKED_BYTES=0`` 是逃生阀；如果
-        修完之后连这个开关也失效，用户就永远打不开自己的流式容器了。
-        注意 ``declared is None`` 的拒绝**先于**上限判定，所以这里验证的是：
-        关闭上限后我们仍然拒绝——除非调用方显式提供了可读大小。
-        因此本用例断言的是"拒绝信息里给出了可行动开关"，而非"能解开"。
+        历史问题：旧文案说「确认可信可设 BACKUPSTUDIO_MAX_UNPACKED_BYTES=0 关闭上限」，
+        但 `declared is None` 的 raise 在 `unpack_limit()` **之前**无条件抛出 ——
+        结构上没有任何代码会去读那个上限。用户照做、重跑、输出一字不差。
+
+        本用例反向锁定：**文案里不能出现那个开关**，且必须给出真实可行动的三条排查项。
         """
         from backupstudio import extract as ex
 
@@ -221,8 +224,13 @@ class TestRealUnknownSizeContainer:
         with pytest.raises(ex.ExtractionError) as ei:
             ex._check_external_bomb(_seven(), arc, None)
         text = str(ei.value)
-        assert ex.ENV_MAX_UNPACKED_BYTES in text, (
-            f"拒绝文案必须告诉用户哪个开关能放宽，实际：{text}"
+
+        assert ex.ENV_MAX_UNPACKED_BYTES not in text, (
+            f"文案仍在建议一个走不通的开关（用户照做也无效）：{text}"
+        )
+        # 必须给出真实可行动的方向
+        assert ("密码" in text) or ("损坏" in text) or ("截断" in text), (
+            f"文案应给出可行动的排查方向（密码/完整性/格式），实际：{text}"
         )
 
 

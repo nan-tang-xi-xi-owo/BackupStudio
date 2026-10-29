@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import bz2
 import contextlib
+import logging
 import gzip
 import io
 import lzma
@@ -47,6 +48,8 @@ except Exception:  # pragma: no cover
 from .platform_info import get_platform_info
 from .staging import force_rmtree, make_staging_dir, same_volume
 from .tools import find_7z, find_rar, probe_unrar_trial
+
+log = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
 # 常量
@@ -1317,7 +1320,10 @@ class ExternalCompressor:
                 self._run_single(src_dir)
             # 通用分卷：由 create_archive 在收尾时调用 split_volumes
         finally:
-            force_rmtree(self.tmpdir)
+            if not force_rmtree(self.tmpdir):
+                log.warning(
+                    "暂存目录未能删净（可能仍含明文，请手动检查）：%s", self.tmpdir
+                )
 
     def abort(self) -> None:
         with contextlib.suppress(Exception):
@@ -1327,7 +1333,8 @@ class ExternalCompressor:
         if self._proc is not None and self._proc.poll() is None:
             with contextlib.suppress(Exception):
                 self._proc.kill()
-        force_rmtree(self.tmpdir)
+        if not force_rmtree(self.tmpdir):
+            log.warning("abort 后暂存目录未能删净（可能仍含明文）：%s", self.tmpdir)
 
     def _with_scc(self, argv: list[str]) -> list[str]:
         """在子命令后插入 `-sccUTF-8`（仅 7-Zip 系可执行文件）。

@@ -773,7 +773,10 @@ class TestRarBombPrecheck:
         arc.write_bytes(b"Rar!\x1a\x07\x00" + b"\x00" * 100)
         with pytest.raises(ex.ExtractionError) as ei:
             ex._check_external_bomb(str(tmp_path / "no-such-unrar.exe"), arc, None, unrar=True)
-        assert "无法预读" in str(ei.value), str(ei.value)
+        # 新文案：不再说"无法预读…可设环境变量关闭上限"（那个开关结构上走不通），
+        # 改为说清"无法读取包信息"并给出真实排查方向
+        text = str(ei.value)
+        assert "无法读取" in text or "无法预读" in text, text
 
 
 class TestUnprotectedPaths:

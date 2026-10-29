@@ -380,6 +380,47 @@ def _declared_unpacked_unrar(exe: str, archive: Path, password: str | None) -> i
     return total if seen else None
 
 
+_LAST_SIZE_PROBE_ERROR = ""
+
+
+def _remember_probe_error(msg: str) -> None:
+    """记住最近一次体积预检失败的原因（7-Zip stderr 摘要）。"""
+    global _LAST_SIZE_PROBE_ERROR
+    _LAST_SIZE_PROBE_ERROR = msg
+
+
+def _digest_7z_error(raw: bytes) -> str:
+    """从 7-Zip 输出里提取可区分病因的一句话。
+
+    7-Zip 的 stderr 本来就能区分四种病因，旧实现 `if returncode != 0: return None`
+    把它整个扔掉了，于是「密码错 / 包损坏 / 文件不存在 / 缺密码」给用户
+    **完全相同**的一句「无法预读解压后大小」，还附一条走不通的建议。
+
+    返回空串 = 认不出来（调用方退回通用文案）。
+    """
+    text = raw.decode("utf-8", "replace")
+    low = text.lower()
+    if "wrong password" in low or "password is incorrect" in low:
+        return "密码错误"
+    # 7-Zip 在需要密码时会打交互提示（EV 上 stdin=DEVNULL，所以直接失败）
+    if "enter password" in low or "can not open encrypted archive" in low:
+        return "该压缩包需要密码（本次未提供）"
+    if "cannot find archive" in low or "no such file" in low:
+        return "文件不存在或无法打开"
+    if "unexpected end" in low or "crc failed" in low or "data error" in low:
+        return "压缩包损坏或被截断"
+    if "is not supported" in low or "unsupported" in low:
+        return "不支持的压缩格式"
+    for line in text.splitlines():
+        ln = line.strip()
+        if not ln or "Copyright" in ln or ln.startswith(("7-Zip", "p7zip")):
+            continue
+        if ln.lower().startswith(("scanning", "opening", "updating", "creating", "extracting")):
+            continue
+        return ln[:80]
+    return ""
+
+
 def _sum_size_lines(argv: list[str]) -> int | None:
     """跑 ``argv`` 并把输出里 ``Size =`` 行的数字求和。
 
@@ -399,15 +440,33 @@ def _sum_size_lines(argv: list[str]) -> int | None:
 
     注意**不要**把"只有空目录的包"误伤成 None：那种包的条目行是 ``Size = 0``，
     能解析出 0 → ``seen=True`` → 正常返回 0（本来就该放行，0 字节炸不了盘）。
+
+    ## 失败时记录 7-Zip 的 stderr（CLI Agent 的 P1）
+
+    旧实现 `if proc.returncode != 0: return None` **把 stderr 整个扔掉**。
+    而 7-Zip 的 stderr 恰好能区分四种病因：
+        「Wrong password」     → 密码错
+        「Unexpected end」/「CRC Failed」 → 包损坏/截断
+        「Cannot find archive」→ 文件不存在
+        「Can not open encrypted archive」→ 缺密码
+    丢掉之后，上层只能统一报「无法预读解压后大小，拒绝在未预检的情况下解压」，
+    还附一条**根本走不通**的建议（`BACKUPSTUDIO_MAX_UNPACKED_BYTES=0`）——
+    CLI Agent 实测 4 种病因的输出**除文件名外字节级完全相同**，用户无法判断
+    该改密码还是该换备份。
+
+    现在把 stderr 摘要挂到模块级 `_LAST_SIZE_PROBE_ERROR`，供上层组装可区分的文案。
     """
     kwargs: dict = {"capture_output": True, "timeout": 300, "stdin": subprocess.DEVNULL}
     if sys.platform == "win32":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         proc = subprocess.run(argv, **kwargs)
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _remember_probe_error(f"{type(exc).__name__}: {exc}")
         return None
     if proc.returncode != 0:
+        err = _digest_7z_error((proc.stdout or b"") + (proc.stderr or b""))
+        _remember_probe_error(err or f"退出码 {proc.returncode}")
         return None
     out = (proc.stdout or b"").decode("utf-8", "replace")
     total = 0
@@ -474,9 +533,19 @@ def _check_external_bomb(
         declared = _declared_unpacked_7z(exe, archive, password)
         entries = _count_entries_7z(exe, archive, password)
     if declared is None:
+        # 把 7-Zip 的 stderr 摘要带上，让用户能区分「密码错 / 包损坏 / 文件不存在」
+        # （CLI Agent 实测：旧文案四种病因**除文件名外字节级完全相同**）。
+        # 同时删掉那条走不通的建议 —— `declared is None` 的 raise 就发生在这里，
+        # 结构上根本没有代码会去读 `BACKUPSTUDIO_MAX_UNPACKED_BYTES`。
+        reason = _LAST_SIZE_PROBE_ERROR
+        if reason:
+            raise ExtractionError(
+                f"无法读取 {archive.name} 的压缩包信息：{reason}。\n"
+                f"请确认：① 密码是否正确 ② 文件是否完整（未截断/未缺分卷）③ 格式是否受支持"
+            )
         raise ExtractionError(
-            f"无法预读 {archive.name} 的解压后大小，拒绝在未预检的情况下解压。"
-            f"（加密包请先提供正确密码；确认可信可设 {ENV_MAX_UNPACKED_BYTES}=0 关闭上限）"
+            f"无法读取 {archive.name} 的压缩包信息（7-Zip 未返回可解析的条目大小）。\n"
+            f"包可能已损坏、被截断，或使用了不支持的格式变体。"
         )
     if max_entries > 0 and entries is not None and entries > max_entries:
         raise ExtractionError(

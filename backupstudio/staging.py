@@ -9,11 +9,14 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import shutil
 import tempfile
 import time
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 
 def same_volume(a: Path, b: Path) -> bool:
@@ -106,9 +109,12 @@ def sweep_stale(parent: Path, prefix: str = "bs-stage-", *, min_age: float | Non
                     pid = 0
                 if pid > 0 and _pid_alive(pid):
                     continue  # 属主还活着，别动
-            force_rmtree(cand)
-            if not cand.exists():
+            if force_rmtree(cand):
                 removed.append(cand)
+            else:
+                log.warning(
+                    "清扫陈旧暂存目录失败（可能仍含明文，请手动检查）：%s", cand
+                )
         except OSError:
             continue
     return removed
@@ -159,7 +165,22 @@ def force_rmtree(path: Path) -> bool:
 
 
 def _pid_alive(pid: int) -> bool:
-    """判断 pid 是否仍在运行（跨平台，失败时保守返回 True）。"""
+    """判断 pid 是否仍在运行（跨平台，失败时**保守返回 True**）。
+
+    ## 为什么要区分「不存在」与「无权限」（审查 Agent 实测）
+
+    旧实现 `if not handle: return False` 把 `OpenProcess` 的**任何**失败都判成
+    「进程已死」—— 包括 `ERROR_ACCESS_DENIED (5)`。可普通用户去查管理员/其它
+    用户的进程时，拿到的正是 ACCESS_DENIED，而那个进程活得好好的。
+
+    后果：`sweep_stale` 会把**别人的活进程**正在用的暂存目录当残留删掉
+    （实测 pid=4 返回 False、last_error=5）。
+
+    这与 docstring 声明的「失败时保守返回 True」**正好相反**。
+
+    修法：只有明确的「参数无效（87）」才是「没有这个进程」，
+    其余错误一律当作「可能还活着」，绝不误删。
+    """
     if pid <= 0:
         return False
     if os.name == "nt":
@@ -167,9 +188,17 @@ def _pid_alive(pid: int) -> bool:
             import ctypes
 
             kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            # 必须先清 LastError：否则读到的是上一个 API 留下的陈旧值
+            kernel32.SetLastError(0)
             handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
             if not handle:
-                return False
+                try:
+                    err = kernel32.GetLastError()
+                except Exception:  # noqa: BLE001
+                    err = 0
+                # 87 = ERROR_INVALID_PARAMETER（该 pid 不存在）→ 确实已死
+                # 其余（5=ACCESS_DENIED 等）→ 保守判活，绝不误删别人的目录
+                return err != 87
             try:
                 code = ctypes.c_ulong()
                 if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
@@ -200,4 +229,7 @@ def staging_dir(near: Path, prefix: str = "bs-stage-"):
     try:
         yield path
     finally:
-        force_rmtree(path)
+        if not force_rmtree(path):
+            log.warning(
+                "暂存目录未能删净（可能仍含明文）：%s", path
+            )

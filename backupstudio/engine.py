@@ -297,6 +297,63 @@ def _verify_7z_py7zr(main: Path, password: str | None) -> tuple[bool | None, str
     return False, f"py7zr 校验失败：条目 {bad} 的 CRC 不匹配"
 
 
+def _assert_bare_tar_eof(path: Path) -> None:
+    """确认**裸 tar** 的末尾是真正的「归档结束」标记（红队 F1，P0）。
+
+    ## 缺陷
+
+    `tarfile` 读到全零块头就认为归档结束 —— 如果文件被**截断在某个 512 边界、
+    且落点恰好是零填充**（文件数据块之后的 padding、或空目录项之后），
+    tarfile 会当成「正常结束」，返回已读到的那些成员，**完全不知道后面还有
+    内容被截掉**。
+
+    实测（5 个 512 字节文件，逐个边界截断）：
+        截断到 512/1536/2560/3584 字节 → verify 返回 **passed**
+        但成员数只有 1/2/3/4（应为 5）→ 尾部文件全丢而界面全绿
+
+    对照：压缩过的 tar.gz 不会中招（gzip 流尾 CRC 会报错）。所以这是**裸 tar 特有**。
+
+    ## 判据
+
+    tar 的规范结束标记是**两个连续的全零 512 块**。正常写出的 tar 末尾通常是
+    「数据 + 零填充到块 + 至少两个零块」，且总长是 512 的整数倍。
+
+    但**「末尾有两个零块」还不够** —— 截断到 512（只有目录头那块）时，
+    那 512 字节本身可能不是零块。真正能区分的是：
+
+      * **文件总长必须是 512 的整数倍**（截断到非块边界必然不是）
+      * **末尾必须存在至少两个全零块**（正常结束标记）
+
+    两者同时满足才是「有完整结束标记的 tar」。截断到 512/1536/2560/3584 时，
+    末尾那块是**数据或文件头**（非全零）→ 判失败。
+
+    抛 `ValueError` 让上层 `except Exception` 归类为校验失败。
+    """
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise ValueError(f"无法读取文件大小：{exc}") from exc
+
+    if size == 0:
+        raise ValueError("空文件（0 字节），不是有效 tar")
+    if size % 512 != 0:
+        raise ValueError(
+            f"tar 长度 {size} 不是 512 的整数倍（{size % 512} 字节余数）"
+            "——文件被截断，缺少完整的归档结束标记"
+        )
+
+    # 末尾至少要有两个全零块（1024 字节）
+    tail_len = min(1024, size)
+    with open(path, "rb") as fh:
+        fh.seek(size - tail_len)
+        tail = fh.read(tail_len)
+    if tail != bytes(tail_len):
+        raise ValueError(
+            "tar 末尾不是全零结束块 ——文件被截断，尾部内容已丢失"
+            "（tarfile 会把它误当成正常结束）"
+        )
+
+
 def verify_archive(main: Path, fmt: str, password: str | None = None) -> tuple[bool | None, str]:
     """校验压缩包完整性。
 
@@ -454,6 +511,16 @@ def verify_archive(main: Path, fmt: str, password: str | None = None) -> tuple[b
                         if f is not None:
                             while f.read(1 << 20):
                                 pass
+            # **只有裸 tar 才做「结束标记」检查**（红队 F1，P0）。
+            #
+            # 不压缩的 tar 没有流尾 CRC：tarfile 读到零块就停 —— 截断在 512 边界
+            # 且落点是零填充时会被误判为「正常结束」，尾部文件静默丢失而 verify 全绿。
+            #
+            # **压缩过的 tar（tar.gz/bz2/xz）绝不能走这个检查**：它们的文件长度
+            # 取决于压缩率（实测 1150 字节），根本不是 512 的倍数；而且它们已有
+            # 更强的保证 —— 上面「把压缩流独立解压到 EOF」会触发流尾 CRC，截断必报错。
+            if fmt == "tar":
+                _assert_bare_tar_eof(main)
             return True, f"{count} 个条目校验通过（内容已读透）"
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
@@ -1038,7 +1105,10 @@ def sweep_orphans(destinations: Iterable[Path | str]) -> list[Path]:
                     # （用户测试 P0：源含只读文件时，加密备份旁永久留明文副本）
                     from .staging import force_rmtree
 
-                    force_rmtree(entry)
+                    if not force_rmtree(entry):
+                        log.warning(
+                            "清扫崩溃残包未删净（可能仍含明文）：%s", entry
+                        )
                 else:
                     entry.unlink()
                 removed.append(entry)
