@@ -289,7 +289,13 @@ jobs:
     name: macOS arm64 dmg
     # B5：macos-14 已 deprecated（2026-11-02 完全下线），迁到 macos-15
     runs-on: macos-15
-    needs: [test, test-macos]
+    # **只依赖 	est，不依赖 	est-macos**（打包与单测解耦）：
+    # macOS arm64 runner 容量不足时 	est-macos 会排队 15 分钟后被平台取消，
+    # 若这里是 [test, test-macos]，dmg 会陪着一起 skip —— 一挂全挂。
+    # 而 	est 是跨平台纯 Python 单测（Windows 上跑），门禁强度不受影响。
+    # 另注：macos-15-intel 是**另一个资源池**（历史 30 次 0 取消），
+    # 它没必要陪 arm64 一起等。
+    needs: [test]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -351,7 +357,13 @@ jobs:
     # B5：macos-13 已于 2025-12-08 退役（runner 永远排队 → 24h 后 cancelled），
     # 官方指定迁移目标为 macos-15-intel（最后一个 x86_64 镜像）
     runs-on: macos-15-intel
-    needs: [test, test-macos]
+    # **只依赖 	est，不依赖 	est-macos**（打包与单测解耦）：
+    # macOS arm64 runner 容量不足时 	est-macos 会排队 15 分钟后被平台取消，
+    # 若这里是 [test, test-macos]，dmg 会陪着一起 skip —— 一挂全挂。
+    # 而 	est 是跨平台纯 Python 单测（Windows 上跑），门禁强度不受影响。
+    # 另注：macos-15-intel 是**另一个资源池**（历史 30 次 0 取消），
+    # 它没必要陪 arm64 一起等。
+    needs: [test]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
