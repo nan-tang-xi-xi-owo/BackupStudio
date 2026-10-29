@@ -584,20 +584,91 @@ jobs:
     name: 发布 Release
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
-    needs: [windows, macos-arm64, macos-x64, linux-appimage, linux-flatpak, test-linux, test-macos]
+    # **不含 macOS**：macOS arm64 runner 容量不足时（GitHub 平台侧 cancel，
+    # 排队 901 秒后放弃）会让 test-macos cancelled → 两个 dmg skipped，
+    # 而 release 的 needs 若含它们就**永远不会跑**。
+    # Windows/Linux 的门禁一条没丢：windows 已 needs: test，
+    # linux-appimage / linux-flatpak 已 needs: [test, test-linux]。
+    #
+    # 缺 macOS 产物由下面的「产物清单门禁」显式拦住（绝不静默发残缺版）。
+    needs: [windows, linux-appimage, linux-flatpak]
     steps:
+      # 门禁 A 要读 backupstudio/__init__.py，所以不能只 sparse-checkout docs。
+      # 仓库本身不大，全量 checkout 更省心。
       - uses: actions/checkout@v4
-        with:
-          sparse-checkout: docs
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
+      # ── 门禁 A：tag 必须与源码版本号一致 ──
+      # 原门禁只比对 env.APP_VERSION ↔ __version__（同源于仓库，与 tag 无关）。
+      # 打 v1.2.0 而源码仍是 1.1.1 时，会发出「标题是 v1.2.0、文件名全是 1.1.1」
+      # 的 release —— 用户完全无法从文件名看出问题。
+      - name: 门禁 A —— tag 与源码版本号一致
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME#v}"
+          ver=$(python3 -c "import re,sys; \
+            print(re.search(r'__version__\s*=\s*\"([^\"]+)\"', \
+            open('backupstudio/__init__.py', encoding='utf-8').read()).group(1))")
+          echo "tag=$tag  源码 __version__=$ver"
+          if [ "$tag" != "$ver" ]; then
+            echo "::error::tag（$tag）与源码版本（$ver）不一致 —— 拒绝发版"
+            echo "::error::请先把 backupstudio/__init__.py、pyproject.toml、"
+            echo "::error::.github/workflows/build.yml 的 APP_VERSION 都改成 $tag 再打 tag"
+            exit 1
+          fi
+          echo "✅ tag 与源码版本一致：$ver"
+
+      # ── 门禁 B：产物清单必须齐全 ──
+      # 风险链（审计实证）：
+      #   download-artifact 无 name/pattern（全量模式）→ v4 源码里空列表只 core.info、
+      #   **不抛异常**；叠加 fail_on_unmatched_files: false 与 sha256sum * || true
+      #   → **缺 macOS 产物时 release 照样成功**，SHA256SUMS 只有 4 行、格式完全正常。
+      #
+      # 所以必须显式比对期望清单。缺任何一个都**硬失败**，把静默变成显式。
+      - name: 门禁 B —— 产物清单齐全
+        run: |
+          set -eu
+          ver="${GITHUB_REF_NAME#v}"
+          expected="BackupStudio-${ver}-windows-x64.zip
+          BackupStudio-Setup-${ver}.exe
+          BackupStudio-${ver}-arm64.dmg
+          BackupStudio-${ver}-x64.dmg
+          BackupStudio-${ver}-x86_64.AppImage
+          BackupStudio.flatpak"
+          echo "=== 期望产物（6 个）==="
+          echo "$expected"
+          echo
+          echo "=== 实际拿到 ==="
+          ls -la artifacts/ || true
+          echo
+          missing=""
+          for f in $expected; do
+            if [ -f "artifacts/$f" ]; then
+              echo "✅ $f"
+            else
+              echo "❌ 缺失：$f"
+              missing="$missing $f"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::产物不全，拒绝发版。缺少：$missing"
+            echo "::error::macOS arm64 runner 容量不足时，请用 gh run rerun <run-id> --failed 补齐"
+            echo "::error::（artifact 是 run 级作用域，只重跑本 job 补不出 dmg）"
+            exit 1
+          fi
+          echo
+          echo "✅ 6 个产物齐全"
+
       - name: 生成校验值
         run: |
           cd artifacts
           ls -la
-          sha256sum * > SHA256SUMS.txt || true
+          # 门禁 B 已确保 6 个文件都在，这里不再 || true
+          sha256sum BackupStudio* > SHA256SUMS.txt
+          echo "=== SHA256SUMS.txt ==="
+          cat SHA256SUMS.txt
       - name: 选择发布说明
         id: notes
         run: |
