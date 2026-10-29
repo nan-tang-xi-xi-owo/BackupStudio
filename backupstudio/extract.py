@@ -240,6 +240,10 @@ def _extract_tar(archive: Path, target: Path) -> None:
     with tarfile.open(archive, "r:*") as tf:
         members = []
         dropped_links: list[str] = []
+        renamed: list[str] = []
+        # 只在 Windows 上做保留名/非法字符改名：Linux/macOS 上 `CON`、`a:b` 都是
+        # **合法文件名**，改了反而破坏用户的目录结构。
+        renamed_enabled = sys.platform == "win32"
         for m in tf.getmembers():
             dest = target / m.name
             if not _is_within(target, dest):
@@ -254,6 +258,32 @@ def _extract_tar(archive: Path, target: Path) -> None:
                 if not _is_within(target, link_target):
                     dropped_links.append(f"{m.name} -> {raw}（指向包外）")
                     continue
+            # **Windows 保留名 / 非法字符必须在解压前改名**（P0，兼容性 Agent）。
+            #
+            # 关键：不能等解压出来再处理 —— `open("NUL","w")` 会"成功"但数据被设备
+            # 吞掉，staging 里已经是个 0 字节文件了，那时再改名救不回来。
+            # 实测（含 5 个保留名的 tar）：CON/NUL/AUX/CON.txt → size=0 数据丢失，
+            # normal.txt 连带整包失败。
+            #
+            # tarfile 允许在 extractall 之前改 `member.name`，就改这里。
+            if renamed_enabled:
+                parts = m.name.split("/")
+                new_parts: list[str] = []
+                changed = False
+                for seg in parts:
+                    reason = _windows_unsafe_reason(seg)
+                    if reason:
+                        fixed = _safe_component(seg)
+                        renamed.append(f"{m.name} → {fixed}（{reason}）")
+                        new_parts.append(fixed)
+                        changed = True
+                    else:
+                        new_parts.append(seg)
+                if changed:
+                    m.name = "/".join(new_parts)
+                    # 改名后要重新校验不越界（理论上只会更安全，但保持防御）
+                    if not _is_within(target, target / m.name):
+                        raise ExtractionError(f"改名后路径异常，已拒绝解压：{m.name}")
             members.append(m)
         try:
             archive_size = archive.stat().st_size
@@ -274,6 +304,12 @@ def _extract_tar(archive: Path, target: Path) -> None:
         # 部分平台 filter="tar" 仍不还原 mode（Windows chmod 语义受限），
         # 显式再补一遍，保证 0600/0444 这类关键位不丢。
         _restore_tar_modes(target, members)
+        if renamed:
+            logging.getLogger(__name__).warning(
+                "已重命名 %d 个 Windows 不安全文件名（原文件数据完好，只是名字变了）：%s",
+                len(renamed),
+                "；".join(renamed[:5]) + ("…" if len(renamed) > 5 else ""),
+            )
 
 
 def _note_dropped_links(items: list[str]) -> None:
@@ -983,6 +1019,72 @@ def _join_and_extract(base: str, volumes: list[tuple[int, Path]], archive: Path,
             joined.unlink()
         with contextlib.suppress(OSError):
             staging.rmdir()
+
+
+#: Windows **保留设备名**。不区分大小写，且**带扩展名也算**（`CON.txt` 同样是设备）。
+#: 写入这些名字时 `open()` 会"成功"、`exists()` 为 True，但数据被设备吞掉 → size=0。
+_WIN_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+    "CONIN$", "CONOUT$",
+}
+
+#: Windows 文件名里禁止出现的字符
+_WIN_BAD_CHARS = set('<>:"|?*') | {chr(i) for i in range(32)}
+
+
+def _windows_unsafe_reason(name: str) -> str:
+    """判断单个路径分量是否为 Windows 上无法安全创建的名字。
+
+    返回空串 = 安全；否则返回原因（用于日志）。
+
+    ## 为什么必须拦截（P0，兼容性 Agent 实测）
+
+    Windows 把 `CON`/`NUL`/`AUX`/`COM1..9`/`LPT1..9` 永久保留给设备。
+    `open("NUL", "w")`、`open("CON", "w")` 都会**成功返回**，但写进去的字节
+    全被丢弃 —— 于是：
+        * `open()` 不报错  → 我们以为写成功了
+        * `exists()` 为 True（其实是设备）
+        * 但 `size == 0`   → **数据全丢**
+
+    实测（含 5 个保留名的 tar 恢复到 Windows）：
+        CON / NUL / AUX / CON.txt → exists=True size=0（数据丢失）
+        normal.txt               → 完全缺失（连带丢失）
+
+    同类还有：
+        * 非法字符 `< > : " | ? *` → `open()` 报 OSError，整包解压失败
+        * 结尾是空格或点 → Windows 自动剥掉，导致名字冲突
+    """
+    if not name or name in (".", ".."):
+        return ""
+    # 非法字符
+    bad = [c for c in name if c in _WIN_BAD_CHARS]
+    if bad:
+        return f"含 Windows 非法字符 {bad!r}"
+    # 结尾空格/点（Windows 会静默剥掉，与同目录另一项撞名）
+    if name != name.rstrip(" ."):
+        return "以空格或点结尾（Windows 会静默剥掉）"
+    # 保留设备名：取扩展名之前的部分判断（CON.txt 也是设备）
+    stem = name.split(".", 1)[0].upper()
+    if stem in _WIN_RESERVED:
+        return f"{stem} 是 Windows 保留设备名"
+    return ""
+
+
+def _safe_component(name: str) -> str:
+    """把 Windows 上不安全的名字改成一个可安全落盘的名字。
+
+    策略：**保留原名可辨识部分**，加 `_renamed` 后缀并替换非法字符。
+    这样用户能看出「这里原本叫什么」，不至于以为文件丢了。
+    """
+    out = "".join("_" if c in _WIN_BAD_CHARS else c for c in name).rstrip(" .")
+    if not out:
+        out = "_"
+    stem, dot, ext = out.partition(".")
+    if stem.upper() in _WIN_RESERVED:
+        stem = f"{stem}_renamed"
+    return stem + dot + ext
 
 
 def _merge_into(staging: Path, target: Path, conflicts: list[str] | None = None) -> None:
