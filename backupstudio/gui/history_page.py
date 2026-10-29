@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -32,6 +33,11 @@ log = logging.getLogger("backupstudio.gui.history")
 
 STATUS = {"success": ("成功", "ok"), "failure": ("失败", "bad"), "skipped": ("跳过", "warn")}
 COLUMNS = ["时间", "任务", "状态", "格式", "文件数", "原始大小", "压缩后", "耗时", "校验", "压缩包"]
+
+#: 各列初始宽度。刻意给得比"内容自然宽度"窄，让整表能落在可用宽度内；
+#: 过长的内容由单元格省略号 + tooltip 兜住，用户可以拖动列宽。
+#: 合计约 700px，低于 980px 窗口下的可用宽度（~740），避免默认就出横向滚动条。
+_COL_WIDTHS = (96, 96, 56, 50, 50, 68, 68, 50, 54, 100)
 
 
 class HistoryPage(QWidget):
@@ -50,10 +56,19 @@ class HistoryPage(QWidget):
         head = QHBoxLayout()
         col = QVBoxLayout()
         col.setSpacing(2)
-        col.addWidget(title_label("运行记录", 1))
-        col.addWidget(muted("最近 500 次备份结果（保存在配置目录的 history.jsonl）"))
+        t = title_label("运行记录", 1)
+        m = muted("最近 500 次备份结果（保存在配置目录的 history.jsonl）")
+        # 标题/副标题在窄窗口下要能被压缩，否则标题行（标题+下拉+三个按钮）
+        # 会把整页最小宽度顶到 835px，超过可用的 764px → 整页横向滚动。
+        for lbl in (t, m):
+            lbl.setMinimumWidth(0)
+            lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        col.addWidget(t)
+        col.addWidget(m)
         head.addLayout(col, 1)
         self.filter_combo = Combo()
+        self.filter_combo.setMinimumWidth(0)
+        self.filter_combo.setMaximumWidth(220)
         self.filter_combo.addItem("全部任务", "")
         self.filter_combo.currentIndexChanged.connect(self.reload)
         head.addWidget(self.filter_combo)
@@ -77,10 +92,25 @@ class HistoryPage(QWidget):
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setShowGrid(False)
         hh = self.table.horizontalHeader()
-        hh.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        # 原来整表 ResizeToContents：10 列内容相加把历史页最小宽度顶到 835px，
+        # 超过窗口的 980-216 可用宽度 → 整页横向滚动（其它页也被它连累，
+        # 主窗口最小宽度被抬到 1051px）。
+        # 改为：默认按内容但允许压缩，最后一列吃掉剩余空间；超长文件名由
+        # item 的省略号处理（QStyle 默认对文本做 ElideRight）。
+        hh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         hh.setStretchLastSection(True)
+        hh.setMinimumSectionSize(48)
+        for i in range(self.table.columnCount()):
+            self.table.setColumnWidth(i, _COL_WIDTHS[i] if i < len(_COL_WIDTHS) else 90)
         self.table.itemSelectionChanged.connect(self._show_detail)
         self.table.itemDoubleClicked.connect(lambda _: self._open_selected())
+        # 允许整页被压窄：QTableWidget 的 minimumSizeHint 会随列数累积，
+        # 集成到主窗口后把页面最小宽度推到 835px（窗口只有 980-216=764 可用），
+        # 于是整页出现横向滚动。这里显式声明"可以压缩"，横向滚动留给表格自己处理。
+        self.table.setMinimumWidth(0)
+        self.table.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding
+        )
         lay.addWidget(self.table, 3)
 
         detail_card = Card()
@@ -138,16 +168,26 @@ class HistoryPage(QWidget):
         finally:
             self.table.setUpdatesEnabled(True)
         if not rows:
-            self.detail.setPlainText("没有记录。")
+            # 空状态：表格与详情都留大片空白会让用户以为"界面坏了"。
+            # 这里给出可行动的说明，而不是一个空白框。
+            empty = (
+                "还没有备份记录。\n\n"
+                "运行一次备份任务后，这里会列出每次的结果（时间、状态、体积、校验）。\n"
+                "记录保存在配置目录的 history.jsonl 中，最近 500 条。"
+            )
+            self.detail.setPlainText(empty)
 
     def _fill_table(self, rows: list[dict]) -> None:
         self.table.setRowCount(len(rows))
+        # 颜色取自当前主题 Palette（不要在这里写死色值 —— 会让状态色与
+        # 主题脱节：改主题时表格里的绿/红不跟着变，且容易与调色板不一致）
+        palette = self.state.palette
         colors = {
-            "success": QColor("#16A34A"),
-            "failure": QColor("#DC2626"),
-            "skipped": QColor("#D97706"),
+            "success": QColor(palette.success),
+            "failure": QColor(palette.danger),
+            "skipped": QColor(palette.warning),
         }
-        default_color = QColor("#6B7280")
+        default_color = QColor(palette.text_dim)
         for i, r in enumerate(rows):
             ts = str(r.get("finished_at") or r.get("started_at") or "")
             try:

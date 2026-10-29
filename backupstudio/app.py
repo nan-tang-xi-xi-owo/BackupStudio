@@ -167,6 +167,14 @@ def _run_gui_inner(start_minimized: bool = False, open_new: bool = False) -> int
 
     QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_DontShowIconsInMenus, False)
     app = QApplication.instance() or QApplication(sys.argv)
+    # 固定用 Fusion 而不是平台的默认风格（Windows 上是 windowsvista）。
+    #
+    # 原因（实测）：Qt 在"设了 QSS"时会跳过受影响控件的原生绘制，但 windowsvista
+    # 的一部分子控件仍走原生渲染 —— 结果是「一半原生、一半样式化」，
+    # 表格左上角会出现纯黑方块，深色主题下表头/交角露白块。
+    # Fusion 是**完全 Stylesheet 感知**的风格，三平台渲染一致，且实测
+    # 各控件 sizeHint 与 windowsvista 基本一致（仅 QSpinBox 宽 6px），不会撑破现有布局。
+    app.setStyle("Fusion")
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_NAME_ZH)
     app.setApplicationVersion(__version__)

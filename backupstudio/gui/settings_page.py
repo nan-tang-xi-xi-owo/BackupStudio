@@ -30,7 +30,7 @@ from ..notify import describe_backend
 from ..paths import config_dir, config_dir_state, log_dir
 from ..util import open_in_file_manager
 from .appstate import AppState
-from .widgets import Card, Combo, Switch, muted, title_label
+from .widgets import Card, Combo, ElidedLabel, Switch, muted, title_label
 
 log = logging.getLogger("backupstudio.gui.settings")
 
@@ -175,9 +175,12 @@ class SettingsPage(QWidget):
         # 数据与日志
         data = Card()
         data.add(title_label("数据与日志", 3))
-        self.lbl_config = QLabel("")
+        # 用 ElidedLabel：配置/日志目录是绝对路径，长用户名或深目录会把设置页
+        # 最小宽度撑到 700px+，进而让整页出现横向滚动条（实测 156px 溢出）。
+        # 省略号截断 + tooltip 全文 + 可选中复制，信息不丢。
+        self.lbl_config = ElidedLabel("")
         self.lbl_config.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.lbl_logs = QLabel("")
+        self.lbl_logs = ElidedLabel("")
         self.lbl_logs.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         data.add(self._row("配置目录", self.lbl_config))
         data.add(self._row("日志目录", self.lbl_logs))
@@ -214,8 +217,8 @@ class SettingsPage(QWidget):
         about = Card()
         about.add(title_label("关于", 3))
         about.add(QLabel(f"{APP_NAME_ZH} · {APP_NAME} {__version__}"))
+        about.add(muted(f"应用 ID：{APP_ID}"))
         about.add(muted(
-            f"应用 ID：{APP_ID}\n"
             "跨平台文件夹备份与多格式压缩工具。GUI 基于 PySide6；7-Zip 由 Igor Pavlov 开发（LGPL，"
             "RAR 为 RARLAB 专有软件，需自行安装）。"
         ))

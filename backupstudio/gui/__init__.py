@@ -126,8 +126,8 @@ class Palette:
 LIGHT = Palette(
     name="light", dark=False,
     bg="#F4F6FB", surface="#FFFFFF", surface_alt="#EEF2F9", border="#D8DEEA",
-    text="#1F2430", text_dim="#6B7280", accent="#4F6BED", accent_hover="#3F58D6",
-    accent_text="#FFFFFF", success="#16A34A", warning="#D97706", danger="#DC2626",
+    text="#1F2430", text_dim="#5C6478", accent="#4F6BED", accent_hover="#3F58D6",
+    accent_text="#FFFFFF", success="#15803D", warning="#B45309", danger="#B91C1C",
     selection="#DCE4FF",
 )
 
@@ -156,7 +156,7 @@ def stylesheet(p: Palette) -> str:
     QFrame#Card {{
         background: {p.surface};
         border: 1px solid {p.border};
-        border-radius: 14px;
+        border-radius: 12px;
     }}
     QFrame#CardFlat {{
         background: {p.surface_alt};
@@ -168,7 +168,7 @@ def stylesheet(p: Palette) -> str:
     QLabel#H3 {{ font-size: 14px; font-weight: 600; }}
     QLabel#Muted {{ color: {p.text_dim}; }}
     QLabel#Badge {{
-        border-radius: 9px; padding: 2px 10px; font-size: 12px; font-weight: 600;
+        border-radius: 8px; padding: 2px 10px; font-size: 12px; font-weight: 600;
         background: {p.surface_alt}; color: {p.text_dim};
     }}
     QLabel#ErrorText {{ color: {p.danger}; }}
@@ -177,7 +177,7 @@ def stylesheet(p: Palette) -> str:
     QPushButton {{
         background: {p.surface_alt};
         border: 1px solid {p.border};
-        border-radius: 9px;
+        border-radius: 8px;
         padding: 7px 16px;
         color: {fg};
     }}
@@ -204,19 +204,47 @@ def stylesheet(p: Palette) -> str:
     }}
     QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled {{ color: {p.text_dim}; background: {p.surface_alt}; }}
     QComboBox::drop-down {{ border: none; width: 22px; }}
+    QComboBox {{
+        combobox-popup: 0;   /* 用真 QListView 弹层，QSS 才会生效（见 widgets.Combo） */
+    }}
     QComboBox QAbstractItemView {{
         background: {p.surface}; border: 1px solid {p.border}; selection-background-color: {p.selection};
         selection-color: {fg}; outline: none;
+        padding: 4px;
+    }}
+    QComboBox QAbstractItemView::item {{
+        min-height: 26px; padding: 2px 8px; border-radius: 8px;
+    }}
+    QComboBox QAbstractItemView::item:hover {{ background: {p.surface_alt}; }}
+    /* 弹层最外层容器是独立顶层 QFrame，不补这条就会在四周留白边 */
+    QComboBox QFrame {{ background: {p.surface}; border: 1px solid {p.border}; }}
+    QComboBox::down-arrow {{
+        image: none; width: 0; height: 0;
+        border-left: 4px solid transparent; border-right: 4px solid transparent;
+        border-top: 5px solid {p.text_dim};
+        margin-right: 8px;
     }}
     QListWidget, QTreeWidget, QTableWidget {{
         background: {p.surface}; border: 1px solid {p.border}; border-radius: 12px; outline: none;
         alternate-background-color: {p.surface_alt};
     }}
+    /* 表格的三处「样式盲区」——实测不补会露黑/白块：
+       * 左上角交角按钮：默认由风格自绘，windowsvista 下是纯黑方块；
+       * 表头整体背景（::section 只覆盖有表头段的地方，表头空白区不归它管）；
+       * 表格右侧/底部空白（列宽不足控件宽度时露出的 viewport 区域）。 */
+    QTableCornerButton::section {{
+        background: {p.surface_alt};
+        border: none;
+        border-bottom: 1px solid {p.border};
+    }}
+    QHeaderView {{ background: {p.surface_alt}; border: none; }}
+    QTableView QTableCornerButton::section {{ background: {p.surface_alt}; border: none; }}
+    QTableWidget QWidget, QTableView QWidget {{ background: {p.surface}; }}
     QTextEdit, QPlainTextEdit {{
-        background: {p.surface_alt}; border: 1px solid {p.border}; border-radius: 10px;
+        background: {p.surface_alt}; border: 1px solid {p.border}; border-radius: 8px;
     }}
     QSplitter::handle:horizontal {{ width: 10px; }}
-    QListWidget::item {{ border-radius: 10px; padding: 10px 12px; margin: 3px 6px; }}
+    QListWidget::item {{ border-radius: 8px; padding: 10px 12px; margin: 3px 6px; }}
     QListWidget::item:selected {{ background: {p.selection}; color: {fg}; }}
     QListWidget::item:hover {{ background: {p.surface_alt}; }}
     QTreeWidget::item, QTableWidget::item {{ padding: 6px; }}
@@ -242,19 +270,19 @@ def stylesheet(p: Palette) -> str:
     QCheckBox::indicator, QRadioButton::indicator {{ width: 17px; height: 17px; }}
     QCheckBox::indicator:unchecked {{ border: 1px solid {p.border}; border-radius: 5px; background: {p.surface}; }}
     QCheckBox::indicator:checked {{ border: 1px solid {p.accent}; border-radius: 5px; background: {p.accent}; }}
-    QRadioButton::indicator:unchecked {{ border: 1px solid {p.border}; border-radius: 9px; background: {p.surface}; }}
-    QRadioButton::indicator:checked {{ border: 5px solid {p.accent}; border-radius: 9px; background: {p.surface}; }}
+    QRadioButton::indicator:unchecked {{ border: 1px solid {p.border}; border-radius: 8px; background: {p.surface}; }}
+    QRadioButton::indicator:checked {{ border: 5px solid {p.accent}; border-radius: 8px; background: {p.surface}; }}
     QSlider::groove:horizontal {{ height: 6px; background: {p.surface_alt}; border-radius: 3px; }}
     QSlider::sub-page:horizontal {{ background: {p.accent}; border-radius: 3px; }}
     QSlider::handle:horizontal {{
         background: {p.surface}; border: 2px solid {p.accent}; width: 14px; height: 14px;
-        margin: -5px 0; border-radius: 9px;
+        margin: -5px 0; border-radius: 8px;
     }}
     QProgressBar {{
-        background: {p.surface_alt}; border: none; border-radius: 6px; height: 12px; text-align: center;
+        background: {p.surface_alt}; border: none; border-radius: 8px; height: 12px; text-align: center;
         color: transparent;
     }}
-    QProgressBar::chunk {{ background: {p.accent}; border-radius: 6px; }}
+    QProgressBar::chunk {{ background: {p.accent}; border-radius: 8px; }}
     QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
     QScrollBar::handle:vertical {{ background: {p.border}; border-radius: 4px; min-height: 30px; }}
     QScrollBar::handle:vertical:hover {{ background: {p.text_dim}; }}
@@ -263,12 +291,12 @@ def stylesheet(p: Palette) -> str:
     QScrollBar::handle:horizontal {{ background: {p.border}; border-radius: 4px; min-width: 30px; }}
     QToolTip {{
         background: {p.surface}; color: {fg}; border: 1px solid {p.border};
-        border-radius: 6px; padding: 6px 8px;
+        border-radius: 8px; padding: 6px 8px;
     }}
     QMenu {{
-        background: {p.surface}; border: 1px solid {p.border}; border-radius: 10px; padding: 6px;
+        background: {p.surface}; border: 1px solid {p.border}; border-radius: 8px; padding: 6px;
     }}
-    QMenu::item {{ padding: 7px 22px 7px 14px; border-radius: 7px; }}
+    QMenu::item {{ padding: 7px 22px 7px 14px; border-radius: 8px; }}
     QMenu::item:selected {{ background: {p.selection}; }}
     QMenu::separator {{ height: 1px; background: {p.border}; margin: 5px 8px; }}
     QStatusBar {{ background: transparent; color: {p.text_dim}; }}
@@ -276,7 +304,7 @@ def stylesheet(p: Palette) -> str:
     QToolButton {{ border-radius: 8px; padding: 6px; background: transparent; }}
     QToolButton:hover {{ background: {p.surface_alt}; }}
     QToolButton#NavButton {{
-        background: transparent; border: none; border-radius: 10px; padding: 10px 14px;
+        background: transparent; border: none; border-radius: 8px; padding: 10px 14px;
         text-align: left; color: {p.text_dim}; font-size: 13px;
     }}
     QToolButton#NavButton:hover {{ background: {p.surface_alt}; color: {fg}; }}

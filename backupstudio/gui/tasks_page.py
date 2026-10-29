@@ -28,7 +28,7 @@ from ..schedule import describe_next
 from ..util import human_duration, human_size, reveal_file
 from .appstate import AppState
 from .icons import line_icon
-from .widgets import Badge, Card, StatusPill, muted, title_label
+from .widgets import Badge, Card, ElidedLabel, StatusPill, muted, title_label
 
 log = logging.getLogger("backupstudio.gui.tasks")
 
@@ -84,17 +84,16 @@ class TaskItemWidget(QWidget):
         lay.setSpacing(5)
         top = QHBoxLayout()
         top.setSpacing(8)
-        self.title = QLabel(task.name)
+        self.title = ElidedLabel(task.name)
         self.title.setStyleSheet("font-weight: 600; font-size: 14px;")
         self.badge = Badge("", "muted")
         self.badge.set_dark(dark)
         top.addWidget(self.title, 1)
         top.addWidget(self.badge)
         lay.addLayout(top)
-        self.sub = QLabel("")
+        self.sub = ElidedLabel("")
         self.sub.setObjectName("Muted")
         self.sub.setStyleSheet("font-size: 12px;")
-        self.sub.setWordWrap(False)
         lay.addWidget(self.sub)
         self.update_task(task)
 
@@ -149,7 +148,10 @@ class TasksPage(QWidget):
 
         # 左：任务列表
         left = Card()
-        left.setMinimumWidth(300)
+        # 240 而不是 300：窗口最小宽度 = 侧栏216 + 左栏300 + 右栏(2×240+间距) + 边距
+        # 会被顶到 1101px，在 980px 窗口下整页横向滚动、卡片文字被裁。
+        # 降到 240 仍够显示任务名摘要，且让整窗最小宽度回到窗口默认值以下。
+        left.setMinimumWidth(240)
         left.setMaximumWidth(430)
         self.search = QLabel("")
         self.list = QListWidget()
@@ -169,7 +171,9 @@ class TasksPage(QWidget):
         rl = QVBoxLayout()
         rl.setSpacing(12)
         top = QHBoxLayout()
-        self.detail_title = title_label("选择一个任务", 2)
+        self.detail_title = ElidedLabel("选择一个任务")
+        self.detail_title.setObjectName("H2")
+        self.detail_title.setStyleSheet("font-size: 16px; font-weight: 600;")
         self.detail_badge = Badge("", "muted")
         self.detail_badge.set_dark(self._dark)
         top.addWidget(self.detail_title, 1)
@@ -200,7 +204,10 @@ class TasksPage(QWidget):
             val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             c.add(cap)
             c.add(val)
-            c.setMinimumWidth(240)
+            # 原来写死 240px×2 列 + 左栏 300px + 侧边栏 216px，把窗口最小宽度顶到
+            # 1101px：在 980px 的窗口里任务页需要横向滚动，卡片文字被裁。
+            # 改为可压缩（只保留一个较小的下限），让 QLabel 的 wordWrap 真正起作用。
+            c.setMinimumWidth(160)
             info_grid.addWidget(c, idx // 2, idx % 2)
             self.info_cards[key] = (c, val)
         rl.addLayout(info_grid)
@@ -317,7 +324,11 @@ class TasksPage(QWidget):
         for t in tasks:
             item = QListWidgetItem()
             widget = TaskItemWidget(t, self._dark)
-            item.setSizeHint(QSize(280, 64))
+            # 宽度交给列表决定（原来写死 280，比列表实际宽度窄，标题与摘要都被裁）；
+            # 高度 66 刚好容纳"标题行 + 摘要行 + 间距"，摘要本身用省略号保证不溢出。
+            # 宽度交给列表决定（原来写死 280，比列表实际宽度窄，标题与摘要都被裁）；
+            # 高度 66 刚好容纳"标题行 + 摘要行 + 间距"，摘要本身用省略号保证不溢出。
+            item.setSizeHint(QSize(0, 66))
             item.setData(Qt.ItemDataRole.UserRole, t.id)
             self.list.addItem(item)
             self.list.setItemWidget(item, widget)
