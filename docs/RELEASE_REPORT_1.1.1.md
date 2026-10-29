@@ -308,3 +308,103 @@ run #56（`workflow_dispatch`）：**8 个 job 全 success**，
 
 这个改动对未来的价值大于本次发版本身 —— 下次 macOS 池再抖动时，
 intel 池仍能产出 x64 dmg，不至于全部卡住。
+
+---
+
+## 11. 最终验收结论（独立 Agent）
+
+7 项全部通过。关键证据：
+
+### SHA256 三方一致
+
+不只比对「本地 = SHA256SUMS.txt」（后者是自产的，属自证），
+还比对了 **GitHub API 的 `digest` 字段**（服务端独立计算，是真正的第三方信任锚）：
+
+| 产物 | SHA256（GitHub digest） | 本地实测 | 一致 |
+|---|---|---|---|
+| windows-x64.zip | `5804fba7…db151` | 同 | ✅ |
+| Setup-1.1.1.exe | `873b26a1…8c80d` | 同 | ✅ |
+| arm64.dmg | `bc2be827ff7bb75267f8b97860a1f8b5282616d231c98fb6f7021d4c76e5f943` | 同 | ✅ |
+| x64.dmg | `473278c3e81444d277fddf8f6b24f91ec56ce7f1b7a6044b278bfe47cd24b07c` | 同 | ✅ |
+| x86_64.AppImage | `a502ce76…061c5` | 同 | ✅ |
+| BackupStudio.flatpak | `944f27fd…b0e0cc` | 同 | ✅ |
+
+### dmg 真实性（证伪「45 MB 零填充」假设）
+
+- 末 512 B 均含 `koly` 魔数，`imageVariant=2`，XML plist 完整，含 `Apple_APFS` 分区
+- 独立 UDIF 解码器**真正解压全部 119 个数据块，0 失败**（zlib adler32 全部通过）
+- 卷首 `NXSB` 确认 APFS；11 处抽样均非零字节
+- 内含 `BackupStudio.app`：`CFBundleExecutable=BackupStudio`、
+  `id=io.github.backupstudio.BackupStudio`、`APPL`
+- **架构未错配**：arm64.dmg 含 144 个 arm64 Mach-O；x64.dmg 含 146 个 x86_64 Mach-O
+
+### 逐字节溯源
+
+6 个产物下载回来与各自来源 run 的 CI artifact **逐字节完全相同**。
+
+---
+
+## 12. 两处口径订正（验收 Agent 指出，我核实后确认）
+
+### 订正 1：6 个产物来自**两次** CI 运行，不是一次
+
+| 产物 | 来源 run | 该 run 的状态 |
+|---|---|---|
+| Windows zip / Setup exe / AppImage / flatpak | **run #55**（tag `v1.1.1` 触发） | 整体 **failure**；但这 3 个 build job 是 success |
+| arm64.dmg / x64.dmg | **run #56**（`workflow_dispatch`） | 整体 **success**，8 个 job 全绿 |
+
+原文写「6 个产物全部由 CI 构建产出」—— **字面成立但暗示「同一次」，不准确**。
+
+### 订正 2：tag 指向的 commit 与 dmg 的构建 commit 差 3 个提交
+
+    tag v1.1.1   → 30cd6eb
+    run #56 构建  → 6d323ca   （ahead_by=3，已用 /compare API 核实）
+
+差异文件（**无一行 src 代码**）：
+
+    .github/workflows/build.yml     +14/-2   （macOS dmg 与单测解耦）
+    docs/RELEASE_NOTES_1.1.1.md     +3/-3    （22/3 → 26/4）
+    docs/RELEASE_REPORT_1.1.1.md    +250/-0  （新增本报告）
+
+即 `backupstudio/` 目录**零改动**，两个 dmg 的程序行为与 tag commit 构建的一致。
+原文「tag、源码三处一致」表述过宽，已在 release body 里改为明确列出差异文件。
+
+---
+
+## 13. 未验证项（诚实边界）
+
+**「dmg 能在真实 macOS 上挂载并启动」未验证。**
+
+Windows 无法挂载 dmg，现有验证只到「APFS 卷 + Mach-O + `.app` 结构完整、
+119 个数据块全部解压成功、架构未错配」这一层。
+
+**若要闭环**，需要在 macOS runner 上跑：
+
+```yaml
+- run: |
+    hdiutil attach dist/BackupStudio-1.1.1-arm64.dmg
+    ls /Volumes/BackupStudio/BackupStudio.app/Contents/MacOS/
+    /Volumes/BackupStudio/BackupStudio.app/Contents/MacOS/BackupStudio --version
+    hdiutil detach /Volumes/BackupStudio
+```
+
+这是 1.1.2 可以加的 CI 步骤。
+
+---
+
+## 14. 过程中我自己的误判（第 7 次）
+
+第一次验证 x64.dmg 时我得到：
+
+    大小 24,653,824 B（应为 48,542,400）
+    koly 魔数不存在
+    SHA256 b64cd2d4… （应为 473278c3…）
+
+**差点误报「文件损坏」。** 但下载量正好是 50.8%，这提示更可能是**下载被截断**。
+带 `--retry 3 -C -` 重下后：大小 48,542,400 ✅、`koly` ✅、SHA256 ✅。
+
+验收 Agent 也报告了同类现象：它的 UDIF 解析器曾两轮报「解压失败」，
+**均为脚本 bug**（blkx 的 `numRuns` 偏移读成 104 实为 200、`sectorStart` 是整盘
+绝对扇区而非分区内相对），修正后 119 块全通过。
+
+**同类教训已累计 7 次**：验证工具链自身的失败，不能当作被验证对象有问题。
