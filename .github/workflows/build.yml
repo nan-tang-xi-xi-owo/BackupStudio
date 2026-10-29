@@ -12,7 +12,7 @@ permissions:
 
 env:
   PYTHON_VERSION: "3.12"
-  APP_VERSION: "1.1.0"
+  APP_VERSION: "1.1.1"
   # B2：**必须显式设 PYTHONIOENCODING=utf-8**，不能只靠 PYTHONUTF8。
   # 原因（实测）：PYTHONUTF8=1 只把 *默认* 编码切到 UTF-8；一旦环境里同时存在
   # PYTHONIOENCODING（本机/镜像预设、或 pyinstaller 子进程继承来的值），

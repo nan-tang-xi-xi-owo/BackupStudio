@@ -46,6 +46,7 @@ except Exception:  # pragma: no cover
     py7zr = None
 
 from .platform_info import get_platform_info
+from .longpath import long_path
 from .staging import force_rmtree, make_staging_dir, same_volume
 from .tools import find_7z, find_rar, probe_unrar_trial
 
@@ -265,8 +266,16 @@ def _iter_tree(root: Path, arcname: str, follow: bool) -> Iterator[tuple[Path, s
     while stack:
         current, current_arc = stack.pop()
         try:
-            entries = sorted(os.scandir(current), key=lambda e: (not e.is_dir(follow_symlinks=False), e.name.lower()))
+            # 用长路径前缀 scandir：Windows 上 >260 字符的目录在遍历阶段就会
+            # `FileNotFoundError`，那时根本走不到后面的 stat 检查（S0）。
+            entries = sorted(
+                os.scandir(long_path(current)),
+                key=lambda e: (not e.is_dir(follow_symlinks=False), e.name.lower()),
+            )
         except OSError:
+            # 整个目录读不到：登记下来，让任务降级为 partial（不能静默跳过）
+            if len(_LAST_UNREADABLE) < 50:
+                _LAST_UNREADABLE.append(f"{current_arc}（目录无法遍历）")
             continue
         for entry in entries:
             p = Path(entry.path)
@@ -422,6 +431,11 @@ def _auto_skip(path: Path) -> bool:
 #: 这些无法备份（FIFO 会永久阻塞），必须让上层能告知用户。
 _LAST_SPECIAL_SKIPPED: list[str] = []
 
+#: 最近一次 `plan_items` **读不到属性**的路径（S0：Windows 长路径 >260 字符）。
+#: 这类失败**必须**让任务降级为 partial —— 旧实现只把 `skipped += 1`，
+#: 而 skipped 从不影响 status，于是「文件读不到 → 包缺它 → 仍报 success/passed」。
+_LAST_UNREADABLE: list[str] = []
+
 
 def _notify_skipped(backend, reason: str) -> None:
     """把「这个条目没能写进包」登记到后端的 skipped_busy。
@@ -475,6 +489,7 @@ def plan_items(
     items: list[Item] = []
     skipped = 0
     special_skipped: list[str] = []
+    _LAST_UNREADABLE.clear()
     for root in sources:
         src = Path(root.source)
         if not src.exists() and not src.is_symlink():
@@ -490,9 +505,16 @@ def plan_items(
                 skipped += 1
                 continue
             try:
-                st = path.stat() if follow_symlinks or not is_link else path.lstat()
-            except OSError:
+                # 用长路径前缀：Windows 上 >260 字符的路径传统 API 直接失败（S0）
+                _lp = long_path(path)
+                st = os.stat(_lp) if (follow_symlinks or not is_link) else os.lstat(_lp)
+            except OSError as exc:
                 skipped += 1
+                # **必须登记**：读不到属性 = 这个文件进不了包。旧实现只 skipped+=1，
+                # 而 skipped 从不影响 status → Windows 长路径（>260）文件静默丢失而
+                # 任务报 success/passed（核对 Agent 实测的 S0）。
+                if len(_LAST_UNREADABLE) < 50:
+                    _LAST_UNREADABLE.append(f"{arc}（{type(exc).__name__}: {exc}）")
                 continue
             # 只处理**普通文件 / 目录 / 符号链接**，其余类型一律跳过（S0）。
             #
@@ -881,7 +903,7 @@ class TarStreamCompressor:
         # 必须让异常冒泡（测试 test_tar_open_failure_does_not_corrupt_stream
         # 明确要求它抛出，且该断言同时验证 tar 流不错位）。
         try:
-            fh = open(src, "rb")
+            fh = open(long_path(src), "rb")
         except PermissionError:
             if src.is_dir():
                 raise  # 目录不该走 add_file：交给调用方记错误，别当"被占用"吞掉
@@ -2091,6 +2113,10 @@ def create_archive(
         # 让 engine 把任务标成 partial（而不是假绿 success）。用户测试 P0：
         # Excel/PSD 打开着的文件被跳过、其余照常备份，旧实现仍报「成功/校验通过」。
         _busy = list(getattr(backend, "skipped_busy", []) or [])
+        # 读不到属性的路径（Windows 长路径 >260）也必须让任务降级为 partial（S0）：
+        # 它们**确实没进包**，但旧实现只 skipped+=1，而 skipped 不影响 status。
+        if _LAST_UNREADABLE:
+            _busy.extend(f"{x}（无法读取属性）" for x in _LAST_UNREADABLE)
         if _busy:
             result.skipped_busy = _busy
             result.skipped = max(result.skipped, len(_busy))

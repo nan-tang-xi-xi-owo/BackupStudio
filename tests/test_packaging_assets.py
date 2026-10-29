@@ -12,7 +12,7 @@
 2. **P1-2 macOS ``CFBundleShortVersionString = 0.0.0``**
    ``packaging/build.py::_app_version()`` 在 ``import backupstudio`` 失败时静默返回
    ``"0.0.0"``；而该脚本运行时 ``sys.path[0]`` 是 ``packaging/``，import **必然**失败
-   → 兜底值成了实际值。dmg 文件名（1.1.0）由 ``make-dmg.sh`` 独立 import 得来，
+   → 兜底值成了实际值。dmg 文件名（1.1.1）由 ``make-dmg.sh`` 独立 import 得来，
    于是「文件名对、包内版本错」，两个 dmg 都中招。
 
 这里不 mock 打包流程，而是**真的检查产物/真源**，避免断言弱化。
@@ -32,7 +32,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 ASSETS_TRAY = ROOT / "backupstudio" / "assets" / "tray"
-EXPECTED_VERSION = "1.1.0"
+EXPECTED_VERSION = "1.1.1"
 BUNDLE_IDENTIFIER = "io.github.backupstudio.BackupStudio"
 
 
@@ -297,7 +297,7 @@ def test_macos_plist_fix_functions_exist():
 
 
 def test_macos_plist_rewrite_roundtrip(tmp_path):
-    """用假 .app 验证 _fix_macos_plist 真的把 0.0.0 改成 1.1.0。"""
+    """用假 .app 验证 _fix_macos_plist 真的把 0.0.0 改成 1.1.1。"""
     plistlib = pytest.importorskip("plistlib")
     mod = _load_build_module()
     app = tmp_path / "BackupStudio.app" / "Contents"

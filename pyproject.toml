@@ -1,6 +1,6 @@
 [project]
 name = "backupstudio"
-version = "1.1.0"
+version = "1.1.1"
 description = "跨平台定时文件夹备份与多格式压缩工具（GUI + 托盘 + CLI）"
 readme = "README.md"
 requires-python = ">=3.10"

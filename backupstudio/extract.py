@@ -24,6 +24,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+from .longpath import long_path
 from .tools import find_7z, find_unrar
 
 log = logging.getLogger("backupstudio.extract")
@@ -131,9 +132,36 @@ def _is_within(base: Path, target: Path) -> bool:
 
 
 def _safe_zip_name(name: str) -> str:
+    """归一 ZIP 成员名并做安全性校验。
+
+    **越界/盘符仍拒绝整包**（真攻击，不该静默跳过）。
+    **Windows 保留名/非法字符则改名放行**（不是攻击，只是跨平台差异）——
+    这与 `_extract_tar` 的处理保持一致（审查 Agent 指出：改名逻辑此前只加在
+    `_extract_tar`，`_extract_zip` 未覆盖，导致含 `a<b.txt` 的 zip 在 Windows 上
+    整包解压失败 `OSError [Errno 22]`，连旁边的正常文件也拿不到）。
+    """
     norm = name.replace("\\", "/").lstrip("/")
-    if ".." in Path(norm).parts or (len(norm) > 1 and norm[1] == ":"):
+    # 盘符判定要**严格**：只认 `X:` 或 `X:/…`（真正的绝对路径）。
+    # 不能把 `e:f.txt`（文件名里带冒号）当盘符 —— 那是 Windows 非法字符问题，
+    # 应该改名放行而不是拒绝整包（审查 Agent 实测：旧判定让含 `e:f.txt` 的
+    # zip/tar 整包解压失败，旁边的正常文件也拿不到）。
+    is_drive = len(norm) > 1 and norm[1] == ":" and (len(norm) == 2 or norm[2] == "/")
+    if ".." in Path(norm).parts or is_drive:
         raise ExtractionError(f"压缩包内包含不安全路径，已拒绝解压：{name}")
+    # Windows：逐段改名（保留设备名 / 非法字符 / 结尾空格点）
+    if sys.platform == "win32":
+        parts = norm.split("/")
+        fixed: list[str] = []
+        changed = False
+        for seg in parts:
+            reason = _windows_unsafe_reason(seg)
+            if reason:
+                fixed.append(_safe_component(seg))
+                changed = True
+            else:
+                fixed.append(seg)
+        if changed:
+            norm = "/".join(fixed)
     return norm
 
 
@@ -177,7 +205,7 @@ def _extract_zip(archive: Path, target: Path, password: str | None = None) -> No
         if exe:
             # 审查 F：这条外部解压路径此前**零防护**（加密 ZIP 炸弹会照写满盘）
             _check_external_bomb(exe, archive, password)
-            argv = [exe, "x", "-y", f"-o{target}", str(archive)]
+            argv = [exe, "x", "-y", f"-o{long_path(target)}", str(archive)]
             argv.insert(3, f"-p{password}")
             code, out = _run(argv)
             if code != 0:
@@ -193,9 +221,9 @@ def _extract_zip(archive: Path, target: Path, password: str | None = None) -> No
             if not _is_within(target, dest):
                 raise ExtractionError(f"压缩包内包含不安全路径，已拒绝解压：{info.filename}")
             if info.is_dir():
-                dest.mkdir(parents=True, exist_ok=True)
+                Path(long_path(dest)).mkdir(parents=True, exist_ok=True)
                 continue
-            dest.parent.mkdir(parents=True, exist_ok=True)
+            Path(long_path(dest.parent)).mkdir(parents=True, exist_ok=True)
             try:
                 src_fh = zf.open(info, pwd=password.encode("utf-8") if password else None)
             except RuntimeError as exc:
@@ -203,7 +231,7 @@ def _extract_zip(archive: Path, target: Path, password: str | None = None) -> No
                 raise ExtractionError(
                     f"无法解压加密条目（{info.filename}）：AES ZIP 需要安装 7-Zip（{exc}）"
                 ) from exc
-            with src_fh, open(dest, "wb") as out:
+            with src_fh, open(long_path(dest), "wb") as out:
                 while True:
                     chunk = src_fh.read(1 << 20)
                     if not chunk:
@@ -604,7 +632,7 @@ def _extract_external(archive: Path, target: Path, password: str | None) -> str:
         if not exe:
             raise ExtractionError("需要 7-Zip 才能解压 .7z")
         _check_external_bomb(exe, archive, password)
-        argv = [exe, "x", "-y", f"-o{target}", str(archive)]
+        argv = [exe, "x", "-y", f"-o{long_path(target)}", str(archive)]
         if password:
             argv.insert(3, f"-p{password}")
         code, out = _run(argv)
@@ -616,7 +644,7 @@ def _extract_external(archive: Path, target: Path, password: str | None) -> str:
         if exe:
             # UnRAR 不认 7z 的 -slt/-ba，必须走 lt（审查 E：此前解析失败被静默放行）
             _check_external_bomb(exe, archive, password, unrar=True)
-            argv = [exe, "x", "-idq", "-y", str(archive), str(target) + os.sep]
+            argv = [exe, "x", "-idq", "-y", str(archive), long_path(target) + os.sep]
             if password:
                 argv.insert(3, f"-p{password}")
             code, out = _run(argv)
@@ -626,7 +654,7 @@ def _extract_external(archive: Path, target: Path, password: str | None) -> str:
         seven = find_7z()
         if seven:
             _check_external_bomb(seven, archive, password)
-            argv = [seven, "x", "-y", f"-o{target}", str(archive)]
+            argv = [seven, "x", "-y", f"-o{long_path(target)}", str(archive)]
             if password:
                 argv.insert(3, f"-p{password}")
             code, out = _run(argv)
@@ -779,13 +807,50 @@ def _scan_escape(base: Path) -> list[str]:
     return bad
 
 
+def _make_staging(target: Path, prefix: str = "bs-extract-") -> Path:
+    """建解压暂存目录。
+
+    ## 关键：目标路径接近 MAX_PATH 时，**必须**用系统临时目录
+
+    建在 target 内是**性能优化**（同卷避免跨盘复制），但它会把 target 的路径长度
+    **带进暂存目录**，而解压时要在暂存目录下再拼上**包内成员的相对路径**：
+
+        暂存目录 226 字符 + 包内成员 172 字符 = 398 字符 → 7z 失败
+        （staging 自己建得出来，因为 226 < 260；但解到里面就超了）
+
+    实测：271 字符 target 下，staging 建在 target 内 → 7z 解压 rc=2、
+    staging 里只有 `shallow.txt`，深路径成员丢了；`_merge_into` 随后也失败。
+
+    所以判据不是「能不能建出来」，而是「建出来之后还能不能装下包内成员」。
+    保守做法：**target 路径超过 200 字符就直接用系统临时目录**。
+    """
+    target_len = len(str(target))
+    if target_len > 200:
+        return Path(tempfile.mkdtemp(prefix=prefix))
+    try:
+        return Path(tempfile.mkdtemp(prefix=prefix, dir=str(target)))
+    except OSError:
+        return Path(tempfile.mkdtemp(prefix=prefix))
+
+
 def extract_archive(archive: Path, target: Path, password: str | None = None) -> tuple[bool, str]:
     """把压缩包安全解压到目录，返回 (成功, 信息)。"""
     archive = Path(archive)
     target = Path(target)
     if not archive.exists():
         return False, f"文件不存在：{archive}"
-    target.mkdir(parents=True, exist_ok=True)
+    # 建目标目录要用长路径前缀（Windows 上 >260 字符传统 API 失败）。
+    # 旧实现这行在 try 之外 —— 深路径时直接抛**未捕获**的
+    # `FileNotFoundError [WinError 3]` 把整个 CLI 打崩（核对 Agent 实测)。
+    try:
+        Path(long_path(target)).mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return False, (
+            f"无法创建目标目录：{target}\n"
+            f"原因：{type(exc).__name__}: {exc}\n"
+            f"（Windows 上路径超过 260 字符时需要在系统里启用长路径支持，"
+            f"或改用更短的目录）"
+        )
     name = archive.name.lower()
 
     def _finish(kind: str) -> tuple[bool, str]:
@@ -802,7 +867,7 @@ def extract_archive(archive: Path, target: Path, password: str | None = None) ->
 
     # zip / tar：先解到暂存目录，检查链接与越界后再合并（防 zip-slip 与链接逃逸）
     if name.endswith(".zip") or name.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".tar.zst")):
-        staging = Path(tempfile.mkdtemp(prefix="bs-extract-", dir=str(target)))
+        staging = _make_staging(target, "bs-extract-")
         try:
             if name.endswith(".zip"):
                 _extract_zip(archive, staging, password)
@@ -843,7 +908,7 @@ def extract_archive(archive: Path, target: Path, password: str | None = None) ->
     #   对照：zip/tar 路径走暂存目录，失败时目标目录一个字节都没动。
     #
     # 现在统一为「解到 staging → 扫链接/越界 → 合并到 target」，与 zip/tar 同构。
-    staging = Path(tempfile.mkdtemp(prefix="bs-extract-", dir=str(target)))
+    staging = _make_staging(target, "bs-extract-")
     try:
         kind = _extract_external(archive, staging, password)
         escapes = _scan_escape(staging)
@@ -999,7 +1064,7 @@ def _join_and_extract(base: str, volumes: list[tuple[int, Path]], archive: Path,
             f"目标磁盘空间不足：拼接 {len(volumes)} 个分卷需要 {total_size // (1024 * 1024) + 1} MB "
             f"临时空间（剩余 {free // (1024 * 1024)} MB）——请把 --to 指到空间充足的磁盘后重试"
         )
-    staging = Path(tempfile.mkdtemp(prefix="bs-join-", dir=str(target)))
+    staging = _make_staging(target, "bs-join-")
     try:
         joined = staging / base
         _join_split(volumes, joined)
@@ -1114,24 +1179,28 @@ def _merge_into(staging: Path, target: Path, conflicts: list[str] | None = None)
     """
     for item in staging.iterdir():
         dest = target / item.name
+        # **所有落盘操作都走长路径前缀**（S0，核对 Agent）：
+        # Windows 上 target 可能超过 260 字符，`shutil.move` / `iterdir` /
+        # `exists` 全都会失败，于是整包解不出来。
+        lp_dest = long_path(dest)
         item_is_dir = item.is_dir() and not item.is_symlink()
 
         if item_is_dir:
-            if dest.exists() and not dest.is_dir():
+            if os.path.exists(lp_dest) and not os.path.isdir(lp_dest):
                 # 文件 ↔ 目录冲突：保留用户的文件，改名让位
                 _park_conflict(dest, conflicts)
-                shutil.move(str(item), str(dest))
-            elif dest.is_dir():
+                shutil.move(str(item), lp_dest)
+            elif os.path.isdir(lp_dest):
                 _merge_into(item, dest, conflicts)
             else:
-                shutil.move(str(item), str(dest))
+                shutil.move(str(item), lp_dest)
         else:
-            if dest.is_dir():
+            if os.path.isdir(lp_dest):
                 # 目录 ↔ 文件冲突：保留用户的目录，改名让位
                 _park_conflict(dest, conflicts)
-            elif dest.exists():
-                dest.unlink()  # 同名文件：恢复的本意就是拿回它，覆盖合理
-            shutil.move(str(item), str(dest))
+            elif os.path.exists(lp_dest):
+                os.unlink(lp_dest)  # 同名文件：恢复的本意就是拿回它，覆盖合理
+            shutil.move(str(item), lp_dest)
 
 
 def _park_conflict(dest: Path, conflicts: list[str] | None) -> None:
@@ -1139,9 +1208,9 @@ def _park_conflict(dest: Path, conflicts: list[str] | None) -> None:
     n = 1
     while True:
         parked = dest.with_name(f"{dest.name}.conflict-{n}")
-        if not parked.exists():
+        if not os.path.exists(long_path(parked)):
             break
         n += 1
-    shutil.move(str(dest), str(parked))
+    shutil.move(long_path(dest), long_path(parked))
     if conflicts is not None:
         conflicts.append(f"{dest.name} → {parked.name}（类型冲突，你的原文件已保留）")

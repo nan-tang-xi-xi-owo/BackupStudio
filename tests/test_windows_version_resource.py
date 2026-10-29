@@ -6,7 +6,7 @@
 ``VSVersionInfo``；PyInstaller 日志里只有 ``Copying 0 resources to EXE``。
 后果：``dist/BackupStudio/BackupStudio.exe`` 的
 「文件版本 / 产品版本 / 公司名 / 产品名 / 版权」**全空**，
-而安装包 ``BackupStudio-Setup-1.1.0.exe`` 有版本（Inno Setup 自己写的）——
+而安装包 ``BackupStudio-Setup-1.1.1.exe`` 有版本（Inno Setup 自己写的）——
 「安装包有版本、装进去的主程序没版本」，资源管理器、杀软信誉、
 企业软件清单、卸载列表全部受影响。
 
@@ -31,7 +31,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_VERSION = "1.1.0"
+EXPECTED_VERSION = "1.1.1"
 BUILD_PY = ROOT / "packaging" / "build.py"
 
 
@@ -68,10 +68,10 @@ def version_file(build_mod, tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_version_tuple_pads_to_four(build_mod):
-    assert build_mod._version_tuple("1.1.0") == (1, 1, 0, 0)
+    assert build_mod._version_tuple("1.1.1") == (1, 1, 1, 0)
     assert build_mod._version_tuple("2.3") == (2, 3, 0, 0)
     assert build_mod._version_tuple("1.2.3.4.5") == (1, 2, 3, 4)
-    assert build_mod._version_tuple("1.1.0-beta") == (1, 1, 0, 0)
+    assert build_mod._version_tuple("1.1.1-beta") == (1, 1, 1, 0)
 
 
 def test_version_file_is_written(build_mod, version_file):
@@ -107,10 +107,10 @@ def test_required_fields_cover_the_six_that_matter(build_mod):
 
 def test_version_file_versions_match(build_mod, version_file):
     text = Path(version_file).read_text(encoding="utf-8")
-    assert "filevers=(1, 1, 0, 0)" in text, f"filevers 不对：\n{text[:600]}"
-    assert "prodvers=(1, 1, 0, 0)" in text, f"prodvers 不对：\n{text[:600]}"
-    assert "'FileVersion', '1.1.0'" in text
-    assert "'ProductVersion', '1.1.0'" in text
+    assert "filevers=(1, 1, 1, 0)" in text, f"filevers 不对：\n{text[:600]}"
+    assert "prodvers=(1, 1, 1, 0)" in text, f"prodvers 不对：\n{text[:600]}"
+    assert "'FileVersion', '1.1.1'" in text
+    assert "'ProductVersion', '1.1.1'" in text
 
 
 def test_version_file_product_name_and_company_non_empty(build_mod, version_file):
@@ -193,8 +193,9 @@ def test_pyinstaller_reads_fixed_file_info_versions(version_file):
     """固定版本信息（数字部分）也必须真的写进去了。"""
     versioninfo = pytest.importorskip("PyInstaller.utils.win32.versioninfo")
     info = versioninfo.load_version_info_from_text_file(str(version_file))
+    # 版本 1.1.1 的四段编码：MS 存前两段 (1,1)，LS 存后两段 (1,0)
     assert info.ffi.fileVersionMS == (1 << 16) | 1, "fileVersionMS 不是 1.1"
-    assert info.ffi.fileVersionLS == 0, "fileVersionLS 不是 .0.0"
+    assert info.ffi.fileVersionLS == (1 << 16), "fileVersionLS 不是 .1.0"
     assert info.ffi.productVersionMS == (1 << 16) | 1
 
 
