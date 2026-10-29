@@ -1,187 +1,316 @@
-# 已知问题（1.1.0）
+# 已知问题（1.1.1）
 
-本文件记录 1.1.0 发布时**仍然存在**、但尚未在正式版修复的缺陷，以及每个缺陷的
-临时规避方法。目的是让合并记录、issue 与发布说明里提到的条目有**可打开的落点**——
-此前这些内容只存在于内部评审目录（`.gitignore` 排除），外部读者永远看不到。
+本文件记录 1.1.1 发布时**仍然存在**、但尚未修复的缺陷，以及每条缺陷的临时规避方法。
+目的是让合并记录、issue 与发布说明里提到的条目都有**可打开的落点**。
 
-> 状态说明：**已修复** = 已进主线并带回归测试；**已规避** = 行为上不会伤到用户，
-> 但根因还在；**未修复** = 仍会复现。
+> **状态说明**
+> - **已修复** = 已进主线并带回归测试
+> - **已规避** = 行为上不会伤到用户，但根因还在
+> - **未修复** = 仍会复现
 >
 > 本文件按「影响面」排序，数据丢失类在最前。
 
 ---
 
-## S2（高危 / 数据丢失）保留策略把「幽灵组」算作一份备份
+## 一、1.1.1 已修复的 26 项
 
-**状态：已修复**（`manifest.BackupGroup.countable` + `engine.apply_retention` 的
-`incomplete` 桶；回归测试 `tests/test_retention_ghost_group.py`）
+以下问题在本版**已修复，不再需要规避**。列出它们是为了让此前遇到这些问题的用户
+能确认「你踩的那个坑已经填了」。
 
-### 现象
+### 灾难级（4 项）
 
-备份目录里的某一组**清单（manifest）还在、但清单里列的卷一个都不在盘上**（下称
-"幽灵组"）时，保留策略会把它当成**一份完整的可信备份**：
+| # | 问题 | 此前后果 |
+|---|---|---|
+| 1 | **FIFO / 设备文件让备份永久卡死** | 源目录有一个命名管道，备份进程就阻塞在 `open()` 上永不返回，只能强杀 |
+| 2 | **恢复时「文件 ↔ 目录」重名删掉用户文件** | 往已有备份目录补解压时，用户的文件/目录被静默删除，返回「已解压」 |
+| 3 | **源文件被占用产出错位坏包** | PSD/Excel 开着时备份，tar 流错位：中间文件名配下一个文件的内容，后续文件凭空消失，而界面报「校验通过」 |
+| 4 | **Windows 长路径（>260）备份静默丢文件** | 文件不进包，仍报 `success / verification=passed` |
 
-- 它占掉 `keep_last` 的一个名额；
-- 计入 `keep_days` 与 `max_total_gb` 的统计；
-- 排序后可能落在"该保留的最新 N 份"区间里，从而把真正完好的备份挤到淘汰区。
+### 数据丢失级（9 项）
 
-实测（`keep_last=2`、2 份真备份 + 1 个幽灵组）：
+| # | 问题 | 此前后果 |
+|---|---|---|
+| 5 | 并发建任务丢失 | 锁竞争超 30 秒后静默降级成不持锁写 → 20 并发丢 90% |
+| 6 | TOCTOU（读快照在加锁之前） | 指纹撞车率 2.6%，持锁也跳过合并 → 整库覆写 |
+| 7 | `undo_last_save()` 锁外整库写 | 撤销一次保存会抹掉期间 CLI 新增的任务 |
+| 8 | 跨任务前缀误认领 | `backup` 任务删掉 `backup_photos` 的**唯一一份**备份 |
+| 9 | 瞬态读失败 → 整库改名 `.rescue` | 10 个任务只剩 1 个，rc=0 |
+| 10 | tar 残包永久堆积 | 强杀后残包文件名正常，清扫逻辑识别不到 |
+| 11 | 类属性共享列表 `skipped_busy` | 干净备份继承上次的跳过清单 → 误标 `partial` → 被保留策略当垃圾回收 |
+| 12 | Windows 保留名（CON/NUL/AUX） | `open()` 成功但数据被设备吞掉，`size=0` |
+| 13 | 大小写冲突（`Readme.txt`/`readme.txt`） | Windows 上只落地 1 个，无告警 |
+
+### 校验与恢复（7 项）
+
+| # | 问题 | 此前后果 |
+|---|---|---|
+| 14 | 裸 tar 边界截断假通过 | 4 个截断位置返回 `passed`，尾部文件已丢 |
+| 15 | 6 种病因同一句报错 | 错密码/没密码/包截断/缺分卷/文件不存在/格式不支持，输出除文件名外字节级相同 |
+| 16 | 绝对符号链接废掉整包 | Linux/WSL 上 `ln -s $PWD/xxx` → 整包一个文件都解不出来 |
+| 17 | 符号链接与权限位丢失 | tarfile 解包 `continue` 掉所有链接；0600 私钥变 0644 |
+| 18 | zip 路径的 Windows 非法字符 | 一个 `a<b.txt` 让整包解压失败，连旁边正常文件也拿不到 |
+| 19 | 长路径解压（zip/tar 失败、7z 假成功） | 271 字符目标路径下解不出任何文件 |
+| 20 | `--exclude 'node_modules'` 官方示例不生效 | 目录被排除后其子文件仍被完整打包 |
+
+### 其它（6 项）
+
+| # | 问题 | 此前后果 |
+|---|---|---|
+| 21 | `re:` 正则排除被反斜杠转换破坏 | `re:\.log$` → `re:/.log$`，永不匹配 |
+| 22 | `source_bytes` 虚高 2~7 倍 | 空间预检按 12.3 倍要求；进度条最多走到 22% 就跳「完成」 |
+| 23 | `force_rmtree` 返回值被 5 处忽略 | 删不净无提示，明文永久残留 |
+| 24 | `_pid_alive` 把 `ACCESS_DENIED` 判死 | 误删别人的活暂存目录 |
+| 25 | junction 环路无检测 | 自引用 junction → 192 个条目（真实 4 个文件） |
+| 26 | DirLock 互斥测试时序脆弱 | CI 上偶发红（测试问题，非产品缺陷） |
+
+---
+
+## 二、未修复（本版仍会复现）
+
+### 2.1 属主（uid/gid）不保留 —— 已规避
+
+**影响**：Unix 侧属主信息丢失。
+
+**现状**：`archives.py` 里 `ti.uid = ti.gid = 0`、`ti.uname = ti.gname = ""` 是硬编码。
+备份时不记录真实 uid/gid，恢复后所有文件归执行恢复的用户所有。
+
+**实测**：源 `uid=1234` → tar 成员 `uid=0 gid=0 uname=''`。
+
+**为什么列为已知**：正确实现需要「以 root 备份时保留属主、以普通用户备份时
+不应假装是 root」的策略判断，且跨平台语义差异大（Windows 无 uid 概念）。
+
+**规避**：
+
+- 备份 `/etc`、`/var/log` 等**依赖属主**的目录时，恢复后手工 `chown -R`
+- 或改用 `tar --numeric-owner` 在带外做一份归档
+- 普通用户备份自己的数据（属主都是自己）时**无影响**
+
+---
+
+### 2.2 目录权限硬编码 0755 —— 已规避
+
+**影响**：目录的收紧权限在恢复后变宽。
+
+**现状**：`add_dir` 传死 `0o755`（`archives.py` 两处）。源目录是 `0700`/`0750`
+时，恢复出来仍是 `0755`。
+
+**实测**：源 `mydir mode=0750` → 归档 `mode=0o755` → 恢复 `0755`。
+
+**风险**：把 `0700` 的私密目录恢复成 `0755` = **权限放宽**，比收紧更危险。
+
+**规避**：
+
+- 敏感目录恢复后手工 `chmod 700 <dir>`
+- **文件**权限本身是保留的（1.1.1 已修），只有**目录**受影响
+
+---
+
+### 2.3 `task add` 阶段不校验密码 —— 已规避
+
+**影响**：非法密码能建任务，但永远跑不了。
+
+**现状**：密码守卫在 `create_archive()`（压缩期），CLI 的 `task add` 无预检。
+
+**实测**：
 
 ```
-=== find_backup_blobs ===
-stem='real0.zip'  managed=True  complete=True   state='committed'
-stem='real1.zip'  managed=True  complete=True   state='committed'
-stem='ghost.zip'  managed=True  complete=False  state='committed'  files=[]
-=== apply_retention ===
-handled = ['real0.zip']
-剩余真实备份 = ['real1.zip']            ← 本应保留 2 份，实际只剩 1 份
+task add --format zip --password 中文密码   → rc=0（任务已创建）
+run <id>                                  → status=failure（ZIP 不支持非 ASCII 密码）
 ```
 
-幽灵组本身还会**永久占盘**：它的清单没有任何代码去清理，于是"空清单"越积越多，
-每次都在挤占配额。
+**为什么不是 P0**：不会产出坏包（fail-closed），只是「创建时没说，运行时才说」。
 
-### 根因（三处叠加）
+**规避**：
 
-1. `manifest.collect_groups` 对"清单在、卷全丢"的 stem 仍然建组（`files=[]`、
-   `complete=False`）——这是对的，调用方需要看见它才能清理；
-2. `BackupGroup.managed` 只判断 `manifest.is_committed`，**完全忽略 `complete`**；
-3. `engine.apply_retention` 的 `trusted` 候选直接用 `b.managed`，从不读
-   `complete`（全文件 `complete` 只有定义、传递、赋值三处，无任何判断）。
+- 建完任务立刻 `run` 一次做验证，别等定时触发
+- 会同时给出明确的中文错误原因
 
-### 修复
+---
 
-把两种语义**显式分开**，这是本次修复的核心：
+### 2.4 `partial` 状态在 `extract` 时无提示 —— 未修复
 
-| 语义 | 判据 | 幽灵组 / 缺卷残包 |
-| --- | --- | --- |
-| 计入 `keep_last` / `keep_days` / `max_total_gb` 配额 | `BackupGroup.countable` = 有清单 + `committed` + `complete` | **否** |
-| 可被保留策略回收清理 | `apply_retention` 的 `incomplete` 桶 | **是** |
+**影响**：从**不完整**的备份恢复时，用户不知道少了文件。
 
-- 幽灵组（`files` 为空）：盘上没有任何用户数据，只剩孤儿清单 → **无条件回收**
-  （实际动作只是删掉那个 `.json`，零风险）；
-- 缺卷残包（还有部分卷）：已无法完整恢复，但卷本身仍是用户数据 → 只在**已被一份
-  更新的完整备份取代**时才回收，避免"备份盘瞬时不可读 → 所有卷被误判缺失"把用户
-  唯一一份备份清走（默认 `move` 模式还会先进回收站）。
+**现状**：`extract.py` 全文不读 manifest（`manifest` 出现 0 次、`partial` 0 次）。
+对 `state=partial` 的包 `extract` → `rc=0`，静默按正常包解压。
 
-### 临时规避（若你用的是 1.1.0 正式版）
+**实测**：清单 `state: partial`（应 4 文件实际 3），`extract` 返回 0，
+只说「已解压到 …」。
+
+**风险**：灾难恢复时以为拿全了，实际缺关键文件。
+
+**规避**：
 
 ```bash
-# 1) 先看有哪些"清单在、卷不在"的组（只读，不动文件）
-python -m backupstudio info          # 环境与压缩支持
-# 2) 手动核对 <备份目录>/.backupstudio/manifests/*.json 与盘上文件名
-# 3) 确认某份清单对应的卷确实全丢了 → 删掉该 .json
-# 4) 保守起见把清理方式设为 move，而不是 delete
+# 先用 task show 看最近一次备份状态
+backupstudio task show <任务名>       # 关注 last_status 是否为 success
+# 只有 success 才当完整备份用；partial/failure 需重新跑一次备份
 ```
-
-配置里 `retention.on_cleanup` 默认是 `move`（挪到
-`<备份目录>/.backupstudio/trash/<日期>/`，可反悔）。**不要**在没有核对清单的情况下
-把它改成 `delete`。
 
 ---
 
-## S1（安全 / 可被绕过）炸弹预检对「无 Size 容器」fail-open
+### 2.5 `backupstudio` 无参数启动 GUI 并永久阻塞 —— 已规避
 
-**状态：已修复**（`extract._sum_size_lines` 的 `seen` 守卫；回归测试
-`tests/test_bomb_unknown_size.py`）
+**影响**：脚本误调用会卡死。
 
-### 现象
+**现状**：`app.py` 里 `cmd = args.command or ("gui" if not argv else None)`
+→ 无参数直接进 GUI 事件循环，既不打印用法也不返回。
 
-对**声明解压大小为空**的容器，压缩炸弹预检完全失效，可被用来做 zip bomb 攻击。
+**实测**：`backupstudio`（无参数）12 秒未退出。
 
-7-Zip 对**流式 / 未知大小**的容器只输出空值。实测 `7z l -slt -ba payload.tar.zst`：
+**规避**：
 
-```
-Size =
-Packed Size =
-```
-
-（容器头里是 `Method = header-open-only ... unknown-content-size`）——一个数字都没有。
-于是 `_sum_size_lines` 返回 `0`，`_check_external_bomb` 的判定 `0 > limit` 恒假，
-**静默放行**。
-
-实测：把 `BACKUPSTUDIO_MAX_UNPACKED_BYTES` 压到 256 KiB，一个 4 MiB 的 `.tar.zst`
-仍被完整解出来（`ok=True`）。
-
-### 根因
-
-`extract._sum_size_lines` 在"命令跑成功但一行 `Size =` 都没解析到"时返回 `0`
-而不是 `None`；而 `_check_external_bomb` 只拦 `None`。
-
-**不对称证据**：rar 路径的 `_declared_unpacked_unrar` 一直有 `seen` 守卫
-（`return total if seen else None`），7z 路径漏了。
-
-### 修复
-
-`_sum_size_lines` 加 `seen` 守卫，零命中返回 `None`（与 rar 对齐）。修复后：
-
-```
-_sum_size_lines(无 Size 容器) -> None
-extract_archive(disguised.7z, 上限 256 KiB) -> ok=False
-    msg=无法预读 ... 的解压后大小，拒绝在未预检的情况下解压
-```
-
-正常的 7z / zip / tar.gz、以及**只含空目录**的包（`Size = 0` 可解析）都不受影响。
-
-### 临时规避（若你用的是 1.1.0 正式版）
-
-**不要**对来源不可信的 `.tar.zst` / `.tar.bz2` 等流式容器使用「解压」功能。
-若必须解，先自行确认文件来源与体积。**切勿**为了"能解开"就把
-`BACKUPSTUDIO_MAX_UNPACKED_BYTES` 设成 `0`——那等于关闭唯一的绝对上限。
+- 脚本里**永远显式指定子命令**（`task` / `run` / `selftest` / `extract`）
+- 需要用法时用 `--help`
+- 无显示环境（CI/服务器）务必显式传子命令
 
 ---
 
-## S3（体验 / 功能静默失效）内置 ZIP 忽略压缩级别
+### 2.6 CLI 缺少 `--json` 与分级退出码 —— 未修复
 
-**状态：已修复**（`archives.zip_info_level`，三处写出点统一调用；回归测试
-`tests/test_zip_level.py`）
+**影响**：自动化集成受限。
 
-### 现象
+**现状**：
 
-内置 ZIP 后端的"压缩级别"设置**完全无效**：级别 1 与级别 9 产出**位元组完全相同**的
-压缩包。用户以为自己在"调小体积 / 调快速度"，实际永远是 zlib 的默认级别 6。
+- **有** `--json`：`info`、`selftest`、`task show`
+- **无** `--json`：`run`、`extract`、`task list`
+- `partial` 与 `failure` 的退出码**都是 1**，CI 无法区分
 
-实测（584000 B 源）：
+**规避**：
 
-```
-修复前： level=1 -> 17228 B    level=9 -> 17228 B     ← 完全相同
-修复后： level=1 -> 27060 B    level=9 -> 17221 B     ← 级别真正生效
-```
-
-### 根因
-
-三处写出点只设了 `zi.compress_type`，**没设 `zi.compress_level`**
-（全项目 `compress_level` 此前零命中）：
-
-- `archives.ZipCompressor._info`
-- `py7zr_backend.Py7zrCompressor._zip_info`
-- `py7zr_backend.ZipFileCompressor._info`
-
-Python 3.12+ 的 `zipfile._ZipWriteFile` 读的是 `zinfo.compress_level`，
-而 `ZipInfo.compress_level` 默认 `None` → 落到 `zlib.Z_DEFAULT_COMPRESSION`（恒 6）。
-
-现有测试只断言了 `compress_type == ZIP_DEFLATED` 和 `ratio < 0.05`，
-**级别差异完全没有断言**——这是"assert 太松"的典型，所以缺陷一直没被发现。
-
-### 修复
-
-新增 `archives.zip_info_level(zi, level, *, is_dir)` 作为三处写出点的**唯一真相来源**：
-
-- `level == 0` 或目录条目 → `compress_type = STORED`，且**不设** `compress_level`
-  （zlib 不参与，设了是无意义字段）；
-- 其它 → `compress_type = DEFLATED` + `compress_level = clamp(level, 1, 9)`。
-
-### 临时规避（若你用的是 1.1.0 正式版）
-
-需要真正控制体积时，**改用 7z 格式或让 7-Zip 参与**（安装 7-Zip 后 ZIP 会走
-`SevenZipCompressor`，其 `-mx=` 参数一直是对的）。内置 ZIP 后端在 1.1.0 上
-一律等价于级别 6。
+- 解析 `task show --json`（有结构化输出）判断最近一次结果
+- 或读 `history.jsonl`（每行一条 JSON）做机读判断
+- 退出码只用于「有没有问题」的粗判断
 
 ---
 
-## 关联条目
+### 2.7 `extract` 失败不留日志 —— 未修复
 
-- 合并记录与 issue 里提到的 `_pm/review-v11/REVIEW-fix-1.1-review.md` 是**内部评审
-  材料**，`.gitignore` 第 20 行排除了整个 `_pm/` 目录，因此外部读者无法访问。
-  本文件即该评审中三条残留缺陷的**公开可读版本**。
-- 版本号一致性：`.github/workflows/build.yml` 的 `env.APP_VERSION` 与
-  `backupstudio.__version__` 由 CI 的 `test-linux` job 强制对齐，不一致会让构建失败。
+**影响**：灾难恢复失败后无痕迹可查。
+
+**现状**：`_cmd_extract` 里没有 `log.*` 也没有 `append_history` —— 失败只
+`print` 到 stdout，`app.log` / `history.jsonl` 都不会记录。
+
+**风险**：事后无法确认「那次恢复到底为什么失败」。
+
+**规避**：手动保存输出
+
+```bash
+backupstudio extract backup.7z --to /restore 2>&1 | tee restore-$(date +%s).log
+```
+
+---
+
+### 2.8 `task add --time` 参数不校验 —— 未修复
+
+**影响**：非法时间会静默产出奇怪的计划。
+
+**现状**：`_parse_time("25:99")` 返回 `(2, 0)` → 落盘成 `daily 02:00`，**零警告**。
+
+**实测**：`task add --time 25:99` → `rc=0`，`schedule={'type':'daily','time':'02:00'}`。
+
+**规避**：
+
+- 建完用 `task show <name>` 核对 `schedule` 字段
+- 时间用 `HH:MM` 两位数格式
+
+---
+
+### 2.9 `_LAST_SPECIAL_SKIPPED` 无人消费 —— 未修复
+
+**影响**：被跳过的 FIFO/设备/junction 对用户不可见。
+
+**现状**：`archives.py` 只写不读，全仓库无任何读取方 → 这些跳过**不进
+`skipped_busy`**，因此不影响 `status`。
+
+**说明**：1.1.1 已让「FIFO 不再挂死」和「junction 不再展开」，但**跳过的
+清单还没送到用户面前**。
+
+**规避**：备份后抽查产物条目数
+
+```bash
+7z l backup.7z | tail -3        # 看 "N files"
+tar -tvf backup.tar | wc -l     # 与源目录文件数对比
+```
+
+---
+
+### 2.10 zip 后端不保留权限位 —— 已规避
+
+**影响**：zip 恢复出来的文件权限固定是 `0644`。
+
+**现状**：`archives.py` 里 `zi.external_attr = (0o40755 if is_dir else 0o100644) << 16`
+是硬编码。（**mtime 是保留的**，2 秒精度 —— 此前文档说「mtime 也丢」不成立）
+
+**规避**：
+
+- 需要保留权限（可执行脚本、0600 私钥）时**用 7z 或 tar 格式**
+- 或恢复后手工 `chmod +x`
+
+---
+
+### 2.11 `task list` 中文名导致后续列右移 —— 未修复
+
+**影响**：表格错位，读屏软件定位失败。
+
+**现状**：`app.py` 表头用 `f"{'ID':<14} {'名称':<16}"` 按**字符数**补齐，
+中文字符显示宽度是 2。同文件已有 `_display_width()` 却未用于表格。
+
+**实测**：`name='abc'` 显示宽度 80，`name='中文任务名'` 显示宽度 85。
+
+**规避**：用 `task show <name>` 看单个任务（结构化输出，不受表格影响）
+
+---
+
+### 2.12 `*/node_modules/*` 需 ≥3 段路径 —— 文档语义
+
+**影响**：按字面理解可能以为两段路径也匹配。
+
+**现状**：`*/node_modules/*` 要求 `a/node_modules/b`（三段）；
+`node_modules/b.js`（两段）不匹配。这是 `fnmatch` 的 `*` 不跨 `/` 的正常语义。
+
+**规避**：**推荐直接写目录名** `--exclude node_modules` —— 三种深度全部命中
+（1.1.1 已修，此前完全失效）。
+
+---
+
+## 三、平台级限制（非缺陷，但需要知道）
+
+### 3.1 Windows 长路径仍需要系统支持
+
+1.1.1 已让产品**自己**用 `\\?\` 前缀处理长路径（备份与解压都覆盖）。
+但以下场景仍受限：
+
+- **7z 外部程序**解压深路径成员时仍可能失败（它内部也受 MAX_PATH 约束）
+- **其它工具**（资源管理器、WinRAR）打开这些产物时可能报错
+
+**规避**：在系统里启用长路径支持（需管理员 + 重启）
+
+```
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\FileSystem" /v LongPathsEnabled /t REG_DWORD /d 1 /f
+```
+
+### 3.2 macOS Unicode 规范化（未实测）
+
+macOS 的 HFS+/APFS 默认把文件名规范化成 **NFD**（分解形式），而 Linux/Windows
+用 NFC。理论上「在 Linux 备份 → 在 macOS 恢复」时，文件名可能被折叠或覆盖。
+
+**状态**：**未实测**（无 macOS 机器）。列在这里是因为它属于同一类
+「跨平台文件名差异」问题。
+
+### 3.3 未签名的 macOS 产物
+
+`.dmg` 未做 Apple 公证。首次打开需右键 → 「打开」，否则 Gatekeeper 会拦。
+
+---
+
+## 四、如何报告新问题
+
+请附上：
+
+1. `backupstudio selftest --json` 的输出
+2. `backupstudio info --json` 的输出
+3. 复现步骤 + 实际输出（`2>&1 | tee` 保存）
+4. 如果涉及数据丢失：**源文件清单与产物清单的对比**
+
+数据丢失类问题会优先处理。
