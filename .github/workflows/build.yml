@@ -582,11 +582,41 @@ jobs:
 
   release:
     name: 发布 Release
-    # `!cancelled()` 是必须的：macOS arm64 runner 容量不足时 GitHub 会把
-    # test-macos 判为 cancelled（runner_id=0、steps=0、排队 901 秒后放弃），
-    # 而 needs 里含它 → 默认的 success 语义会让本 job 永久 skip。
-    # `!cancelled()` 覆盖的只是「上游未成功」，workflow 自身被取消时仍不跑。
-    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/') }}
+    # ## if 条件的三个部分，缺一不可（全部有实证，见下）
+    #
+    # 1. `!cancelled()` —— **上游被 cancelled / skipped 时仍运行**
+    #    macOS arm64 runner 容量不足时 GitHub 会把 test-macos 判为 cancelled
+    #    （runner_id=0、steps=0、排队 901 秒后放弃），needs 里含它 → 默认的
+    #    success 语义会让本 job 永久 skip。
+    #
+    #    机制：官方实现 `CancelledFunction.cs` 是
+    #        `return jobStatus == ActionResult.Cancelled;`
+    #    读的是 **JobContext.Status（整个 run 的状态）**，代码里没有任何遍历
+    #    needs 的逻辑 —— 所以上游 job 被取消不会让它返回 true。
+    #    但**整个 workflow 被用户 Cancel** 时它返回 true → 本 job 不跑（正确）。
+    #
+    # 2. `!failure()` —— **上游真失败时必须拦住**（实测发现的缺口）
+    #    实证矩阵（本仓库 6 个探针 run）：
+    #        上游 cancelled → `!cancelled()` 放行  ✅ 期望放行
+    #        上游 skipped   → `!cancelled()` 放行  ✅ 期望放行
+    #        上游 failure   → `!cancelled()` **仍放行**  ❌ 期望拦住！
+    #    即 `!cancelled()` 挡不住 failure。若 Windows/Linux 构建真失败，
+    #    release 仍会发版 —— 只靠「门禁 B」兜底太晚。加上 `!failure()` 后三者全对。
+    #
+    # 3. tag 判断 —— 只有打 tag 才发版（分支 push 不发）
+    #
+    # ## 为什么不用 `always()`（同样实证）
+    # 手动 Cancel 整个 run 后：
+    #     `always()` 的 job        → **success，3 个 step 真跑完了**（会发版！）
+    #     `!cancelled()` 的 job    → cancelled，steps=0，不分配 runner
+    # 官方文档也警告 always() 用于关键任务可能让 workflow 挂起到超时。
+    #
+    # ## 为什么 needs 必须保留 macOS 三项
+    # `needs` 同时承担「成功后」和「之后」两件事（官方原文：
+    # "must complete successfully **before this job will run**"）。
+    # 删掉 macOS 会让 release 与 dmg job 并行 → `download-artifact` 抢跑
+    # → 门禁 B 对**健康构建**误报红。保留 needs + `!cancelled()` 才是对的。
+    if: ${{ !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     # **needs 必须保留 macOS 三项**，即使它们可能被取消。
     #
