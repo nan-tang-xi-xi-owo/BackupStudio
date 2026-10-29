@@ -249,6 +249,39 @@ class Progress:
 # 扫描 / 规划
 # --------------------------------------------------------------------------
 
+def _is_junction(p: Path) -> bool:
+    """是否是 Windows 目录联接（junction / 重解析点）。
+
+    ## 为什么必须单独判（P1，核对 Agent 实测）
+
+    Windows 上 junction 的 ``is_symlink()`` 是 **False**、
+    ``is_dir(follow_symlinks=False)`` 是 **True** —— 于是 `_iter_tree` 把它当
+    「普通目录」无限下钻。
+
+    实测（`mklink /J src\\loop src` 自引用）：
+        ``plan_items`` 得 **192 个条目**，而真实文件只有 **4 个**，
+        嵌套到 ``src/loop/loop/loop/...``
+
+    普通用户就能 `mklink /J`，容器/开发目录里很常见。后果：备份体积爆炸、
+    时间暴涨，真环路会把磁盘写满。
+
+    判据：``os.lstat`` 的 ``st_reparse_tag``（Python 3.8+ 在 Windows 上提供），
+    或 `FILE_ATTRIBUTE_REPARSE_POINT` 位。
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        st = os.lstat(p)
+    except OSError:
+        return False
+    # st_reparse_tag 存在且非 0 → 重解析点（junction / mount point / 符号链接）
+    tag = getattr(st, "st_reparse_tag", 0)
+    if tag:
+        return True
+    # 退化判据：文件属性里的 REPARSE_POINT 位（0x400）
+    return bool(getattr(st, "st_file_attributes", 0) & 0x400)
+
+
 def _iter_tree(root: Path, arcname: str, follow: bool) -> Iterator[tuple[Path, str, bool, bool, str]]:
     """产出 (路径, 归档名, 是否目录, 是否符号链接, 链接目标)。"""
     try:
@@ -263,6 +296,13 @@ def _iter_tree(root: Path, arcname: str, follow: bool) -> Iterator[tuple[Path, s
         return
     yield root, arcname, True, False, ""
     stack: list[tuple[Path, str]] = [(root, arcname)]
+    # **环路防护**：记录已展开目录的 realpath，junction/符号链接成环时不再下钻。
+    # 用 realpath 而不是 path：junction 的 path 每层都不同，但 realpath 相同。
+    visited: set[str] = set()
+    try:
+        visited.add(os.path.realpath(long_path(root)))
+    except OSError:
+        pass
     while stack:
         current, current_arc = stack.pop()
         try:
@@ -284,6 +324,15 @@ def _iter_tree(root: Path, arcname: str, follow: bool) -> Iterator[tuple[Path, s
                 if entry.is_symlink():
                     if follow:
                         if p.is_dir():
+                            try:
+                                rp = os.path.realpath(long_path(p))
+                            except OSError:
+                                rp = ""
+                            if rp and rp in visited:
+                                _LAST_SPECIAL_SKIPPED.append(f"{arc}（链接成环，已跳过）")
+                                continue
+                            if rp:
+                                visited.add(rp)
                             yield p, arc, True, False, ""
                             stack.append((p, arc))
                         else:
@@ -291,6 +340,36 @@ def _iter_tree(root: Path, arcname: str, follow: bool) -> Iterator[tuple[Path, s
                     else:
                         yield p, arc, False, True, _safe_readlink(p)
                 elif entry.is_dir(follow_symlinks=False):
+                    # junction 是「重解析点」，不是真目录：把它当链接对待，
+                    # 不展开（否则自引用 junction 会无限下钻 —— 实测 192 条目 vs 4 真实文件）
+                    if _is_junction(p):
+                        if follow:
+                            # 用户要求跟随链接：仍要防环
+                            try:
+                                rp = os.path.realpath(long_path(p))
+                            except OSError:
+                                rp = ""
+                            if rp and rp in visited:
+                                _LAST_SPECIAL_SKIPPED.append(f"{arc}（junction 成环，已跳过）")
+                                continue
+                            if rp:
+                                visited.add(rp)
+                            yield p, arc, True, False, ""
+                            stack.append((p, arc))
+                        else:
+                            _LAST_SPECIAL_SKIPPED.append(f"{arc}（junction，未展开）")
+                            yield p, arc, False, True, _safe_readlink(p)
+                        continue
+                    # 普通目录：防环（realpath 已访问过就不下钻）
+                    try:
+                        rp = os.path.realpath(long_path(p))
+                    except OSError:
+                        rp = ""
+                    if rp and rp in visited:
+                        _LAST_SPECIAL_SKIPPED.append(f"{arc}（与已遍历目录相同，防环跳过）")
+                        continue
+                    if rp:
+                        visited.add(rp)
                     yield p, arc, True, False, ""
                     stack.append((p, arc))
                 else:

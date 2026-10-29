@@ -216,8 +216,16 @@ def _extract_zip(archive: Path, target: Path, password: str | None = None) -> No
         declared_total = sum(i.file_size for i in infos)
         _check_bomb(archive_size, len(infos), declared_total)
         unpacked = 0
+        # 大小写冲突预扫（P1，同 tar）
+        _case_renames = _dedupe_case([i.filename for i in infos]) if sys.platform == "win32" else {}
         for info in infos:
-            dest = target / _safe_zip_name(info.filename)
+            _zf_name = info.filename
+            if _case_renames and _zf_name in _case_renames:
+                _zf_name = _case_renames[_zf_name]
+                logging.getLogger(__name__).warning(
+                    "解压时遇到大小写冲突，已改名保留：%s → %s", info.filename, _zf_name
+                )
+            dest = target / _safe_zip_name(_zf_name)
             if not _is_within(target, dest):
                 raise ExtractionError(f"压缩包内包含不安全路径，已拒绝解压：{info.filename}")
             if info.is_dir():
@@ -272,6 +280,9 @@ def _extract_tar(archive: Path, target: Path) -> None:
         # 只在 Windows 上做保留名/非法字符改名：Linux/macOS 上 `CON`、`a:b` 都是
         # **合法文件名**，改了反而破坏用户的目录结构。
         renamed_enabled = sys.platform == "win32"
+        # 大小写冲突预扫（P1）：Windows 上 Readme.txt 与 readme.txt 是同一个文件，
+        # 第二个会覆盖第一个 —— 数据静默丢失且 ok=True。先算出改名映射。
+        _case_renames = _dedupe_case([m.name for m in tf.getmembers()]) if renamed_enabled else {}
         for m in tf.getmembers():
             dest = target / m.name
             if not _is_within(target, dest):
@@ -312,6 +323,12 @@ def _extract_tar(archive: Path, target: Path) -> None:
                     # 改名后要重新校验不越界（理论上只会更安全，但保持防御）
                     if not _is_within(target, target / m.name):
                         raise ExtractionError(f"改名后路径异常，已拒绝解压：{m.name}")
+            # 应用大小写冲突改名
+            if _case_renames:
+                new_case = _case_renames.get(m.name)
+                if new_case:
+                    renamed.append(f"{m.name} → {new_case}（与另一个成员仅大小写不同）")
+                    m.name = new_case
             members.append(m)
         try:
             archive_size = archive.stat().st_size
@@ -805,6 +822,64 @@ def _scan_escape(base: Path) -> list[str]:
                 if not _is_within(base, resolved):
                     bad.append(str(p))
     return bad
+
+
+def _dedupe_case(names: list[str]) -> dict[str, str]:
+    """检测**同一目录内仅大小写不同**的成员，给重复项一个不冲突的新名字。
+
+    返回 ``{原名: 新名}``（只含需要改名的项）。
+
+    ## 为什么必须处理（P1，核对 Agent 实测）
+
+    Windows 文件系统（NTFS 默认）**大小写不敏感**：``Readme.txt`` 与
+    ``readme.txt`` 是**同一个文件**。解压时第二个会覆盖第一个 —— 数据静默丢失，
+    而 `extract_archive` 返回 `ok=True`、无任何告警。
+
+    实测（tar 含 3 个仅大小写不同的成员 + keep.txt）：
+        **只落地 2 个**（`Readme.txt` 与 `keep.txt`），另两个被覆盖
+
+    ## 关键：**只对同名文件去重，目录不参与**
+
+    第一版把目录也纳入去重集合，结果 ``src`` 目录与 ``src/a.bin`` 的 key
+    计算方式不同 → 目录被误判为冲突 → ``src/a.bin`` 被改名成 ``src_1/a.bin``，
+    整棵目录树错位（实测 6 个分卷测试因此失败）。
+
+    正确做法：**按「父目录 + 文件名」精确比较**，目录本身不改名。
+    """
+    if sys.platform != "win32":
+        return {}
+    # (lower(父目录), lower(文件名)) -> 该目录下已用的 (原名 stem+ext)
+    used: dict[tuple[str, str], str] = {}
+    rename: dict[str, str] = {}
+    for name in names:
+        parts = name.split("/")
+        # 目录部分原样保留（不同层级的同名目录不算冲突）
+        dir_key = "/".join(parts[:-1]).lower()
+        fname = parts[-1]
+        if not fname:
+            continue  # 目录条目本身（以 / 结尾）
+        key = (dir_key, fname.lower())
+        if key in used:
+            # 同一目录下已有仅大小写不同的名字 → 给这个加序号
+            stem, dot, ext = fname.partition(".")
+            n = 1
+            cand = fname
+            while True:
+                cand = f"{stem}_{n}{dot}{ext}"
+                ckey = (dir_key, cand.lower())
+                if ckey not in used:
+                    break
+                n += 1
+                if n > 9999:  # 防御：极端情况下不死循环
+                    cand = f"{stem}_{os.getpid()}{dot}{ext}"
+                    break
+            used[ckey] = cand
+            prefix = "/".join(parts[:-1])
+            rename[name] = f"{prefix}/{cand}" if prefix else cand
+        else:
+            used[key] = fname
+    return rename
+
 
 
 def _make_staging(target: Path, prefix: str = "bs-extract-") -> Path:
