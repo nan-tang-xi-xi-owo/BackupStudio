@@ -1,4 +1,4 @@
-﻿"""1.1.2 UI 修复的回归测试。
+"""1.1.2 UI 修复的回归测试。
 
 锁住三个「改回去了也不会有人发现」的行为：
 1. `partial` 状态必须映射成中文（服务端会产出这个状态）
@@ -140,3 +140,53 @@ def test_elide_label_keeps_full_text(qapp) -> None:
     lab = ElideLabel(long_path)
     assert lab.toolTip() == long_path
     assert lab.full_text() == long_path
+
+
+# ── 6. 一键删除入口 ────────────────────────────────────────────────
+def test_task_list_has_context_menu_and_delete_key() -> None:
+    """列表必须能直接删任务：右键菜单 + Delete 键。
+
+    用户反馈「备份任务里没有一键删除」—— 之前只有右侧详情区一个按钮，
+    且必须先选中任务才可用。
+    """
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "backupstudio" / "gui" / "tasks_page.py").read_text(
+        encoding="utf-8"
+    )
+    assert "CustomContextMenu" in src, "列表没设右键菜单策略"
+    assert "customContextMenuRequested" in src, "右键菜单没连接"
+    assert "def _on_list_menu" in src, "缺少右键菜单处理函数"
+    assert "Key_Delete" in src, "没有 Delete 键删除"
+    assert "def _delete_task" in src, "缺少按 id 删除的实现"
+
+
+# ── 7. 启动性能：懒加载 ────────────────────────────────────────────
+def test_main_window_lazy_pages() -> None:
+    """启动时只建「任务」页，其余三页懒加载。
+
+    实测：`_apply_theme` 若直接访问 history/env/settings 属性，
+    会把三页全部建出来（环境页探测要 0.9s），启动从 0.34s 退化到 2.08s。
+    这条测试锁住那个退化。
+    """
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "backupstudio" / "gui" / "main_window.py").read_text(
+        encoding="utf-8"
+    )
+    # _apply_theme 里不能出现直接访问三页属性的**代码**（注释里提到没关系）
+    m = re.search(r"def _apply_theme\(.*?(?=\n    def )", src, re.S)
+    assert m, "找不到 _apply_theme"
+    code = [
+        ln.split("#", 1)[0]
+        for ln in m.group(0).splitlines()
+        if not ln.strip().startswith("#")
+    ]
+    body = "\n".join(code)
+    for attr in ("self.history_page", "self.env_page", "self.settings_page"):
+        assert attr not in body, f"_apply_theme 里直接访问 {attr} 会触发懒加载，启动变慢"
+    assert '"_pages"' in body or "self._pages" in body, "_apply_theme 应只遍历已创建的页面"
+    # 必须有懒加载机制
+    assert "def _page" in src and "_prewarm_pages" in src, "缺少懒加载/预热实现"

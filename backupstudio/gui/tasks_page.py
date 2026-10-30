@@ -1,4 +1,4 @@
-﻿"""备份任务页：任务列表 + 详情 + 立即备份/进度。"""
+"""备份任务页：任务列表 + 详情 + 立即备份/进度。"""
 
 from __future__ import annotations
 
@@ -203,6 +203,12 @@ class TasksPage(QWidget):
         self.list.setStyleSheet("QListWidget { background: transparent; border: none; }")
         self.list.currentItemChanged.connect(self._on_select)
         self.list.itemDoubleClicked.connect(lambda _: self.edit_current())
+        # **1.1.2 一键删除**：列表右键菜单 + Delete 键。
+        # 之前只有右侧详情区一个「删除」按钮、且必须先选中任务才可用，
+        # 用户反馈"备份任务里没有一键删除"。
+        self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self._on_list_menu)
+        self.list.installEventFilter(self)
         left.add(self.list, 1)
         empty = muted("还没有任务。点击右上角「新建任务」开始。")
         left.add(empty)
@@ -747,7 +753,58 @@ class TasksPage(QWidget):
             self._select_by_id(new.id)
 
     def delete_current(self) -> None:
-        tid = self._current_id
+        self._delete_task(self._current_id)
+
+    # ------------------------------------------------------------------
+    # 一键删除入口（1.1.2）：右键菜单 + Delete 键
+    # ------------------------------------------------------------------
+    def eventFilter(self, obj, event) -> bool:  # noqa: ANN001, N802
+        from PySide6.QtCore import QEvent
+
+        if obj is getattr(self, "list", None) and event.type() == QEvent.Type.KeyPress:
+            if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+                tid = self._id_at_current_row()
+                if tid:
+                    self._delete_task(tid)
+                    return True
+        return super().eventFilter(obj, event)
+
+    def _id_at_current_row(self) -> str:
+        item = self.list.currentItem()
+        if item is None:
+            return ""
+        return str(item.data(Qt.ItemDataRole.UserRole) or "")
+
+    def _on_list_menu(self, pos) -> None:  # noqa: ANN001
+        from PySide6.QtWidgets import QMenu
+
+        item = self.list.itemAt(pos)
+        if item is None:
+            return
+        tid = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        if not tid or self.state.get(tid) is None:
+            return
+        self.list.setCurrentItem(item)
+
+        menu = QMenu(self)
+        act_run = menu.addAction("立即备份")
+        act_edit = menu.addAction("编辑…")
+        act_dup = menu.addAction("复制")
+        menu.addSeparator()
+        act_del = menu.addAction("删除任务…")
+        act_run.triggered.connect(lambda: self._with_id(tid, self.run_current))
+        act_edit.triggered.connect(lambda: self._with_id(tid, self.edit_current))
+        act_dup.triggered.connect(lambda: self._with_id(tid, self.duplicate_current))
+        act_del.triggered.connect(lambda: self._delete_task(tid))
+        menu.exec(self.list.viewport().mapToGlobal(pos))
+
+    def _with_id(self, tid: str, fn) -> None:  # noqa: ANN001
+        """先切到该任务再执行操作（右键菜单项可能不是当前行）。"""
+        self._current_id = tid
+        self._select_by_id(tid)
+        fn()
+
+    def _delete_task(self, tid: str) -> None:
         task = self.state.get(tid) if tid else None
         if task is None:
             return

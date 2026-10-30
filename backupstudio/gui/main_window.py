@@ -63,21 +63,35 @@ class MainWindow(QMainWindow):
         self.stack.setContentsMargins(0, 0, 0, 0)
         root.addWidget(self.stack, 1)
 
-        from .environment_page import EnvironmentPage
-        from .history_page import HistoryPage
-        from .settings_page import SettingsPage
+        # **1.1.2 启动性能**：只立刻建「任务」页，其余三页**懒加载**。
+        #
+        # 实测 MainWindow 构造 2.08 秒，其中 0.89 秒花在
+        # `format_capabilities()` + `environment_report()`（探测 7z/rar/zip 能力），
+        # 而环境页和任务对话框各调一次。首屏只需要任务页，没理由等它们。
+        #
+        # 懒加载后：启动只付任务页的成本；用户点开对应页才付出探测成本。
+        # `_page()` 保证四页在第一次被访问时创建，且顺序与 NAV_ITEMS 一致
+        # （`_select` 依赖 index，见下方 `_page_index`）。
         from .tasks_page import TasksPage
 
         self.tasks_page = TasksPage(state, self)
-        self.history_page = HistoryPage(state, self)
-        self.env_page = EnvironmentPage(state, self)
-        self.settings_page = SettingsPage(state, self)
-        for page in (self.tasks_page, self.history_page, self.env_page, self.settings_page):
-            self.stack.addWidget(page)
+        self.stack.addWidget(self.tasks_page)
+        self._pages: dict[str, object] = {"tasks": self.tasks_page}
+        # 占位页：让 stack 的索引与 NAV_ITEMS 对齐（懒加载时逐个替换）
+        self._placeholders: dict[str, QWidget] = {}
+        for key, _label in NAV_ITEMS:
+            if key == "tasks":
+                continue
+            ph = QWidget()
+            ph.setObjectName("Page")
+            self.stack.addWidget(ph)
+            self._placeholders[key] = ph
 
         self._select("tasks")
         self._build_tray()
         self._install_shortcuts()
+        # 空闲时预热其它页面：用户点过去时不再等探测（不阻塞首屏）
+        QTimer.singleShot(1200, self._prewarm_pages)
         # 第一次运行时提示「程序在托盘里」，只提示一次
         if not state.store.settings.tray_hint_shown and not state.store.settings.start_minimized:
             QTimer.singleShot(1500, self._show_tray_hint_once)
@@ -228,9 +242,73 @@ class MainWindow(QMainWindow):
         if hasattr(self, "side_dot"):
             self.side_dot.setStyleSheet(f"color: {color}; font-size: 8pt;")
 
+    # ------------------------------------------------------------------
+    def _make_page(self, key: str):  # noqa: ANN201
+        """按需创建页面（懒加载，1.1.2）。"""
+        from .environment_page import EnvironmentPage
+        from .history_page import HistoryPage
+        from .settings_page import SettingsPage
+
+        maker = {
+            "history": HistoryPage,
+            "env": EnvironmentPage,
+            "settings": SettingsPage,
+        }[key]
+        page = maker(self.state, self)
+        self._pages[key] = page
+        # 新建的页面要立刻跟上当前主题（懒加载不会走 _apply_theme）
+        if hasattr(self, "_pal") and hasattr(page, "set_palette_mode"):
+            try:
+                page.set_palette_mode(self._pal.dark)
+            except Exception:  # noqa: BLE001
+                log.debug("页面应用主题失败：%s", key, exc_info=True)
+        return page
+
+    def _page(self, key: str) -> QWidget:
+        """取页面，未创建则创建并替换掉占位页。"""
+        page = self._pages.get(key)
+        if page is not None:
+            return page  # type: ignore[return-value]
+        page = self._make_page(key)
+        idx = [k for k, _ in NAV_ITEMS].index(key)
+        old = self.stack.widget(idx)
+        self.stack.insertWidget(idx, page)  # type: ignore[arg-type]
+        self.stack.removeWidget(old)
+        old.deleteLater()
+        self._placeholders.pop(key, None)
+        return page  # type: ignore[return-value]
+
+    def _prewarm_pages(self) -> None:
+        """空闲预热：把还没建的页面建出来，用户点过去时不再等。
+
+        放在 1200ms 后，避开首屏渲染；失败也不影响使用。
+        """
+        for key, _label in NAV_ITEMS:
+            if key in self._pages:
+                continue
+            try:
+                self._page(key)
+            except Exception:  # noqa: BLE001
+                log.debug("预热页面失败：%s", key, exc_info=True)
+
+    # 属性代理：其它地方仍可用 `window.history_page` 这种写法
+    @property
+    def history_page(self):  # noqa: ANN201
+        return self._page("history")
+
+    @property
+    def env_page(self):  # noqa: ANN201
+        return self._page("env")
+
+    @property
+    def settings_page(self):  # noqa: ANN201
+        return self._page("settings")
+
     def _select(self, key: str) -> None:
         order = [k for k, _ in NAV_ITEMS]
         idx = order.index(key) if key in order else 0
+        # 懒加载：先确保目标页已创建（否则会切到空白占位页）
+        self._page(key)
         self.stack.setCurrentIndex(idx)
         self.nav_buttons[key].setChecked(True)
         # 选中项图标换成强调色（视觉上"当前在哪"更明确）
@@ -423,22 +501,24 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def _apply_theme(self, palette) -> None:  # noqa: ANN001
+        # **1.1.2 启动性能**：只对**已创建**的页面调 set_palette_mode。
+        # 原来这里直接访问 `self.history_page` / `self.env_page` /
+        # `self.settings_page`，在懒加载下会立刻把它们建出来（环境页的
+        # 能力探测要 0.9 秒），等于把懒加载省下的时间又花回去。
+        # 未创建的页面在 `_page()` 里创建后会自行应用当前主题。
         QApplication.instance().setStyleSheet(stylesheet(palette))
         self._pal = palette
-        # 1.1.2：导航图标原先写死 #94A3B8（浅色下偏灰、深色下偏亮），
-        # 改为跟随主题的 text_dim / accent
+        # 导航图标跟随主题（原先写死 #94A3B8）
         from .icons import line_icon
 
         for key, btn in getattr(self, "nav_buttons", {}).items():
-            active = btn.isChecked()
-            color = palette.accent if active else palette.text_dim
+            color = palette.accent if btn.isChecked() else palette.text_dim
             btn.setIcon(line_icon(key, color, 18))
         if hasattr(self, "side_dot"):
             self._set_side_state(getattr(self, "_daemon_kind", "muted"))
-        self.tasks_page.set_palette_mode(palette.dark)
-        self.history_page.set_palette_mode(palette.dark)
-        self.env_page.set_palette_mode(palette.dark)
-        self.settings_page.set_palette_mode(palette.dark)
+        for page in getattr(self, "_pages", {}).values():
+            if hasattr(page, "set_palette_mode"):
+                page.set_palette_mode(palette.dark)
 
     def _on_daemon_state(self, info) -> None:  # noqa: ANN001
         """底栏守护进程状态（1.1.2：此前信号没人接，永远显示"检测中…"）。"""
