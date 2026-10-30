@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 
+from . import DARK, LIGHT
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter
 from PySide6.QtWidgets import (
@@ -63,18 +64,21 @@ class Badge(QLabel):
     """小徽章：可用/不可用、状态等。"""
 
     COLORS = {
-        "ok": ("#16A34A", "#DCFCE7"),
-        "warn": ("#B45309", "#FEF3C7"),
-        "bad": ("#B91C1C", "#FEE2E2"),
-        "info": ("#1D4ED8", "#DBEAFE"),
-        "muted": ("#4B5563", "#E5E7EB"),
+        # 1.1.2：改为从 Palette 派生（原值与 Palette 不一致：
+        # Badge 用 #16A34A、StatusPill 用 #22C55E、Palette 用 #127F3A，
+        # 同一语义三个不同绿）
+        "ok": (LIGHT.success, "#DCFCE7"),
+        "warn": (LIGHT.warning, "#FEF3C7"),
+        "bad": (LIGHT.danger, "#FEE2E2"),
+        "info": (LIGHT.accent, "#DBEAFE"),
+        "muted": (LIGHT.text_dim, "#E5E7EB"),
     }
     DARK_COLORS = {
-        "ok": ("#6EE7B7", "#14372B"),
-        "warn": ("#FCD34D", "#3A2E10"),
-        "bad": ("#FCA5A5", "#3B1717"),
-        "info": ("#93C5FD", "#152B4D"),
-        "muted": ("#CBD5E1", "#2A2F3D"),
+        "ok": (DARK.success, "#14372B"),
+        "warn": (DARK.warning, "#3A2E10"),
+        "bad": (DARK.danger, "#3B1717"),
+        "info": (DARK.accent, "#152B4D"),
+        "muted": (DARK.text_dim, "#2A2F3D"),
     }
 
     def __init__(self, text: str = "", kind: str = "muted", parent: QWidget | None = None) -> None:
@@ -117,7 +121,15 @@ class StatusPill(QWidget):
         self.set_state("muted", "")
 
     def set_state(self, kind: str, text: str) -> None:
-        color = {"ok": "#22C55E", "warn": "#F59E0B", "bad": "#EF4444", "run": "#3B82F6"}.get(kind, "#9CA3AF")
+        # 1.1.2：改用 Palette 语义色（原 #22C55E 与 Badge 的 #16A34A、
+        # Palette 的 #127F3A 是三个不同的绿）
+        _pal = DARK if getattr(self, "_dark", False) else LIGHT
+        color = {
+            "ok": _pal.success,
+            "warn": _pal.warning,
+            "bad": _pal.danger,
+            "run": _pal.accent,
+        }.get(kind, _pal.text_dim)
         self.dot.setStyleSheet(f"color: {color}; font-size: 14px;")
         self.text.setText(text)
 
@@ -196,12 +208,14 @@ class Switch(QAbstractButton):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         on = self.isChecked()
-        track_on = QColor("#4F6BED") if not self._dark else QColor("#7C8CF8")
-        track_off = QColor("#CBD5E1") if not self._dark else QColor("#3A4056")
+        # 1.1.2：改用 Palette（原 track_off 浅色 #CBD5E1 不在 Palette 里）
+        _pal = DARK if self._dark else LIGHT
+        track_on = QColor(_pal.accent)
+        track_off = QColor(_pal.border_strong)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(track_on if on else track_off)
         p.drawRoundedRect(self.rect(), 12, 12)
-        knob = QColor("#FFFFFF") if not self._dark else QColor("#E6E8F0")
+        knob = QColor(_pal.accent_text if self._dark else _pal.surface)
         p.setBrush(knob)
         x = self.width() - 21 if on else 3
         p.drawEllipse(x, 3, 18, 18)

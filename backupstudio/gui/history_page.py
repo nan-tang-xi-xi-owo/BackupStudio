@@ -30,7 +30,14 @@ from .widgets import Card, Combo, muted, title_label
 
 log = logging.getLogger("backupstudio.gui.history")
 
-STATUS = {"success": ("成功", "ok"), "failure": ("失败", "bad"), "skipped": ("跳过", "warn")}
+STATUS = {
+    "success": ("成功", "ok"),
+    "failure": ("失败", "bad"),
+    # **1.1.2 修复**：同 tasks_page —— `engine.py` 会产出 `partial`，
+    # 这里缺这个键时历史记录会显示成原始英文 `partial` 或回落成「未运行过」。
+    "partial": ("部分完成", "warn"),
+    "skipped": ("跳过", "warn"),
+}
 COLUMNS = ["时间", "任务", "状态", "格式", "文件数", "原始大小", "压缩后", "耗时", "校验", "压缩包"]
 
 

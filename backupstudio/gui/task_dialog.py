@@ -810,9 +810,10 @@ class TaskDialog(QDialog):
         available = entry.get("available", False)
         self.fmt_status.setText(format_status_line(fmt, entry) if entry else "")
         self.fmt_status.setObjectName("SuccessText" if available else "ErrorText")
-        self.fmt_status.setStyleSheet(
-            f"color: {'#16A34A' if available else '#DC2626'}; font-weight: 600;"
-        )
+        # 1.1.2：这里原本在 setObjectName 之后**又用内联样式覆盖**，
+        # 等于把全局 QSS 的 SuccessText/ErrorText 规则废掉 ——
+        # 主题切换时颜色不跟着变。删掉内联，让全局 QSS 接管。
+        self.fmt_status.setStyleSheet("")
         # 缺失软件
         while self.fmt_missing_lay.count():
             item = self.fmt_missing_lay.takeAt(0)

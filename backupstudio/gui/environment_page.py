@@ -269,7 +269,11 @@ class EnvironmentPage(QWidget):
                 self.miss_lay.addWidget(box)
         else:
             self.miss_ok.setText("✓ 所有格式所需的组件都已就绪。")
-            self.miss_ok.setStyleSheet("color: #16A34A; font-weight: 600;")
+            # 1.1.2：改用 objectName + 全局 QSS，不用内联硬编码色
+            # （内联色会无视主题切换，且 #16A34A 在浅色下仅 3.05:1 不达 AA）
+            self.miss_ok.setObjectName("SuccessText")
+            self.miss_ok.style().unpolish(self.miss_ok)
+            self.miss_ok.style().polish(self.miss_ok)
             self.miss_ok.show()
 
         # 原始报告

@@ -279,7 +279,10 @@ class SettingsPage(QWidget):
             self.lbl_config.setText(
                 f"{st.get('actual')}  ⚠ 已回退（首选 {st.get('preferred')} 不可写）"
             )
-            self.lbl_config.setStyleSheet("color:#B45309;")
+            # 1.1.2：同上，走主题的 warning 色
+            self.lbl_config.setObjectName("WarningText")
+            self.lbl_config.style().unpolish(self.lbl_config)
+            self.lbl_config.style().polish(self.lbl_config)
             self.lbl_config.setToolTip(str(st.get("reason") or ""))
         self._loading = False
         self._refresh_daemon()

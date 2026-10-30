@@ -35,6 +35,11 @@ log = logging.getLogger("backupstudio.gui.tasks")
 STATUS_MAP = {
     "success": ("成功", "ok"),
     "failure": ("失败", "bad"),
+    # **1.1.2 修复**：`engine.py` 会产出 `status="partial"`（有文件被占用/无权限，
+    # 备份完成了但不完整）。这里原本没有这个键 → `.get()` 回落到默认值
+    # 「未运行过」，即**部分失败的备份在列表里显示成"从没跑过"**，
+    # 用户会以为定时任务没生效，实际是备份不完整需要处理。
+    "partial": ("部分完成", "warn"),
     "skipped": ("已跳过", "warn"),
     "running": ("运行中", "info"),
     "": ("未运行过", "muted"),

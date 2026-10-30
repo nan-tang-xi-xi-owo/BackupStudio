@@ -106,6 +106,24 @@ def format_icon() -> QIcon:  # 兼容旧调用
 
 @dataclass(frozen=True)
 class Palette:
+    """一套主题的全部颜色。
+
+    ## 为什么有这么多字段（1.1.2 UI 改造）
+
+    改造前只有 15 个字段，导致三个具体问题：
+
+    1. **一个色当两种用**：`selection` 既做「列表选中行背景」又做
+       「导航按钮选中态背景」，前者需正文对比 12:1、后者需 4.5:1，
+       取折中值就两头不讨好（实测 NavButton 选中态仅 3.34~3.56:1）。
+    2. **语义色只有一种形态**：`success` 既做文字又做图标，
+       文字需 4.5:1、图标只需 3:1，只给一个值就只能按最低要求取。
+    3. **`disabled` 与正常态同值**：`QPushButton:disabled` 的
+       `background` 直接用了 `surface_alt`，与正常按钮**完全相同** ——
+       规则生效了但看不出区别（实测 `#EEF2F9 -> #EEF2F9`）。
+
+    所以这里把「文字色」与「填充色」、「常态」与「禁用」分开。
+    """
+
     name: str
     dark: bool
     bg: str
@@ -121,22 +139,43 @@ class Palette:
     warning: str
     danger: str
     selection: str
+    # ── 1.1.2 新增 ──
+    #: 强边框：输入框、需要强调的卡片。比 `border` 深，保证 ≥1.5:1
+    border_strong: str = "#C2CCE0"
+    #: 禁用态背景。**必须**与常态背景可区分（旧实现直接复用 surface_alt 是 bug）
+    disabled_bg: str = "#F5F7FB"
+    #: 禁用态文字
+    disabled_fg: str = "#A0A7B8"
+    #: 焦点环颜色。需 ≥3:1 对背景（WCAG 图形元素标准）
+    focus_ring: str = "#3F58D6"
+    #: 导航/页签的选中背景。独立于 `selection`，因两者对比度要求不同
+    nav_active: str = "#E4EBFF"
 
 
 LIGHT = Palette(
     name="light", dark=False,
-    bg="#F4F6FB", surface="#FFFFFF", surface_alt="#EEF2F9", border="#D8DEEA",
-    text="#1F2430", text_dim="#6B7280", accent="#4F6BED", accent_hover="#3F58D6",
-    accent_text="#FFFFFF", success="#16A34A", warning="#D97706", danger="#DC2626",
+    bg="#F4F6FB", surface="#FFFFFF", surface_alt="#EEF2F9", border="#D5DDEB",
+    text="#1F2430", text_dim="#656B78", accent="#3E5DEB", accent_hover="#2F49C9",
+    accent_text="#FFFFFF", success="#127F3A", warning="#9F5706", danger="#D12222",
     selection="#DCE4FF",
+    border_strong="#C2CCE0",
+    disabled_bg="#F5F7FB",
+    disabled_fg="#A0A7B8",
+    focus_ring="#2F49C9",
+    nav_active="#E4EBFF",
 )
 
 DARK = Palette(
     name="dark", dark=True,
-    bg="#161821", surface="#1E2130", surface_alt="#262A3B", border="#33384D",
+    bg="#161821", surface="#212536", surface_alt="#262A3B", border="#3A4056",
     text="#E6E8F0", text_dim="#9AA1B5", accent="#7C8CF8", accent_hover="#93A0FF",
     accent_text="#11131A", success="#34D399", warning="#FBBF24", danger="#F87171",
     selection="#33406B",
+    border_strong="#4A5170",
+    disabled_bg="#1B1E2B",
+    disabled_fg="#5A6178",
+    focus_ring="#93A0FF",
+    nav_active="#2E3A66",
 )
 
 
@@ -145,14 +184,40 @@ def palette_for(name: str) -> Palette:
 
 
 def stylesheet(p: Palette) -> str:
+    """生成整套 QSS。
+
+    ## 1.1.2 改造要点（每条都有实测依据）
+
+    1. **焦点可见**：改造前 `:focus` 只有一条规则，且**只覆盖输入类**——
+       `QPushButton`(9 个规则块) 与 `QToolButton`(5 个) **都没有** `:focus`。
+       同时 `outline: none` 主动关掉了 Qt 的系统焦点框。结果：键盘用户的焦点
+       **完全不可见**（像素差实测 0/8084）。
+    2. **disabled 可辨**：改造前 `QPushButton:disabled` 的 background 与正常态
+       **同值**（`#EEF2F9`），规则生效但看不出；`QPushButton#Primary` 又因
+       **ID 选择器特异性更高**而完全盖掉了 `:disabled`（实测
+       enabled→`#4f6bed`、disabled→`#4f6bed` 逐像素相同）。
+    3. **补箭头**：`down-arrow`/`up-arrow`/`right-arrow` 全缺失。
+       `QComboBox::drop-down` 设了 `border: none; width: 22px` 却没画箭头，
+       实测箭头区只有 32 个非背景像素（几乎空白）。
+    4. **补表格选中态**：只有 `QListWidget::item:selected`，
+       `QTableWidget::item:selected` 缺失 → 历史表选中行 1.24:1，看不出选哪行。
+    5. **字号用 pt 而非 px**：`px` 无视系统文字缩放（实测系统设 20pt 后
+       仍渲染 13px）。改 `pt` 后跟随系统。
+    6. **卡片有层次**：`surface` vs `bg` 原本 1.08:1（几乎同色），
+       靠加深边框 + 保留底色差来分层。
+    """
     fg = p.text
+    # 焦点环：用 focus_ring 画 2px 外扩边框（QSS 无 box-shadow，
+    # 用 border 加粗 + 变色是 Qt 里最可靠的做法）
     return f"""
     QWidget {{
         color: {fg};
         font-family: "Segoe UI", "Microsoft YaHei UI", "PingFang SC", "Noto Sans CJK SC", "Helvetica Neue", sans-serif;
-        font-size: 13px;
+        font-size: 10pt;
     }}
     QMainWindow, QDialog, QWidget#Page {{ background: {p.bg}; }}
+
+    /* ── 卡片：靠边框分层（surface vs bg 只有 1.08:1，单靠底色看不出） ── */
     QFrame#Card {{
         background: {p.surface};
         border: 1px solid {p.border};
@@ -163,17 +228,21 @@ def stylesheet(p: Palette) -> str:
         border: 1px solid {p.border};
         border-radius: 12px;
     }}
-    QLabel#H1 {{ font-size: 22px; font-weight: 600; }}
-    QLabel#H2 {{ font-size: 16px; font-weight: 600; }}
-    QLabel#H3 {{ font-size: 14px; font-weight: 600; }}
+
+    /* ── 字号层级 ── */
+    QLabel#H1 {{ font-size: 17pt; font-weight: 600; }}
+    QLabel#H2 {{ font-size: 12pt; font-weight: 600; }}
+    QLabel#H3 {{ font-size: 11pt; font-weight: 600; }}
     QLabel#Muted {{ color: {p.text_dim}; }}
     QLabel#Badge {{
-        border-radius: 9px; padding: 2px 10px; font-size: 12px; font-weight: 600;
+        border-radius: 9px; padding: 2px 10px; font-size: 9pt; font-weight: 600;
         background: {p.surface_alt}; color: {p.text_dim};
     }}
     QLabel#ErrorText {{ color: {p.danger}; }}
     QLabel#SuccessText {{ color: {p.success}; }}
     QLabel#WarningText {{ color: {p.warning}; }}
+
+    /* ── 按钮 ── */
     QPushButton {{
         background: {p.surface_alt};
         border: 1px solid {p.border};
@@ -181,37 +250,119 @@ def stylesheet(p: Palette) -> str:
         padding: 7px 16px;
         color: {fg};
     }}
-    QPushButton:hover {{ background: {p.selection}; }}
+    QPushButton:hover {{ background: {p.selection}; border-color: {p.border_strong}; }}
     QPushButton:pressed {{ background: {p.border}; }}
-    QPushButton:disabled {{ color: {p.text_dim}; background: {p.surface_alt}; }}
+    QPushButton:focus {{
+        border: 2px solid {p.focus_ring};
+        padding: 6px 15px;
+    }}
+    /* disabled 必须与常态可区分：换背景 + 弱化文字 */
+    QPushButton:disabled {{
+        color: {p.disabled_fg};
+        background: {p.disabled_bg};
+        border-color: {p.border};
+    }}
     QPushButton#Primary {{
         background: {p.accent}; border: 1px solid {p.accent}; color: {p.accent_text}; font-weight: 600;
     }}
     QPushButton#Primary:hover {{ background: {p.accent_hover}; border-color: {p.accent_hover}; }}
+    QPushButton#Primary:focus {{
+        border: 2px solid {p.focus_ring};
+        padding: 6px 15px;
+    }}
+    /* **关键**：必须用同样带 #Primary 的选择器，否则被上面那条盖掉 */
+    QPushButton#Primary:disabled {{
+        background: {p.disabled_bg};
+        border: 1px solid {p.border};
+        color: {p.disabled_fg};
+    }}
     QPushButton#Danger {{ color: {p.danger}; }}
+    QPushButton#Danger:disabled {{ color: {p.disabled_fg}; }}
     QPushButton#Link {{ background: transparent; border: none; color: {p.accent}; padding: 2px 4px; }}
     QPushButton#Link:hover {{ text-decoration: underline; }}
+    QPushButton#Link:focus {{ border: 2px solid {p.focus_ring}; border-radius: 6px; }}
+    QPushButton#Link:disabled {{ color: {p.disabled_fg}; }}
+
+    /* ── 输入类 ── */
     QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox, QDateTimeEdit, QTimeEdit {{
         background: {p.surface};
-        border: 1px solid {p.border};
+        border: 1px solid {p.border_strong};
         border-radius: 8px;
         padding: 6px 9px;
         selection-background-color: {p.accent};
         selection-color: {p.accent_text};
     }}
-    QLineEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus, QTimeEdit:focus {{
-        border: 1px solid {p.accent};
+    QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QSpinBox:focus,
+    QDoubleSpinBox:focus, QComboBox:focus, QDateTimeEdit:focus, QTimeEdit:focus {{
+        border: 2px solid {p.focus_ring};
+        padding: 5px 8px;
     }}
-    QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled {{ color: {p.text_dim}; background: {p.surface_alt}; }}
-    QComboBox::drop-down {{ border: none; width: 22px; }}
+    QLineEdit:disabled, QPlainTextEdit:disabled, QTextEdit:disabled,
+    QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled,
+    QDateTimeEdit:disabled, QTimeEdit:disabled {{
+        color: {p.disabled_fg}; background: {p.disabled_bg}; border-color: {p.border};
+    }}
+
+    /* ── 下拉框：补回箭头（原来只有 ::drop-down 没有 down-arrow，箭头区几乎空白） ── */
+    QComboBox::drop-down {{
+        border: none; width: 22px; subcontrol-origin: padding; subcontrol-position: center right;
+    }}
+    QComboBox::down-arrow {{
+        image: none;
+        border-left: 4px solid transparent;
+        border-right: 4px solid transparent;
+        border-top: 5px solid {p.text_dim};
+        width: 0; height: 0;
+        margin-right: 8px;
+    }}
+    QComboBox::down-arrow:hover {{ border-top-color: {p.accent}; }}
+    QComboBox::down-arrow:disabled {{ border-top-color: {p.disabled_fg}; }}
     QComboBox QAbstractItemView {{
-        background: {p.surface}; border: 1px solid {p.border}; selection-background-color: {p.selection};
+        background: {p.surface}; border: 1px solid {p.border_strong}; selection-background-color: {p.selection};
         selection-color: {fg}; outline: none;
     }}
+
+    /* ── 微调框：补回上下箭头（原来完全没有，深色下 1.13:1 等于隐形） ── */
+    QSpinBox::up-button, QDoubleSpinBox::up-button,
+    QTimeEdit::up-button, QDateTimeEdit::up-button {{
+        subcontrol-origin: border; subcontrol-position: top right;
+        width: 18px; border: none; background: transparent;
+    }}
+    QSpinBox::down-button, QDoubleSpinBox::down-button,
+    QTimeEdit::down-button, QDateTimeEdit::down-button {{
+        subcontrol-origin: border; subcontrol-position: bottom right;
+        width: 18px; border: none; background: transparent;
+    }}
+    QSpinBox::up-arrow, QDoubleSpinBox::up-arrow, QTimeEdit::up-arrow, QDateTimeEdit::up-arrow {{
+        image: none;
+        border-left: 4px solid transparent;
+        border-right: 4px solid transparent;
+        border-bottom: 5px solid {p.text_dim};
+        width: 0; height: 0;
+    }}
+    QSpinBox::down-arrow, QDoubleSpinBox::down-arrow, QTimeEdit::down-arrow, QDateTimeEdit::down-arrow {{
+        image: none;
+        border-left: 4px solid transparent;
+        border-right: 4px solid transparent;
+        border-top: 5px solid {p.text_dim};
+        width: 0; height: 0;
+    }}
+    QSpinBox::up-arrow:hover, QDoubleSpinBox::up-arrow:hover {{ border-bottom-color: {p.accent}; }}
+    QSpinBox::down-arrow:hover, QDoubleSpinBox::down-arrow:hover {{ border-top-color: {p.accent}; }}
+    QSpinBox::up-arrow:disabled, QDoubleSpinBox::up-arrow:disabled {{ border-bottom-color: {p.disabled_fg}; }}
+    QSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:disabled {{ border-top-color: {p.disabled_fg}; }}
+
+    /* ── 列表/表格 ── */
     QListWidget, QTreeWidget, QTableWidget {{
-        background: {p.surface}; border: 1px solid {p.border}; border-radius: 12px; outline: none;
+        background: {p.surface}; border: 1px solid {p.border}; border-radius: 12px;
         alternate-background-color: {p.surface_alt};
     }}
+    /* 只对**真正看不见的**控件去掉 outline：列表/表格需要自己的焦点态，
+       所以下面给它们补 :focus 边框，而不是简单 outline:none */
+    QListWidget:focus, QTreeWidget:focus, QTableWidget:focus {{
+        border: 2px solid {p.focus_ring};
+    }}
+    QComboBox QAbstractItemView {{ outline: none; }}
     QTextEdit, QPlainTextEdit {{
         background: {p.surface_alt}; border: 1px solid {p.border}; border-radius: 10px;
     }}
@@ -220,17 +371,28 @@ def stylesheet(p: Palette) -> str:
     QListWidget::item:selected {{ background: {p.selection}; color: {fg}; }}
     QListWidget::item:hover {{ background: {p.surface_alt}; }}
     QTreeWidget::item, QTableWidget::item {{ padding: 6px; }}
+    /* **关键**：表格选中行原来完全没有样式（1.24:1，看不出选哪行） */
+    QTableWidget::item:selected, QTreeWidget::item:selected {{
+        background: {p.selection};
+        color: {fg};
+    }}
+    QTableWidget::item:hover, QTreeWidget::item:hover {{ background: {p.surface_alt}; }}
     QHeaderView::section {{
         background: {p.surface_alt}; border: none; border-bottom: 1px solid {p.border};
         padding: 7px 8px; font-weight: 600;
     }}
+
+    /* ── 页签 ── */
     QTabWidget::pane {{ border: 1px solid {p.border}; border-radius: 12px; background: {p.surface}; top: -1px; }}
     QTabBar::tab {{
         background: transparent; padding: 8px 16px; margin-right: 4px;
         border-radius: 8px; color: {p.text_dim};
     }}
-    QTabBar::tab:selected {{ background: {p.surface}; color: {p.accent}; font-weight: 600; }}
+    QTabBar::tab:selected {{ background: {p.nav_active}; color: {p.accent}; font-weight: 600; }}
     QTabBar::tab:hover {{ color: {fg}; }}
+    QTabBar::tab:focus {{ border: 2px solid {p.focus_ring}; }}
+
+    /* ── 分组框 ── */
     QGroupBox {{
         border: 1px solid {p.border}; border-radius: 12px; margin-top: 14px; padding: 14px 12px 12px 12px;
         background: transparent;
@@ -238,47 +400,84 @@ def stylesheet(p: Palette) -> str:
     QGroupBox::title {{
         subcontrol-origin: margin; left: 12px; padding: 0 6px; color: {p.text_dim}; font-weight: 600;
     }}
+
+    /* ── 勾选/单选：加焦点态 ── */
     QCheckBox, QRadioButton {{ spacing: 8px; }}
     QCheckBox::indicator, QRadioButton::indicator {{ width: 17px; height: 17px; }}
-    QCheckBox::indicator:unchecked {{ border: 1px solid {p.border}; border-radius: 5px; background: {p.surface}; }}
+    QCheckBox::indicator:unchecked {{ border: 1px solid {p.border_strong}; border-radius: 5px; background: {p.surface}; }}
     QCheckBox::indicator:checked {{ border: 1px solid {p.accent}; border-radius: 5px; background: {p.accent}; }}
-    QRadioButton::indicator:unchecked {{ border: 1px solid {p.border}; border-radius: 9px; background: {p.surface}; }}
+    QCheckBox::indicator:disabled {{ border-color: {p.border}; background: {p.disabled_bg}; }}
+    QCheckBox:focus {{ color: {p.focus_ring}; }}
+    QRadioButton::indicator:unchecked {{ border: 1px solid {p.border_strong}; border-radius: 9px; background: {p.surface}; }}
     QRadioButton::indicator:checked {{ border: 5px solid {p.accent}; border-radius: 9px; background: {p.surface}; }}
+    QRadioButton::indicator:disabled {{ border-color: {p.border}; background: {p.disabled_bg}; }}
+    QRadioButton:focus {{ color: {p.focus_ring}; }}
+
+    /* ── 滑块 ── */
     QSlider::groove:horizontal {{ height: 6px; background: {p.surface_alt}; border-radius: 3px; }}
     QSlider::sub-page:horizontal {{ background: {p.accent}; border-radius: 3px; }}
     QSlider::handle:horizontal {{
         background: {p.surface}; border: 2px solid {p.accent}; width: 14px; height: 14px;
         margin: -5px 0; border-radius: 9px;
     }}
+    QSlider:focus {{ border: 2px solid {p.focus_ring}; border-radius: 6px; }}
+
+    /* ── 进度条 ── */
     QProgressBar {{
         background: {p.surface_alt}; border: none; border-radius: 6px; height: 12px; text-align: center;
         color: transparent;
     }}
     QProgressBar::chunk {{ background: {p.accent}; border-radius: 6px; }}
+
+    /* ── 滚动条 ── */
     QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
-    QScrollBar::handle:vertical {{ background: {p.border}; border-radius: 4px; min-height: 30px; }}
+    QScrollBar::handle:vertical {{ background: {p.border_strong}; border-radius: 4px; min-height: 30px; }}
     QScrollBar::handle:vertical:hover {{ background: {p.text_dim}; }}
     QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
     QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 2px; }}
-    QScrollBar::handle:horizontal {{ background: {p.border}; border-radius: 4px; min-width: 30px; }}
+    QScrollBar::handle:horizontal {{ background: {p.border_strong}; border-radius: 4px; min-width: 30px; }}
+
+    /* ── 提示/菜单 ── */
     QToolTip {{
-        background: {p.surface}; color: {fg}; border: 1px solid {p.border};
+        background: {p.surface}; color: {fg}; border: 1px solid {p.border_strong};
         border-radius: 6px; padding: 6px 8px;
     }}
     QMenu {{
-        background: {p.surface}; border: 1px solid {p.border}; border-radius: 10px; padding: 6px;
+        background: {p.surface}; border: 1px solid {p.border_strong}; border-radius: 10px; padding: 6px;
     }}
     QMenu::item {{ padding: 7px 22px 7px 14px; border-radius: 7px; }}
     QMenu::item:selected {{ background: {p.selection}; }}
+    QMenu::item:disabled {{ color: {p.disabled_fg}; }}
     QMenu::separator {{ height: 1px; background: {p.border}; margin: 5px 8px; }}
+    /* **关键**：补回子菜单箭头（原来缺失，托盘菜单的可发现性线索被砍掉） */
+    QMenu::right-arrow {{
+        image: none;
+        border-top: 4px solid transparent;
+        border-bottom: 4px solid transparent;
+        border-left: 5px solid {p.text_dim};
+        width: 0; height: 0;
+        margin-right: 10px;
+    }}
+    QMenu::indicator {{ width: 14px; height: 14px; }}
     QStatusBar {{ background: transparent; color: {p.text_dim}; }}
     QSplitter::handle {{ background: transparent; }}
+
+    /* ── 工具按钮与导航 ── */
     QToolButton {{ border-radius: 8px; padding: 6px; background: transparent; }}
     QToolButton:hover {{ background: {p.surface_alt}; }}
+    QToolButton:focus {{
+        border: 2px solid {p.focus_ring};
+        padding: 4px;
+    }}
     QToolButton#NavButton {{
         background: transparent; border: none; border-radius: 10px; padding: 10px 14px;
-        text-align: left; color: {p.text_dim}; font-size: 13px;
+        text-align: left; color: {p.text_dim}; font-size: 10pt;
     }}
     QToolButton#NavButton:hover {{ background: {p.surface_alt}; color: {fg}; }}
-    QToolButton#NavButton:checked {{ background: {p.selection}; color: {p.accent}; font-weight: 600; }}
+    QToolButton#NavButton:checked {{ background: {p.nav_active}; color: {p.accent}; font-weight: 600; }}
+    /* 焦点必须能在导航上看见 —— 这是键盘用户切换页面的唯一线索 */
+    QToolButton#NavButton:focus {{
+        border: 2px solid {p.focus_ring};
+        color: {fg};
+    }}
     """

@@ -86,6 +86,22 @@ class MainWindow(QMainWindow):
         state.run_finished.connect(self._on_run_finished)
         self._apply_theme(state.palette)
 
+        # **1.1.2 键盘可达性**：在**所有控件创建完成之后**显式串联导航按钮的
+        # Tab 顺序。
+        #
+        # 为什么必须放在这里：`QWidget.setTabOrder` 要求两个控件都已有父窗口，
+        # 且顺序会被后续 addWidget 打乱。放在 `_build_sidebar` 里调用时，
+        # `self.stack` 和四个页面还没建完，实测无效（Tab 只能走到
+        # tasks → history 就被页内控件截走）。
+        #
+        # 为什么需要它：`QStackedWidget` 只让**当前页**的可聚焦控件进 Tab 链
+        # （Qt 正常行为），所以「Tab 走遍所有页面内部控件」本身不成立；
+        # 键盘用户切换页面的**唯一路径**就是这 4 个导航按钮。
+        # 必须保证它们连续可达，再配合空格/回车激活。
+        navs = [self.nav_buttons[k] for k, _ in NAV_ITEMS if k in self.nav_buttons]
+        for i in range(len(navs) - 1):
+            QWidget.setTabOrder(navs[i], navs[i + 1])
+
     # ------------------------------------------------------------------
     def _build_sidebar(self) -> QWidget:
         side = QFrame()
@@ -126,14 +142,32 @@ class MainWindow(QMainWindow):
             btn.setIcon(line_icon(key, "#94A3B8", 20))
             btn.setIconSize(QSize(20, 20))
             btn.setCheckable(True)
+            # **1.1.2 键盘可达性**：互斥 QButtonGroup 在 show() 时会把
+            # **未选中项**的 focusPolicy 改成 NoFocus（Qt 对单选组的既定行为）。
+            # 实测：show 前 4/4 是 TabFocus，show 后只有 1/4 是 TabFocus
+            # → 连续 Tab 60 次，焦点只在当前页的 4 个控件里死循环，
+            # 永远切不到「运行记录 / 环境 / 设置」。
+            # 这里显式设 StrongFocus，并在 showEvent 里再设一次（见 _enforce_nav_focus）。
+            btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            btn.setAccessibleName(label)
+            btn.setAccessibleDescription(f"切换到{label}页")
             btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
             btn.clicked.connect(lambda _=False, k=key: self._select(k))
+            # **1.1.2**：`QToolButton` 默认只响应**空格**，不响应**回车**。
+            # Windows 用户习惯回车激活，所以各绑一个 WidgetShortcut。
+            # 实测：空格 4/4 切页正常，回车 0/4（本轮补上）。
+            for _key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                _sc = QShortcut(QKeySequence(_key), btn)
+                _sc.setContext(Qt.ShortcutContext.WidgetShortcut)
+                _sc.activated.connect(lambda _=False, k=key: self._select(k))
             self.nav_group.addButton(btn)
             self.nav_buttons[key] = btn
             lay.addWidget(btn)
         lay.addStretch(1)
+        # 注：导航按钮的 setTabOrder 在 __init__ 末尾统一做 —— 那时 `self.stack`
+        # 与四个页面才建好，这里调用会被后续 addWidget 打乱（实测无效）。
 
         self.side_status = QLabel("守护进程：检测中…")
         self.side_status.setObjectName("Muted")
@@ -153,8 +187,42 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(idx)
         self.nav_buttons[key].setChecked(True)
         page = self.stack.currentWidget()
+        # **1.1.2**：`setChecked(True)` 会再次触发 Qt 对互斥组「未选中项
+        # 置 NoFocus」的逻辑，所以每次切页后都要把焦点策略补回来。
+        self._enforce_nav_focus()
         if hasattr(page, "on_shown"):
             page.on_shown()
+
+    def _enforce_nav_focus(self) -> None:
+        """把导航按钮的 focusPolicy 强制回 StrongFocus。
+
+        ## 为什么需要这个（1.1.2）
+
+        Qt 对**互斥 QButtonGroup** 有个既定行为：`show()` 时会把所有
+        **未选中**的可选中按钮的 `focusPolicy` 改为 `NoFocus`（这是为了让
+        单选组在 Tab 链里只占一个位置，组内用方向键切换）。
+
+        但对**页面导航**来说这是灾难：焦点只能停在当前页，其余页面
+        Tab 永远到不了。实测：连续 60 次 Tab，焦点只在「任务」页的
+        4 个控件（nav / 按钮 / 列表 / 滚动区）里死循环。
+
+        隔离实验（纯 Qt，不含项目代码）确认了触发时机：
+            建好未 checkable         → TabFocus ×N
+            setCheckable(True)       → TabFocus ×N
+            addButton（互斥组）       → TabFocus ×N   ← 不是这里
+            setChecked(True)         → TabFocus ×N
+            **show()**               → NoFocus ×(N-1)  ← 只在这里变
+
+        所以必须在 show 之后重设。`showEvent` 里调用本方法是唯一可靠时机。
+        """
+        for btn in self.nav_buttons.values():
+            if btn.focusPolicy() != Qt.FocusPolicy.StrongFocus:
+                btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def showEvent(self, event) -> None:  # noqa: ANN001, N802
+        super().showEvent(event)
+        # 单次定时器：等 Qt 完成内部状态设置后再改，否则会被再次覆盖
+        QTimer.singleShot(0, self._enforce_nav_focus)
 
     def _install_shortcuts(self) -> None:
         QShortcut(QKeySequence("Ctrl+B"), self, activated=lambda: self.state.run_task(self.tasks_page.selected_task_id()) if self.tasks_page.selected_task_id() else None)
@@ -335,10 +403,21 @@ class MainWindow(QMainWindow):
 
     def quit_app(self) -> None:
         if self.tasks_page.has_running():
-            ret = QMessageBox.question(
-                self, "确认退出", "还有备份正在运行，现在退出会中断备份。确定退出吗？"
+            # **1.1.2 修复**：原来没传 defaultButton，Qt 默认把「是」设为默认
+            # → 用户误按回车就中断正在运行的备份。危险操作必须默认「否」。
+            # 对照：tasks_page 的删除确认传了 No，是对的。
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("确认退出")
+            box.setText("还有备份正在运行，现在退出会中断备份。")
+            box.setInformativeText("确定要退出吗？")
+            box.setStandardButtons(
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
-            if ret != QMessageBox.StandardButton.Yes:
+            box.setDefaultButton(QMessageBox.StandardButton.No)
+            box.button(QMessageBox.StandardButton.Yes).setText("退出并中断")
+            box.button(QMessageBox.StandardButton.No).setText("继续备份")
+            if box.exec() != QMessageBox.StandardButton.Yes:
                 return
         self._really_quit = True
         self.close()
