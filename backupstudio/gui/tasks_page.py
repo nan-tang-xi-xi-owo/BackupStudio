@@ -238,7 +238,9 @@ class TasksPage(QWidget):
         from PySide6.QtWidgets import QGridLayout
 
         info_grid = QGridLayout()
-        info_grid.setSpacing(10)
+        # **1.1.2 矮窗口**：间距 10→8、卡片内距 14/10→12/7，四张卡合计省约 30px。
+        # 实拍确认逻辑高 648 时「最近一次结果」被压到底部边缘。
+        info_grid.setSpacing(8)
         self.info_cards: dict[str, tuple[Card, ElideLabel]] = {}
         for idx, (key, label) in enumerate((
             ("source", "来源"),
@@ -246,7 +248,7 @@ class TasksPage(QWidget):
             ("format", "压缩格式"),
             ("schedule", "计划"),
         )):
-            c = Card(flat=True, margins=(14, 10, 14, 10))
+            c = Card(flat=True, margins=(12, 7, 12, 7))
             cap = QLabel(label)
             cap.setObjectName("CardCap")
             # 路径可能很长：用省略号 + tooltip，不再硬截断
@@ -255,7 +257,7 @@ class TasksPage(QWidget):
             val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             c.add(cap)
             c.add(val)
-            c.setMinimumWidth(150)
+            c.setMinimumWidth(140)
             info_grid.addWidget(c, idx // 2, idx % 2)
             info_grid.setColumnStretch(idx % 2, 1)
             self.info_cards[key] = (c, val)
@@ -369,6 +371,30 @@ class TasksPage(QWidget):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([340, 760])
+        # **1.1.2 窄窗口**：左栏最小 260，右栏信息卡 2×150=300，加边距约 650。
+        # 窗口被压窄时若左栏还占 340，右侧会被挤出去。
+        self._splitter = splitter
+        splitter.setChildrenCollapsible(False)
+        left.setMinimumWidth(260)
+        left.setMaximumWidth(430)
+        # **1.1.2 矮窗口**：右侧「标题+4 张信息卡+按钮行」是固定高度，
+        # 窗口高度 < 约 620 逻辑像素时底部会被裁掉（实拍截图确认：
+        # 「最近一次结果」和按钮只露出一半）。给整个右栏加外层滚动区，
+        # 内容超出时可滚动，不再被硬裁。
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        right_scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollArea > QWidget > QWidget { background: transparent; }"
+        )
+        right_scroll.viewport().setAutoFillBackground(False)
+        # Card 作为滚动内容时不能有最大高度限制，否则又被压扁
+        right.setMinimumHeight(0)
+        right_scroll.setWidget(right)
+        splitter.addWidget(right_scroll)
+        splitter.setStretchFactor(splitter.indexOf(right_scroll), 1)
         root.addWidget(splitter, 1)
 
         state.tasks_changed.connect(self.refresh)

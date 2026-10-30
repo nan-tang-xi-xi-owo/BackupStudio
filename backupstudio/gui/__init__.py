@@ -154,16 +154,19 @@ class Palette:
 
 LIGHT = Palette(
     name="light", dark=False,
-    # 页面底比卡片更深一档（1.08 → 1.16:1），卡片才"浮"得起来
-    bg="#EDF1F8", surface="#FFFFFF", surface_alt="#F4F6FB", border="#D5DDEB",
-    text="#1F2430", text_dim="#656B78", accent="#3E5DEB", accent_hover="#2F49C9",
+    # **1.1.2 观感调整**：实拍截图反馈"整屏发灰"。实测数值显示对比度都达标
+    # （正文 13.7:1、副标题 4.72:1），问题在**明度层次太挤**：
+    # 页面底/卡片底只有 1.13:1、边框 1.37:1，三层几乎糊在一起。
+    # 这里把页面底再压深一档、边框加深，拉开"页 < 卡 < 边框"的层次。
+    bg="#E8EDF6", surface="#FFFFFF", surface_alt="#F2F5FB", border="#C0CADD",
+    text="#1A1F2B", text_dim="#525869", accent="#3E5DEB", accent_hover="#2F49C9",
     accent_text="#FFFFFF", success="#127F3A", warning="#9F5706", danger="#D12222",
-    selection="#DCE4FF",
-    border_strong="#C2CCE0",
+    selection="#D6DEFF",
+    border_strong="#A9B6CE",
     disabled_bg="#F5F7FB",
     disabled_fg="#A0A7B8",
     focus_ring="#2F49C9",
-    nav_active="#E4EBFF",
+    nav_active="#DFE7FF",
 )
 
 DARK = Palette(

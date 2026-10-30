@@ -43,12 +43,21 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.state = state
         self._really_quit = False
+        # **1.1.2 自适应尺寸**：固定 1180×760 在 1366×768 / 1280×800 这类屏上
+        # 加上任务栏就装不下（用户实测窗口被压到 991×518，比最小尺寸还矮）。
+        # 改为按当前屏幕可用区域取「理想尺寸与可用区域的较小值」，
+        # 并保证窗口不会超出屏幕。
         self.setWindowTitle(f"{APP_NAME_ZH} · {APP_NAME} {__version__}")
         self.setWindowIcon(app_icon())
-        self.resize(1180, 760)
-        # 1.1.2：最小尺寸从 980×640 降到 900×600 —— 1366×768@150% 缩放后
-        # 逻辑分辨率只有 911×512，原来的 980×640 在那种屏上打不开完整窗口。
-        self.setMinimumSize(900, 600)
+        avail = QApplication.primaryScreen().availableGeometry()
+        # 兜底：离屏/最小平台会报极小的可用区域（实测 240×320），
+        # 直接用会把窗口算成 900×600 甚至更小。低于阈值时按默认值。
+        avail_w = avail.width() if avail.width() >= 800 else 1440
+        avail_h = avail.height() if avail.height() >= 600 else 900
+        w = min(1180, max(900, int(avail_w * 0.86)))
+        h = min(760, max(600, int(avail_h * 0.88)))
+        self.resize(w, h)
+        self.setMinimumSize(min(900, avail_w), min(600, avail_h))
 
         central = QWidget()
         central.setObjectName("Page")
