@@ -319,3 +319,55 @@ docs/screenshots/ui-1.1.2/dark-focus.png       焦点对照（深色）
 | 10 | 空状态无引导 | 首次进入任务页是空白 |
 
 这些需要下一轮继续。
+
+---
+
+## 十、我在本次改造中的一处失误（换行符）
+
+### 问题
+
+改 	ask_dialog.py / settings_page.py / environment_page.py /
+history_page.py / widgets.py 时，我用 write_text(..., newline=") 写入，
+**把文件的 CRLF 换行符改成了 LF**。
+
+后果：这两个文件的 diff 从
+`
+task_dialog.py | 7 +++++--
+`
+变成
+`
+task_dialog.py | 2311 +++++++++++++-------------
+`
+—— 1156 行全被标记为「改动」，实际只改了 7 行。
+
+### 影响
+
+1. **git blame 失效**：所有行都变成「本次提交」
+2. **code review 看不到真实改动**：审阅者会被 2311 行噪音淹没
+3. **未来合并冲突风险**：其他分支若基于旧文件，会产生大面积冲突
+
+### 修复
+
+把 5 个文件恢复成 CRLF。diff 从
+2978 insertions / 2345 deletions → **683 / 50**，真实改动一目了然。
+
+### 顺带发现：仓库本身不一致
+
+.gitattributes 规定 * text=auto eol=lf（文本文件应存 LF），
+但 core.autocrlf=false，且 git 里**实际存的是 CRLF**（如
+__init__.py 284 行全是 CRLF）。
+
+而部分文件（ppstate.py、icons.py、worker.py）是纯 LF ——
+说明仓库历史上就没统一过。
+
+**本次按「与仓库现状一致」处理**（恢复 CRLF），让 diff 干净。
+彻底统一换行符是独立的技术债，需要单独一次提交（会触及所有文件，
+不适合混在 UI 改造里）。
+
+### 教训
+
+用 Path.write_text() 改文件时，**显式保留原有换行符**。
+正确做法是先读字节判断，或统一用 
+ewline=" + 自行处理。
+
+同类问题我在这个项目里已经踩过一次（早期批量替换版本号时也有类似风险）。
