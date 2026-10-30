@@ -216,7 +216,7 @@ def install_translator(app) -> bool:  # noqa: ANN001
     return False
 
 
-def stylesheet(p: Palette) -> str:
+def stylesheet(p: Palette, style: str | None = None) -> str:
     """生成整套 QSS。
 
     ## 1.1.2 改造要点（每条都有实测依据）
@@ -240,6 +240,99 @@ def stylesheet(p: Palette) -> str:
        靠加深边框 + 保留底色差来分层。
     """
     fg = p.text
+
+    # ── 风格参数（1.1.3）：6 套外观共享下面的规则集 ──────────────
+    # 只注入「几何 + 质感」，配色仍由 Palette 决定，两者正交。
+    from .styles import current as _style_current, style_for as _style_for
+    from .styles import styled_palette as _styled_palette
+
+    _st = _style_for(style) if style else _style_current()
+    p = _styled_palette(p, _st.key)
+    R, RI, RB, BW = _st.radius, _st.radius_input, _st.radius_button, _st.border
+    fg = p.text
+
+    def _hex2rgb(h: str) -> str:
+        h = h.lstrip("#")
+        return f"{int(h[0:2], 16)}, {int(h[2:4], 16)}, {int(h[4:6], 16)}"
+
+    def _mix(h: str, target: int, ratio: float) -> str:
+        h = h.lstrip("#")
+        r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+        f = lambda v: max(0, min(255, round(v + (target - v) * ratio)))  # noqa: E731
+        return f"#{f(r):02X}{f(g):02X}{f(b):02X}"
+
+    def _lighter(h: str, ratio: float = 0.35) -> str:
+        return _mix(h, 255, ratio)
+
+    def _darker(h: str, ratio: float = 0.25) -> str:
+        return _mix(h, 0, ratio)
+
+    # 卡片质感：**背景**与**边框**分开算，这样 bevel（立体边框）与
+    # gradient（渐变背景）可以同时生效 —— 拟物风格两者都需要。
+    _lighter = _lighter
+    # 背景
+    if _st.gradient:
+        _top = _lighter(p.surface, 0.28 if not p.dark else 0.10)
+        _bot = _darker(p.surface, 0.06 if not p.dark else 0.14)
+        _card_fill = (
+            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            f" stop:0 {_top}, stop:1 {_bot});"
+        )
+        _btn_fill = (
+            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            f" stop:0 {_lighter(p.surface_alt, 0.35)}, stop:1 {p.surface_alt});"
+        )
+    elif _st.translucent:
+        _a = 0.84 if not p.dark else 0.78
+        _card_fill = f"background: rgba({_hex2rgb(p.surface)}, {_a});"
+        _btn_fill = f"background: rgba({_hex2rgb(p.surface_alt)}, {_a});"
+    else:
+        _card_fill = f"background: {p.surface};"
+        _btn_fill = f"background: {p.surface_alt};"
+
+    # 边框
+    if _st.bevel:
+        # 3D 凸起：左上亮、右下暗（Win98 与拟物共用）
+        _card_border = (
+            f" border-top: {BW}px solid {_lighter(p.surface, 0.55)};"
+            f" border-left: {BW}px solid {_lighter(p.surface, 0.55)};"
+            f" border-right: {BW}px solid {_darker(p.surface, 0.45)};"
+            f" border-bottom: {BW}px solid {_darker(p.surface, 0.45)};"
+            f" border-radius: {R}px;"
+        )
+        _btn_border = (
+            f" border-top: {BW}px solid {_lighter(p.surface_alt, 0.6)};"
+            f" border-left: {BW}px solid {_lighter(p.surface_alt, 0.6)};"
+            f" border-right: {BW}px solid {_darker(p.surface_alt, 0.4)};"
+            f" border-bottom: {BW}px solid {_darker(p.surface_alt, 0.4)};"
+            f" border-radius: {RB}px;"
+        )
+    elif _st.translucent:
+        # 玻璃：外圈淡边 + 顶部高光（模拟折射）
+        _hl = 0.55 if not p.dark else 0.22
+        _card_border = (
+            f" border: {BW}px solid rgba({_hex2rgb(p.border_strong)}, 0.6);"
+            f" border-top: {BW}px solid rgba(255, 255, 255, {_hl});"
+            f" border-radius: {R}px;"
+        )
+        _btn_border = (
+            f" border: {BW}px solid rgba({_hex2rgb(p.border_strong)}, 0.5);"
+            f" border-top: {BW}px solid rgba(255, 255, 255, {_hl * 0.9});"
+            f" border-radius: {RB}px;"
+        )
+    else:
+        _card_border = f" border: {BW}px solid {p.border}; border-radius: {R}px;"
+        _btn_border = f" border: {BW}px solid {p.border}; border-radius: {RB}px;"
+
+    _card_bg = _card_fill + _card_border
+    _btn_bg = _btn_fill + _btn_border
+
+    # mac / Material / 玻璃：底部加深一档模拟投影
+    _card_shadow = ""
+    if _st.shadow:
+        _card_shadow = (
+            f" border-bottom: {max(2, BW + 1)}px solid {_darker(p.border, 0.18)};"
+        )
     # 焦点环：用 focus_ring 画 2px 外扩边框（QSS 无 box-shadow，
     # 用 border 加粗 + 变色是 Qt 里最可靠的做法）
     return f"""
@@ -251,15 +344,11 @@ def stylesheet(p: Palette) -> str:
     QMainWindow, QDialog, QWidget#Page {{ background: {p.bg}; }}
 
     /* ── 卡片：靠边框分层（surface vs bg 只有 1.08:1，单靠底色看不出） ── */
-    QFrame#Card {{
-        background: {p.surface};
-        border: 1px solid {p.border};
-        border-radius: 14px;
-    }}
+    QFrame#Card {{ {_card_bg}{_card_shadow} }}
     QFrame#CardFlat {{
         background: {p.surface_alt};
-        border: 1px solid {p.border};
-        border-radius: 12px;
+        border: {BW}px solid {p.border};
+        border-radius: {R}px;
     }}
 
     /* ── 字号层级 ── */
@@ -276,13 +365,7 @@ def stylesheet(p: Palette) -> str:
     QLabel#WarningText {{ color: {p.warning}; }}
 
     /* ── 按钮 ── */
-    QPushButton {{
-        background: {p.surface_alt};
-        border: 1px solid {p.border};
-        border-radius: 9px;
-        padding: 7px 16px;
-        color: {fg};
-    }}
+    QPushButton {{ {_btn_bg} padding: 7px 16px; color: {fg}; }}
     QPushButton:hover {{ background: {p.selection}; border-color: {p.border_strong}; }}
     QPushButton:pressed {{ background: {p.border}; }}
     QPushButton:focus {{

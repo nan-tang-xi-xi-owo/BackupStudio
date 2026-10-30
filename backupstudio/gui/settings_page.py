@@ -100,6 +100,20 @@ class SettingsPage(QWidget):
         self.theme_combo.addItem("深色", "dark")
         self.theme_combo.currentIndexChanged.connect(self._on_theme)
         appearance.addWidget(self.theme_combo)
+
+        # ── 外观风格（1.1.3）──
+        # 与配色正交：先选明暗，再选质感风格，可自由组合（6 风格 × 3 配色）。
+        appearance.addWidget(QLabel("外观风格"), 1)
+        self.style_combo = Combo()
+        from .styles import style_names
+
+        for key, name in style_names():
+            self.style_combo.addItem(name, key)
+        self.style_combo.currentIndexChanged.connect(self._on_style)
+        self.style_combo.setToolTip(
+            "风格决定圆角、立体感、渐变与透明度；配色决定明暗。两者可自由组合。"
+        )
+        appearance.addWidget(self.style_combo)
         general.add_layout(appearance)
         lay.addWidget(general)
 
@@ -257,6 +271,7 @@ class SettingsPage(QWidget):
         self.sw_close_tray.setChecked(s.close_to_tray)
         self.sw_daemon.setChecked(s.auto_run_backup_daemon)
         self.theme_combo.select_data(s.theme_mode)
+        self.style_combo.select_data(getattr(s, "ui_style", "win") or "win")
         n = s.notifications
         self.sw_notif.setChecked(n.enabled)
         self.sw_tray_msg.setChecked(n.tray)
@@ -297,6 +312,7 @@ class SettingsPage(QWidget):
         # 门户授权的子进程，用户看到的是"定时备份永不执行"且没有提示）。
         s.auto_run_backup_daemon = self.sw_daemon.isChecked() if daemon_available() else False
         s.theme_mode = self.theme_combo.currentData() or "system"
+        s.ui_style = self.style_combo.currentData() or "win"
         n = s.notifications
         n.enabled = self.sw_notif.isChecked()
         n.tray = self.sw_tray_msg.isChecked()
@@ -317,6 +333,12 @@ class SettingsPage(QWidget):
             return
         self._save()
         self.state.set_theme(self.theme_combo.currentData() or "system")
+
+    def _on_style(self) -> None:
+        """切换外观风格（1.1.3）。"""
+        if self._loading:
+            return
+        self.state.set_style(self.style_combo.currentData() or "win")
 
     def _on_autostart(self, checked: bool) -> None:
         if self._loading:

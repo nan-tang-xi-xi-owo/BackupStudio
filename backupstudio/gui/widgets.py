@@ -37,6 +37,88 @@ class Card(QFrame):
         self._layout.setContentsMargins(*margins)
         self._layout.setSpacing(10)
 
+    # ── 玻璃风格（1.1.3）──────────────────────────────────────
+    # 不用覆盖层控件（会和孙级按钮抢 z-order），直接在本控件 paintEvent
+    # 里画「采样背景 → 模糊 → 色散 → 高光」。
+    _glass_on: bool = False
+    _glass_radius: int = 14
+    _glass_tint: str = "#F7FAFF"
+    _glass_alpha: float = 0.62
+    _glass_dark: bool = False
+
+    def set_glass(self, on: bool, *, radius: int = 14, tint: str = "#F7FAFF",
+                  alpha: float = 0.62, dark: bool = False) -> None:
+        self._glass_on = on
+        if on:
+            self._glass_radius = radius
+            self._glass_tint = tint
+            self._glass_alpha = alpha
+            self._glass_dark = dark
+            # 交给自绘，QSS 背景必须让位
+            self.setStyleSheet("background: transparent; border: none;")
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: ANN001, N802
+        if not self._glass_on:
+            return super().paintEvent(event)
+        from PySide6.QtCore import QPoint, QRect, Qt as _Qt
+        from PySide6.QtGui import QColor, QImage, QLinearGradient, QPainter, QPainterPath, QPixmap
+
+        from .glass import _box_blur, _chromatic
+
+        win = self.window()
+        if win is None:
+            return super().paintEvent(event)
+        # 采样背后（临时隐藏自己避免递归重绘）
+        self.setVisible(False)
+        try:
+            top_left = self.mapTo(win, QPoint(0, 0))
+            pm = QPixmap(self.size())
+            pm.fill(_Qt.GlobalColor.transparent)
+            win.render(pm, QPoint(0, 0), QRect(top_left, self.size()))
+        finally:
+            self.setVisible(True)
+
+        # **缓存**：模糊+色散是整个玻璃效果里最贵的两步（实测 19 张卡
+        # 会让截图脚本跑不动）。按「尺寸 + 窗口内坐标 + 主题」缓存，
+        # 尺寸不变时不重算 —— 拖动/缩放时会重算，滚动不受影响。
+        key = (self.width(), self.height(), top_left.x(), top_left.y(),
+               self._glass_tint, self._glass_dark)
+        cached = getattr(self, "_glass_cache", None)
+        if cached is not None and cached[0] == key:
+            img = cached[1]
+        else:
+            img = pm.toImage()
+            for r in (6, 4, 2):
+                img = _box_blur(img, r)
+            img = _chromatic(img, 1)
+            self._glass_cache = (key, img)
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(0.5, 0.5, self.width() - 1, self.height() - 1,
+                            self._glass_radius, self._glass_radius)
+        p.setClipPath(path)
+        p.setOpacity(0.92)
+        p.drawPixmap(0, 0, QPixmap.fromImage(img))
+        p.setOpacity(1.0)
+        tint = QColor(self._glass_tint)
+        tint.setAlphaF(self._glass_alpha)
+        p.fillPath(path, tint)
+        # 顶部高光
+        g = QLinearGradient(0, 0, self.width() * 0.6, self.height())
+        g.setColorAt(0.0, QColor(255, 255, 255, 90 if not self._glass_dark else 46))
+        g.setColorAt(0.35, QColor(255, 255, 255, 22 if not self._glass_dark else 10))
+        g.setColorAt(1.0, QColor(255, 255, 255, 0))
+        p.fillPath(path, g)
+        # 内高光边
+        p.setPen(QColor(255, 255, 255, 140 if not self._glass_dark else 60))
+        p.setBrush(_Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(1, 1, self.width() - 2, self.height() - 2,
+                          self._glass_radius, self._glass_radius)
+        p.end()
+
     def body(self) -> QVBoxLayout:
         return self._layout
 

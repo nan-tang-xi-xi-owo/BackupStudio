@@ -59,8 +59,15 @@ class MainWindow(QMainWindow):
         self.resize(w, h)
         self.setMinimumSize(min(900, avail_w), min(600, avail_h))
 
-        central = QWidget()
-        central.setObjectName("Page")
+        # 1.1.3：玻璃风格需要「背后有内容」才有折射感。
+        # 非玻璃风格仍是普通 QWidget（零开销）。
+        from .styles import current as _style_current
+
+        if _style_current().translucent:
+            central = _Backdrop(state)
+        else:
+            central = QWidget()
+            central.setObjectName("Page")
         self.setCentralWidget(central)
         root = QHBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
@@ -271,6 +278,9 @@ class MainWindow(QMainWindow):
                 page.set_palette_mode(self._pal.dark)
             except Exception:  # noqa: BLE001
                 log.debug("页面应用主题失败：%s", key, exc_info=True)
+        # 1.1.3：懒加载出来的新页面也要装玻璃层
+        if getattr(self, "_pal", None) is not None:
+            QTimer.singleShot(0, lambda: self._install_glass(self._pal))
         return page
 
     def _page(self, key: str) -> QWidget:
@@ -366,6 +376,9 @@ class MainWindow(QMainWindow):
         super().showEvent(event)
         # 单次定时器：等 Qt 完成内部状态设置后再改，否则会被再次覆盖
         QTimer.singleShot(0, self._enforce_nav_focus)
+        # 1.1.3：玻璃层必须在页面/卡片都创建后再装
+        # （`_apply_theme` 在 __init__ 早期调用，那时还只有占位页）
+        QTimer.singleShot(0, lambda: self._install_glass(self.state.palette))
 
     def _install_shortcuts(self) -> None:
         QShortcut(QKeySequence("Ctrl+B"), self, activated=lambda: self.state.run_task(self.tasks_page.selected_task_id()) if self.tasks_page.selected_task_id() else None)
@@ -528,6 +541,28 @@ class MainWindow(QMainWindow):
         for page in getattr(self, "_pages", {}).values():
             if hasattr(page, "set_palette_mode"):
                 page.set_palette_mode(palette.dark)
+        # 1.1.3：玻璃风格下给卡片装折射层
+        try:
+            self._install_glass(palette)
+        except Exception:  # noqa: BLE001
+            log.debug("玻璃层安装失败", exc_info=True)
+
+    def _install_glass(self, palette) -> None:  # noqa: ANN001
+        """玻璃风格：让每张 Card 自绘折射背景（1.1.3）。
+
+        **为什么不用覆盖层控件**：按钮通常是 Card 的**孙控件**
+        （Card → layout → QPushButton），`lower()` 只能降到直接子级之下，
+        实测把「立即备份」压成模糊影子 —— 试过 `stackUnder(子控件)` 与
+        `lower()+raise_()` 都不行。自绘没有额外控件，也就没有 z-order 问题。
+        """
+        from .styles import current as _st
+        from .widgets import Card
+
+        on = _st().translucent
+        alpha = 0.62 if not palette.dark else 0.55
+        for card in self.findChildren(Card):
+            card.set_glass(on, radius=_st().radius, tint=palette.surface,
+                           alpha=alpha, dark=palette.dark)
 
     def _on_daemon_state(self, info) -> None:  # noqa: ANN001
         """底栏守护进程状态（1.1.2：此前信号没人接，永远显示"检测中…"）。"""
@@ -593,3 +628,53 @@ class MainWindow(QMainWindow):
                 return
         self._really_quit = True
         self.close()
+
+class _Backdrop(QWidget):
+    """玻璃风格的背景：深/浅底色 + 2~3 个柔光斑。
+
+    光斑用径向渐变画大圆，模糊后成为玻璃的折射源。
+    只在 `glass` 风格下创建。
+    """
+
+    def __init__(self, state) -> None:  # noqa: ANN001
+        super().__init__()
+        self.setObjectName("Page")
+        self.state = state
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._pal = state.palette
+        state.theme_changed.connect(self._on_theme)
+
+    def _on_theme(self, palette) -> None:  # noqa: ANN001
+        self._pal = palette
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: ANN001, N802
+        from PySide6.QtGui import QColor, QPainter, QRadialGradient
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pal = self._pal
+        p.fillRect(self.rect(), QColor(pal.bg))
+
+        w, h = self.width(), self.height()
+        # 光斑配色：用主题强调色/成功色/警告色的低饱和版本
+        spots = (
+            (int(w * 0.16), int(h * 0.10), int(max(w, h) * 0.55), pal.accent, 0.30),
+            (int(w * 0.88), int(h * 0.26), int(max(w, h) * 0.42), pal.success, 0.18),
+            (int(w * 0.62), int(h * 0.95), int(max(w, h) * 0.50), pal.warning, 0.14),
+            (int(w * 0.34), int(h * 0.72), int(max(w, h) * 0.38), pal.accent_hover, 0.16),
+        )
+        for cx, cy, r, color, alpha in spots:
+            g = QRadialGradient(cx, cy, r)
+            c = QColor(color)
+            c.setAlphaF(alpha)
+            g.setColorAt(0.0, c)
+            g.setColorAt(0.55, QColor(color).darker(100))
+            c2 = QColor(color)
+            c2.setAlphaF(0.0)
+            g.setColorAt(0.55, c2)
+            g.setColorAt(1.0, c2)
+            p.setBrush(g)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawEllipse(cx - r, cy - r, r * 2, r * 2)
+        p.end()

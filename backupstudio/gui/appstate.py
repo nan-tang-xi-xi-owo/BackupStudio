@@ -66,6 +66,11 @@ class AppState(QObject):
         self._daemon_timer.timeout.connect(self.poll_daemon_status)
         self._daemon_probe_busy = threading.Lock()
         self.daemon_info: dict = {}
+        # 1.1.3：启动时先应用已保存的外观风格（风格是进程级全局，
+        # 必须早于第一次 stylesheet() 调用，否则首帧会用默认风格）。
+        from .styles import set_current
+
+        set_current(getattr(self.store.settings, "ui_style", "win") or "win")
         self.palette: Palette = self._resolve_palette()
         self._lock = threading.Lock()
 
@@ -91,6 +96,16 @@ class AppState(QObject):
     def set_theme(self, mode: str) -> None:
         self.store.settings.theme_mode = mode
         self.store.save()
+        self.palette = self._resolve_palette()
+        self.theme_changed.emit(self.palette)
+
+    def set_style(self, key: str) -> None:
+        """切换外观风格（1.1.3）。风格与配色正交，切完重发一次主题信号即可。"""
+        from .styles import set_current
+
+        self.store.settings.ui_style = key
+        self.store.save()
+        set_current(key)
         self.palette = self._resolve_palette()
         self.theme_changed.emit(self.palette)
 
