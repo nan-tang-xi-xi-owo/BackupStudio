@@ -183,12 +183,11 @@ def _run_gui_inner(start_minimized: bool = False, open_new: bool = False) -> int
     app.setWindowIcon(app_icon())
     app.setQuitOnLastWindowClosed(False)
     if getattr(sys, "frozen", False) and sys.platform == "win32":
-        try:
-            import ctypes
+        # 注册 AppUserModelID：不注册的话 Windows Toast 通知的标题会显示成
+        # "AppId锕鈷?锕鈷..." 这类乱码（用户实测遇到）。
+        from .notify import ensure_windows_aumid
 
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)  # type: ignore[attr-defined]
-        except Exception:  # noqa: BLE001
-            pass
+        ensure_windows_aumid(APP_ID, APP_NAME_ZH)
 
     # ---- 配置：损坏/不可写都不应阻止启动
     store = TaskStore(config_dir() / "tasks.json")
