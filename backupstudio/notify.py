@@ -16,6 +16,43 @@ import sys
 log = logging.getLogger("backupstudio.notify")
 
 
+def ensure_windows_aumid(app_id: str, display_name: str = "BackupStudio") -> bool:
+    """把应用的 AppUserModelID 注册到当前用户，并绑定显示名。
+
+    ## 为什么必须做（实测缺陷）
+
+    Windows 10/11 的 Toast 通知靠 AUMID 识别"这条通知是谁发的"。系统会去
+    ``HKCU\\SOFTWARE\\Classes\\AppUserModelId\\<AUMID>`` 读 ``DisplayName``。
+
+    * 只调 ``SetCurrentProcessExplicitAppUserModelID`` **不够** —— 那只影响
+      任务栏分组，通知仍然找不到来源；
+    * AUMID 没注册时，Windows 会回退到一个匿名的内部标识，
+      通知标题显示成 ``AppId锕鈷?锕鈷...`` 这样的乱码（用户实际遇到的就是它）。
+
+    这里注册到 HKCU（不需要管理员权限），并写入 ``DisplayName``。
+    每次启动都写一遍是幂等的，也能覆盖用户重装/换用户名后的缺失。
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+
+        key_path = rf"SOFTWARE\Classes\AppUserModelId\{app_id}"
+        with winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_WRITE
+        ) as key:
+            winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, display_name)
+        # 同时把进程 AUMID 设上，确保任务栏/通知都归到这个 ID
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.debug("注册 AppUserModelID 失败（通知可能显示为乱码）：%s", exc)
+        return False
+
+
+
 def _popen(argv: list[str]) -> bool:
     try:
         kwargs: dict = {

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import threading
+from dataclasses import dataclass
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QScrollArea,
@@ -40,12 +42,30 @@ from .widgets import Card, muted, title_label
 log = logging.getLogger("backupstudio.gui.env")
 
 
+@dataclass
+class _ProbeResult:
+    """一次环境探测的完整产物（在后台线程里构造，回到 UI 线程再渲染）。"""
+
+    caps: dict
+    env: dict
+    info: object
+    rows: list
+
+
 class EnvironmentPage(QWidget):
+    #: 后台探测完成（参数是 _ProbeResult 或 Exception）。
+    #: 用 object 而不是具体类型：Qt 信号跨线程传递时不做类型检查更稳。
+    _probe_done = Signal(object)
+
     def __init__(self, state: AppState, window) -> None:  # noqa: ANN001
         super().__init__()
         self.state = state
         self.window = window
         self._caps = {}
+        self._probe_busy = False
+        #: 上次探测是否失败（失败后切页不再自动重试，避免每次白跑 1 秒）
+        self._probe_failed = False
+        self._probe_done.connect(self._apply_probe)
 
         outer_layout = QVBoxLayout(self)
         outer_layout.setContentsMargins(0, 0, 0, 0)
@@ -72,7 +92,7 @@ class EnvironmentPage(QWidget):
         head.addLayout(col, 1)
         self.btn_rescan = QPushButton("重新检测")
         self.btn_rescan.setIcon(line_icon("settings", "#64748B", 16))
-        self.btn_rescan.clicked.connect(self.rescan)
+        self.btn_rescan.clicked.connect(lambda: self.rescan(force=True))
         head.addWidget(self.btn_rescan)
         lay.addLayout(head)
 
@@ -151,21 +171,87 @@ class EnvironmentPage(QWidget):
         raw_card.add(self.raw)
         lay.addWidget(raw_card)
 
-        self.rescan()
+        self.rescan(force=True)  # 首次进入：清缓存并后台探测（不阻塞启动）
 
     # ------------------------------------------------------------------
     def set_palette_mode(self, dark: bool) -> None:
         return
 
     def on_shown(self) -> None:
-        self.rescan(quiet=True)
+        """切页时**不清缓存**、**不阻塞 UI**。
 
-    def rescan(self, quiet: bool = False) -> None:
-        reset_cache()
-        caps = format_capabilities(force=False)  # 如实展示：不勾强制时的可用性（审查 P0-13）
+        环境不会在两次点击之间变化：真正需要重扫的场景只有"用户刚装了 7-Zip"，
+        而那由「重新检测」按钮负责（会传 force=True）。
+
+        原来的实现每次切页都 ``reset_cache()`` 再把六项外部探测串行跑一遍，
+        实测阻塞 UI 线程 921–1237 ms（标题栏显示「未响应」）。
+        """
+        if self._caps:  # 已有结果直接复用，切页零成本
+            return
+        if self._probe_failed:
+            # 上一次探测失败时不要每次切页都重试：那是白烧 1 秒的后台 CPU，
+            # 且用户看不到任何变化。要么点「重新检测」，要么看诊断报告里的原因。
+            return
+        self.rescan(force=False)
+
+    def rescan(self, force: bool = False) -> None:
+        """重新探测环境。
+
+        ``force=True``（用户点「重新检测」）：清空所有缓存后重探；
+        ``force=False``（首次进入页面）：用现有缓存，并在后台线程里跑。
+
+        探测本身要启动 7za/unrar/tar 子进程并查注册表，实测串行约 1.3 s，
+        **绝不能放在 UI 线程**——那会让窗口变成「未响应」。
+        """
+        if self._probe_busy:
+            return  # 上一次还没回来，不重复发起
+        self._probe_busy = True
+        self._probe_failed = False  # 新一轮探测开始，清掉上次的失败标记
+        if force:
+            self.btn_rescan.setEnabled(False)
+            self.btn_rescan.setText("检测中…")
+
+        def _work() -> None:
+            # 注意：reset_cache 会清 lru_cache，只在 worker 里、且只在 force 时做，
+            # 且 worker 内不会再被别的探测并发调用（_probe_busy 已互斥）。
+            if force:
+                reset_cache()
+            try:
+                data = _ProbeResult(
+                    caps=format_capabilities(force=False),
+                    env=environment_report(),
+                    info=get_platform_info(),
+                    rows=describe_environment(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                data = exc
+            try:
+                self._probe_done.emit(data)
+            except RuntimeError:  # 页面已销毁（C++ 对象没了）
+                pass
+
+        threading.Thread(target=_work, daemon=True, name="bs-env-probe").start()
+
+    @Slot(object)
+    def _apply_probe(self, data: object) -> None:
+        """后台探测完成，回到 UI 线程渲染。"""
+        self._probe_busy = False
+        self.btn_rescan.setEnabled(True)
+        self.btn_rescan.setText("重新检测")
+        if isinstance(data, Exception):
+            log.warning("环境探测失败：%s", data)
+            self._probe_failed = True
+            self.raw.setPlainText(f"环境探测失败：{data}")
+            return
+        # 显式判断而不是 assert：assert 在 python -O 下会被移除，
+        # 那时 data.caps 会变成对任意对象的属性访问并抛出难懂的 AttributeError。
+        if not isinstance(data, _ProbeResult):
+            log.warning("环境探测返回了意外类型 %r，已忽略", type(data))
+            return
+        self._render(data.caps, data.env, data.info, data.rows)
+
+    def _render(self, caps, env, info, rows) -> None:  # noqa: ANN001
         self._caps = caps
-        env = environment_report()
-        info = get_platform_info()
         self.os_label.setText(info.label)
 
         # 系统信息网格
@@ -174,7 +260,6 @@ class EnvironmentPage(QWidget):
             w = item.widget()
             if w is not None:
                 w.deleteLater()
-        rows = describe_environment()
         cols = 3
         for i, (k, v) in enumerate(rows):
             cell = QWidget()

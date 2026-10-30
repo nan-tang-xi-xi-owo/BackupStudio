@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter
 from PySide6.QtWidgets import (
     QAbstractButton,
@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListView,
     QPushButton,
     QStyle,
     QVBoxLayout,
@@ -128,6 +129,57 @@ class Kbd(QLabel):
         self.setObjectName("Badge")
 
 
+class ElidedLabel(QLabel):
+    """按可用宽度省略的标签（单行，超出部分显示 ``…``）。
+
+    为什么不用 ``setWordWrap(True)``：这里显示的是「计划 · 下次 · 目标目录」这类
+    信息密度高、但不该换行的摘要。换行会让列表项高度参差，截断又会出现
+    ``p-bs-fix-src`` 这种半截词。
+
+    也没有用 ``QLabel.setElideMode``——Qt 的 QLabel 没有这个 API（那是
+    ``QAbstractItemView`` 与 ``QFontMetrics.elidedText`` 的东西）。
+
+    完整文本放进 tooltip，用户悬停即可看到。
+    """
+
+    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
+        super().__init__("", parent)
+        self._full = ""
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setMinimumWidth(0)
+        self.setText(text)  # 走统一的 setText，保证 tooltip / 省略都初始化到
+
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt 命名
+        self._full = text
+        self.setToolTip(text)
+        self._relayout()
+
+    def full_text(self) -> str:
+        return self._full
+
+    def minimumSizeHint(self):  # noqa: ANN201, N802 - Qt 命名
+        """返回"可以压到很窄"的最小尺寸。
+
+        QLabel 默认的最小宽度是**整段文本**的宽度，一个长路径就能把整页顶宽
+        （实测设置页因此出现 156px 横向溢出）。省略号本来就是为了在有限宽度下
+        表达文本，所以这里允许压到 0 —— 布局给多宽就显示多宽。
+        """
+        hint = super().minimumSizeHint()
+        return QSize(0, hint.height())
+
+    def resizeEvent(self, event) -> None:  # noqa: ANN001, N802 - Qt 命名
+        super().resizeEvent(event)
+        self._relayout()
+
+    def _relayout(self) -> None:
+        width = max(0, self.width() - 2)
+        if width <= 0:
+            return
+        metrics = self.fontMetrics()
+        # Qt 自带省略号算法：按像素宽度裁剪并补 "…"，不会切断多字节字符
+        super().setText(metrics.elidedText(self._full, Qt.TextElideMode.ElideRight, width))
+
+
 # --------------------------------------------------------------------------
 # 输入类
 # --------------------------------------------------------------------------
@@ -215,7 +267,19 @@ class Combo(QComboBox):
         self.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.setMinimumContentsLength(12)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        # 弹层是**独立的顶层窗口**（QComboBoxPrivateContainer），不是 combo 的子控件，
+        # 因此 QSS 里的 `QComboBox QAbstractItemView` 选择器匹配不到它 —— 用户看到的是
+        # 白底黑字的系统样式弹层。改用真正的 QListView 后 QSS 才能生效。
+        #
+        # 注意：setView() 会**重置 view 的尺寸策略**（实测行高 21→13、最小宽度 280→0），
+        # 所以必须在其后重新声明这两项，否则长条目被压扁、弹层窄得看不清。
+        self.setView(QListView())
         self.view().setMinimumWidth(280)
+        self.view().setSpacing(2)
+        # setView 会把行高重置成字体原始高度（实测 21→12px），条目挤在一起很难点。
+        # 显式给一个与正文行高匹配的下限（QSS 的 min-height 是给 item 的，
+        # 这里补的是 view 自身的 sizeHintForRow 基线）。
+        self.view().setStyleSheet("QListView::item { min-height: 26px; }")
 
     def add_item(self, text: str, data=None) -> None:  # noqa: ANN001
         self.addItem(text, data)

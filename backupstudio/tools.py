@@ -270,6 +270,20 @@ def probe_unrar_trial(path: str | None = None) -> tuple[bool, bool]:
         return False, bool(find_unrar())
 
 
+def reset_tools_cache() -> None:
+    """清空本模块所有 ``@lru_cache``（**"重新检测"要真正生效就必须调它**）。
+
+    缺陷背景（实测）：``capabilities.reset_cache()`` 原先只清 ``environment_report``
+    与 ``_codec_support``，**没清这里**。于是用户装了 7-Zip 后点「重新检测」，
+    ``probe_7z`` 仍命中旧缓存，界面显示的仍是"未找到"——
+    按钮看起来在工作，实际从来没生效过。
+    """
+    find_7z_gui.cache_clear()
+    probe_7z.cache_clear()
+    probe_rar.cache_clear()
+    probe_unrar_trial.cache_clear()
+
+
 def detect_bsdtar_backend() -> tuple[str, str] | None:
     """查找可用的 libarchive 后端：bsdtar / tar.exe / gtar。"""
     for name in ("bsdtar", "gtar", "tar"):
