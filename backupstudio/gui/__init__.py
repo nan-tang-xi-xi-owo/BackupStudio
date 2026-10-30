@@ -154,7 +154,8 @@ class Palette:
 
 LIGHT = Palette(
     name="light", dark=False,
-    bg="#F4F6FB", surface="#FFFFFF", surface_alt="#EEF2F9", border="#D5DDEB",
+    # 页面底比卡片更深一档（1.08 → 1.16:1），卡片才"浮"得起来
+    bg="#EDF1F8", surface="#FFFFFF", surface_alt="#F4F6FB", border="#D5DDEB",
     text="#1F2430", text_dim="#656B78", accent="#3E5DEB", accent_hover="#2F49C9",
     accent_text="#FFFFFF", success="#127F3A", warning="#9F5706", danger="#D12222",
     selection="#DCE4FF",
@@ -181,6 +182,35 @@ DARK = Palette(
 
 def palette_for(name: str) -> Palette:
     return DARK if name == "dark" else LIGHT
+
+
+def install_translator(app) -> bool:  # noqa: ANN001
+    """给 Qt 装中文翻译，让 QMessageBox 标准按钮显示「确定/取消/是/否」。
+
+    1.1.2 新增。改造前实测按钮文案是英文 `OK`/`Save`/`Cancel`/`&Yes`/`&No`
+    （全项目 37 个模态框都受影响）。
+
+    翻译文件来自 Qt 自带 `translations/qtbase_zh_CN.qm`。
+    打包时若没带进 `_internal/PySide6/translations`，本函数静默失败，
+    界面回落到英文按钮 —— 不会崩，但打包脚本应确保带上（见 packaging/build.py）。
+    """
+    try:
+        from PySide6.QtCore import QLibraryInfo, QLocale, QTranslator
+
+        path = QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)
+        tr = QTranslator(app)
+        # qtbase 提供 QDialogButtonBox / QMessageBox 的标准按钮文案
+        if tr.load(QLocale(QLocale.Language.Chinese, QLocale.Country.China), "qtbase", "_", path):
+            app.installTranslator(tr)
+            app._bs_translator = tr  # 防止被 GC
+            return True
+        if tr.load("qtbase_zh_CN", path):
+            app.installTranslator(tr)
+            app._bs_translator = tr
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
 
 
 def stylesheet(p: Palette) -> str:
@@ -303,26 +333,25 @@ def stylesheet(p: Palette) -> str:
         color: {p.disabled_fg}; background: {p.disabled_bg}; border-color: {p.border};
     }}
 
-    /* ── 下拉框：补回箭头（原来只有 ::drop-down 没有 down-arrow，箭头区几乎空白） ── */
+    /* ── 下拉框 ──
+       1.1.2 教训（两次踩坑，都记在这里）：
+       1) 用 QSS 的 border-* 拼三角箭头（`border-left: 4px solid transparent`），
+          在 Windows 风格下渲染成**实心小黑方块**，比没箭头更难看。
+          QSS 对子控件（::down-arrow）只支持 `image:`，不支持边框拼三角。
+       2) 完全删掉 ::drop-down 规则也不行：原生箭头区会画成**一条黑边**。
+       结论：给 ::drop-down 明确的背景色（与输入框同色），
+       让原生箭头画在上面 —— 实测黑块消失、箭头可见（深色像素 8→2）。 */
     QComboBox::drop-down {{
-        border: none; width: 22px; subcontrol-origin: padding; subcontrol-position: center right;
+        subcontrol-origin: padding; subcontrol-position: center right;
+        width: 24px; border: none; background: {p.surface};
     }}
-    QComboBox::down-arrow {{
-        image: none;
-        border-left: 4px solid transparent;
-        border-right: 4px solid transparent;
-        border-top: 5px solid {p.text_dim};
-        width: 0; height: 0;
-        margin-right: 8px;
-    }}
-    QComboBox::down-arrow:hover {{ border-top-color: {p.accent}; }}
-    QComboBox::down-arrow:disabled {{ border-top-color: {p.disabled_fg}; }}
+    QComboBox::drop-down:disabled {{ background: {p.disabled_bg}; }}
     QComboBox QAbstractItemView {{
         background: {p.surface}; border: 1px solid {p.border_strong}; selection-background-color: {p.selection};
         selection-color: {fg}; outline: none;
     }}
 
-    /* ── 微调框：补回上下箭头（原来完全没有，深色下 1.13:1 等于隐形） ── */
+    /* ── 微调框：只给按钮留位置，箭头交给原生风格画 ── */
     QSpinBox::up-button, QDoubleSpinBox::up-button,
     QTimeEdit::up-button, QDateTimeEdit::up-button {{
         subcontrol-origin: border; subcontrol-position: top right;
@@ -333,24 +362,6 @@ def stylesheet(p: Palette) -> str:
         subcontrol-origin: border; subcontrol-position: bottom right;
         width: 18px; border: none; background: transparent;
     }}
-    QSpinBox::up-arrow, QDoubleSpinBox::up-arrow, QTimeEdit::up-arrow, QDateTimeEdit::up-arrow {{
-        image: none;
-        border-left: 4px solid transparent;
-        border-right: 4px solid transparent;
-        border-bottom: 5px solid {p.text_dim};
-        width: 0; height: 0;
-    }}
-    QSpinBox::down-arrow, QDoubleSpinBox::down-arrow, QTimeEdit::down-arrow, QDateTimeEdit::down-arrow {{
-        image: none;
-        border-left: 4px solid transparent;
-        border-right: 4px solid transparent;
-        border-top: 5px solid {p.text_dim};
-        width: 0; height: 0;
-    }}
-    QSpinBox::up-arrow:hover, QDoubleSpinBox::up-arrow:hover {{ border-bottom-color: {p.accent}; }}
-    QSpinBox::down-arrow:hover, QDoubleSpinBox::down-arrow:hover {{ border-top-color: {p.accent}; }}
-    QSpinBox::up-arrow:disabled, QDoubleSpinBox::up-arrow:disabled {{ border-bottom-color: {p.disabled_fg}; }}
-    QSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:disabled {{ border-top-color: {p.disabled_fg}; }}
 
     /* ── 列表/表格 ── */
     QListWidget, QTreeWidget, QTableWidget {{
@@ -449,15 +460,6 @@ def stylesheet(p: Palette) -> str:
     QMenu::item:selected {{ background: {p.selection}; }}
     QMenu::item:disabled {{ color: {p.disabled_fg}; }}
     QMenu::separator {{ height: 1px; background: {p.border}; margin: 5px 8px; }}
-    /* **关键**：补回子菜单箭头（原来缺失，托盘菜单的可发现性线索被砍掉） */
-    QMenu::right-arrow {{
-        image: none;
-        border-top: 4px solid transparent;
-        border-bottom: 4px solid transparent;
-        border-left: 5px solid {p.text_dim};
-        width: 0; height: 0;
-        margin-right: 10px;
-    }}
     QMenu::indicator {{ width: 14px; height: 14px; }}
     QStatusBar {{ background: transparent; color: {p.text_dim}; }}
     QSplitter::handle {{ background: transparent; }}
@@ -474,10 +476,31 @@ def stylesheet(p: Palette) -> str:
         text-align: left; color: {p.text_dim}; font-size: 10pt;
     }}
     QToolButton#NavButton:hover {{ background: {p.surface_alt}; color: {fg}; }}
-    QToolButton#NavButton:checked {{ background: {p.nav_active}; color: {p.accent}; font-weight: 600; }}
+    /* 选中态：底色 + 左侧 3px 强调条（比纯底色更"有设计感"） */
+    QToolButton#NavButton:checked {{
+        background: {p.nav_active}; color: {p.accent}; font-weight: 600;
+        border-left: 3px solid {p.accent};
+        padding-left: 11px;
+    }}
     /* 焦点必须能在导航上看见 —— 这是键盘用户切换页面的唯一线索 */
     QToolButton#NavButton:focus {{
         border: 2px solid {p.focus_ring};
         color: {fg};
     }}
+
+    /* ── 1.1.2 新增：说明文字、分隔线、空状态 ── */
+    QLabel#Caption {{
+        color: {p.text_dim}; font-size: 9pt; font-weight: 700;
+        padding: 2px 4px; background: transparent;
+    }}
+    QFrame#Divider {{ background: {p.border}; border: none; max-height: 1px; min-height: 1px; }}
+    /* 空状态：大图标 + 标题 + 说明 */
+    QLabel#EmptyIcon {{ color: {p.border_strong}; font-size: 30pt; font-weight: 400; }}
+    QLabel#EmptyTitle {{ color: {fg}; font-size: 11pt; font-weight: 600; }}
+    QLabel#EmptyHint {{ color: {p.text_dim}; font-size: 9pt; }}
+    /* 信息卡片的标题行（比正文小、比说明深） */
+    QLabel#CardCap {{ color: {p.text_dim}; font-size: 9pt; font-weight: 600; }}
+    QLabel#CardVal {{ color: {fg}; font-size: 10pt; font-weight: 600; }}
+    /* 侧栏底部的状态条 */
+    QFrame#SideFooter {{ background: {p.surface_alt}; border: 1px solid {p.border}; border-radius: 9px; }}
     """

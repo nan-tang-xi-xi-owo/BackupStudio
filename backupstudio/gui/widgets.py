@@ -4,8 +4,8 @@ from __future__ import annotations
 
 
 from . import DARK, LIGHT
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QIcon, QPainter
+from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtGui import QColor, QIcon, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractButton,
     QComboBox,
@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QSizePolicy,
     QStyle,
     QVBoxLayout,
     QWidget,
@@ -197,12 +198,18 @@ class Switch(QAbstractButton):
         super().__init__(parent)
         self.setCheckable(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedSize(42, 24)
+        # 1.1.2：42×24 → 46×26（原尺寸低于 WCAG 2.1 AA 的 24×24 底线，
+        # 且 24 高时圆角弧度显得局促）
+        self.setFixedSize(46, 26)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._dark = dark
 
     def set_dark(self, dark: bool) -> None:
         self._dark = dark
         self.update()
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        return QSize(46, 26)
 
     def paintEvent(self, event) -> None:  # noqa: ANN001, N802
         p = QPainter(self)
@@ -211,14 +218,69 @@ class Switch(QAbstractButton):
         # 1.1.2：改用 Palette（原 track_off 浅色 #CBD5E1 不在 Palette 里）
         _pal = DARK if self._dark else LIGHT
         track_on = QColor(_pal.accent)
-        track_off = QColor(_pal.border_strong)
+        # 关闭态轨道加深，保证与卡片底 ≥1.9:1，一眼能看出"关着"
+        track_off = QColor(_pal.text_dim if self._dark else "#AEB8CC")
+        disabled = not self.isEnabled()
+        if disabled:
+            track_on = QColor(_pal.border)
+            track_off = QColor(_pal.border)
+
+        h = self.height()
+        r = h / 2
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(track_on if on else track_off)
-        p.drawRoundedRect(self.rect(), 12, 12)
-        knob = QColor(_pal.accent_text if self._dark else _pal.surface)
+        p.drawRoundedRect(self.rect(), r, r)
+
+        knob = QColor(_pal.surface if disabled else (_pal.accent_text if self._dark else "#FFFFFF"))
+        d = h - 6
+        x = self.width() - d - 3 if on else 3
         p.setBrush(knob)
-        x = self.width() - 21 if on else 3
-        p.drawEllipse(x, 3, 18, 18)
+        p.drawEllipse(x, 3, d, d)
+
+        # 焦点环（WCAG：焦点必须可见）
+        if self.hasFocus():
+            pen = QPen(QColor(_pal.focus_ring))
+            pen.setWidth(2)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), r - 1, r - 1)
+
+
+class ElideLabel(QLabel):
+    """单行省略号标签：宽度不足时显示 `…`，完整内容放 tooltip。
+
+    1.1.2 新增。改造前长路径/长任务名是**硬截断**（实测副标题需 372px
+    实得 240px，右侧内容直接消失且无提示），用户看不出被截掉了什么。
+    """
+
+    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._full = ""
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(0)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802
+        self._full = text or ""
+        self.setToolTip(self._full)
+        super().setText(self._full)
+
+    def full_text(self) -> str:
+        return self._full
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        s = super().minimumSizeHint()
+        return QSize(24, s.height())
+
+    def paintEvent(self, event) -> None:  # noqa: ANN001, N802
+        from PySide6.QtGui import QPainter as _QP
+
+        p = _QP(self)
+        fm = self.fontMetrics()
+        avail = self.contentsRect().width()
+        txt = fm.elidedText(self._full, Qt.TextElideMode.ElideMiddle, avail) if avail > 0 else ""
+        p.setPen(self.palette().color(self.foregroundRole()))
+        p.drawText(self.contentsRect(), int(self.alignment()), txt)
 
 
 class Combo(QComboBox):

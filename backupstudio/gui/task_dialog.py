@@ -1,4 +1,4 @@
-"""新建 / 编辑备份任务的对话框（来源、格式、密码、分卷、计划、保留策略、通知）。"""
+﻿"""新建 / 编辑备份任务的对话框（来源、格式、密码、分卷、计划、保留策略、通知）。"""
 
 from __future__ import annotations
 
@@ -154,7 +154,7 @@ class TaskDialog(QDialog):
         self.enabled_switch = Switch(dark=self._dark)
         row = QHBoxLayout()
         row.addWidget(self.enabled_switch)
-        row.addWidget(muted("停用后不会按计划自动执行，仍可手动备份"))
+        row.addWidget(muted("停用后不自动执行计划，仍可手动备份"))
         row.addStretch(1)
         form.addRow("启用任务", self._wrap(row))
         basic.add_layout(form)

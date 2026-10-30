@@ -1,4 +1,4 @@
-"""备份任务页：任务列表 + 详情 + 立即备份/进度。"""
+﻿"""备份任务页：任务列表 + 详情 + 立即备份/进度。"""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from ..schedule import describe_next
 from ..util import human_duration, human_size, reveal_file
 from .appstate import AppState
 from .icons import line_icon
-from .widgets import Badge, Card, StatusPill, muted, title_label
+from .widgets import Badge, Card, ElideLabel, StatusPill, muted, title_label
 
 log = logging.getLogger("backupstudio.gui.tasks")
 
@@ -79,28 +79,47 @@ _FORCE_RETRY_EXCLUDES = (
 
 
 class TaskItemWidget(QWidget):
-    """列表中的任务条目。"""
+    """列表中的任务条目（1.1.2 重做）。
+
+    改动：
+    - 标题改用 `ElideLabel`（长任务名不再撑破/硬截断）
+    - 副标题只显示「格式 · 下次时间」，**去掉重复的路径**
+      （路径在右侧详情里已有，重复显示既挤又乱）
+    - 左侧加状态色圆点，一眼看出成功/失败/未运行
+    """
 
     def __init__(self, task: BackupTask, dark: bool = False) -> None:
         super().__init__()
         self.task = task
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(2, 2, 2, 2)
-        lay.setSpacing(5)
+        self._dark = dark
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(4, 2, 4, 2)
+        lay.setSpacing(9)
+
+        # 状态圆点（用文本字符画，无需额外资源）
+        self.dot = QLabel("●")
+        self.dot.setFixedWidth(10)
+        lay.addWidget(self.dot, 0, Qt.AlignmentFlag.AlignTop)
+
+        col = QVBoxLayout()
+        col.setSpacing(3)
+        col.setContentsMargins(0, 0, 0, 0)
+
         top = QHBoxLayout()
-        top.setSpacing(8)
-        self.title = QLabel(task.name)
-        self.title.setStyleSheet("font-weight: 600; font-size: 14px;")
+        top.setSpacing(6)
+        self.title = ElideLabel(task.name)
+        self.title.setStyleSheet("font-weight: 600; font-size: 11pt;")
         self.badge = Badge("", "muted")
         self.badge.set_dark(dark)
         top.addWidget(self.title, 1)
-        top.addWidget(self.badge)
-        lay.addLayout(top)
-        self.sub = QLabel("")
+        top.addWidget(self.badge, 0)
+        col.addLayout(top)
+
+        self.sub = ElideLabel("")
         self.sub.setObjectName("Muted")
-        self.sub.setStyleSheet("font-size: 12px;")
-        self.sub.setWordWrap(False)
-        lay.addWidget(self.sub)
+        self.sub.setStyleSheet("font-size: 9pt;")
+        col.addWidget(self.sub)
+        lay.addLayout(col, 1)
         self.update_task(task)
 
     def update_task(self, task: BackupTask) -> None:
@@ -108,9 +127,30 @@ class TaskItemWidget(QWidget):
         self.title.setText(task.name)
         text, kind = STATUS_MAP.get(task.last_status, ("未运行过", "muted"))
         self.badge.set_state(text, kind)
+        self._set_dot(kind)
         sched = task.schedule.describe()
         when = describe_next(task, datetime.now())
-        self.sub.setText(f"{sched} · 下次 {when}   |   {task.destination or '未设置位置'}")
+        fmt = (task.options.fmt or "").upper()
+        self.sub.setText(f"{fmt} · {sched} · 下次 {when}")
+        self.sub.setToolTip(f"{sched} · 下次 {when}\n{task.destination or '未设置位置'}")
+
+    def _set_dot(self, kind: str) -> None:
+        from . import DARK as _D
+        from . import LIGHT as _L
+
+        pal = _D if self._dark else _L
+        color = {
+            "ok": pal.success,
+            "bad": pal.danger,
+            "warn": pal.warning,
+            "info": pal.accent,
+        }.get(kind, pal.border_strong)
+        self.dot.setStyleSheet(f"color: {color}; font-size: 11pt;")
+
+    def set_dark(self, dark: bool) -> None:
+        self._dark = dark
+        self.badge.set_dark(dark)
+        self.update_task(self.task)
 
 
 class TasksPage(QWidget):
@@ -174,21 +214,26 @@ class TasksPage(QWidget):
         rl = QVBoxLayout()
         rl.setSpacing(12)
         top = QHBoxLayout()
-        self.detail_title = title_label("选择一个任务", 2)
+        self.detail_title = ElideLabel("选择一个任务")
+        self.detail_title.setStyleSheet("font-size: 12pt; font-weight: 600;")
         self.detail_badge = Badge("", "muted")
         self.detail_badge.set_dark(self._dark)
         top.addWidget(self.detail_title, 1)
-        top.addWidget(self.detail_badge)
+        top.addWidget(self.detail_badge, 0)
         rl.addLayout(top)
 
-        self.detail_sub = muted("")
+        # 1.1.2：副标题改为「上次运行」摘要 —— 原来这里显示来源路径，
+        # 与下面「来源」卡片完全重复（同一路径在详情里出现两次）
+        self.detail_sub = ElideLabel("")
+        self.detail_sub.setObjectName("Muted")
+        self.detail_sub.setStyleSheet("font-size: 9pt;")
         rl.addWidget(self.detail_sub)
 
         from PySide6.QtWidgets import QGridLayout
 
         info_grid = QGridLayout()
         info_grid.setSpacing(10)
-        self.info_cards: dict[str, tuple[Card, QLabel]] = {}
+        self.info_cards: dict[str, tuple[Card, ElideLabel]] = {}
         for idx, (key, label) in enumerate((
             ("source", "来源"),
             ("dest", "备份位置"),
@@ -197,16 +242,16 @@ class TasksPage(QWidget):
         )):
             c = Card(flat=True, margins=(14, 10, 14, 10))
             cap = QLabel(label)
-            cap.setObjectName("Muted")
-            cap.setStyleSheet("font-size: 11px;")
-            val = QLabel("—")
-            val.setWordWrap(True)
-            val.setStyleSheet("font-size: 13px; font-weight: 600;")
+            cap.setObjectName("CardCap")
+            # 路径可能很长：用省略号 + tooltip，不再硬截断
+            val = ElideLabel("—")
+            val.setObjectName("CardVal")
             val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             c.add(cap)
             c.add(val)
-            c.setMinimumWidth(240)
+            c.setMinimumWidth(150)
             info_grid.addWidget(c, idx // 2, idx % 2)
+            info_grid.setColumnStretch(idx % 2, 1)
             self.info_cards[key] = (c, val)
         rl.addLayout(info_grid)
 
@@ -273,7 +318,7 @@ class TasksPage(QWidget):
         self.result_text.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         self.result_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.result_text.setStyleSheet(
-            "font-family: 'Cascadia Mono','Consolas','Menlo',monospace; font-size: 12px;"
+            "font-family: 'Cascadia Mono','Consolas','Menlo',monospace; font-size: 9pt;"
             "background: transparent; padding: 4px 2px;"
         )
         result_holder = QWidget()
@@ -288,7 +333,30 @@ class TasksPage(QWidget):
         scroll.setStyleSheet("QScrollArea { background: transparent; border: none; } QScrollArea > QWidget > QWidget { background: transparent; }")
         scroll.viewport().setAutoFillBackground(False)
         scroll.setWidget(result_holder)
+        self.result_scroll = scroll
         rl.addWidget(scroll, 1)
+
+        # 1.1.2：空状态 —— 一张"还没有结果"的引导面板，替代原来孤零零的「—」
+        self.empty_box = QWidget()
+        ev = QVBoxLayout(self.empty_box)
+        ev.setContentsMargins(0, 0, 0, 0)
+        ev.setSpacing(8)
+        ev.addStretch(1)
+        self.empty_icon = QLabel()
+        self.empty_icon.setObjectName("EmptyIcon")
+        self.empty_icon.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.empty_title = QLabel("还没有备份记录")
+        self.empty_title.setObjectName("EmptyTitle")
+        self.empty_title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.empty_hint = QLabel("点上面的「立即备份」跑第一次，或编辑任务设置自动计划")
+        self.empty_hint.setObjectName("EmptyHint")
+        self.empty_hint.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.empty_hint.setWordWrap(True)
+        for w in (self.empty_icon, self.empty_title, self.empty_hint):
+            ev.addWidget(w)
+        ev.addStretch(1)
+        rl.addWidget(self.empty_box, 1)
+        self.empty_box.hide()
 
         right.add_layout(rl)
         splitter.addWidget(right)
@@ -322,7 +390,7 @@ class TasksPage(QWidget):
         for t in tasks:
             item = QListWidgetItem()
             widget = TaskItemWidget(t, self._dark)
-            item.setSizeHint(QSize(280, 64))
+            item.setSizeHint(QSize(280, 58))
             item.setData(Qt.ItemDataRole.UserRole, t.id)
             self.list.addItem(item)
             self.list.setItemWidget(item, widget)
@@ -356,12 +424,13 @@ class TasksPage(QWidget):
     def _show_empty(self) -> None:
         self.detail_title.setText("选择一个任务")
         self.detail_badge.setVisible(False)
-        self.detail_sub.setText("")
+        self.detail_sub.setText("左侧选一个任务，这里会显示它的来源、目标与最近一次结果")
         for _, val in self.info_cards.values():
             val.setText("—")
-        self.result_text.setText("—")
+        self.result_text.setText("")
+        self.result_scroll.hide()
+        self.empty_box.hide()
         self.last_run.set_state("muted", "")
-
     def _show_task(self, task_id: str) -> None:
         task = self.state.get(task_id)
         if task is None:
@@ -371,7 +440,12 @@ class TasksPage(QWidget):
         text, kind = STATUS_MAP.get(task.last_status, ("未运行过", "muted"))
         self.detail_badge.setVisible(True)
         self.detail_badge.set_state(text, kind)
-        self.detail_sub.setText(self._describe_sources(task))
+        self.detail_sub.setText(
+            (
+                f"上次运行 {self._fmt_time(task.last_run)} · 用时 {human_duration(task.last_duration)}"
+                if task.last_run else "还没有运行记录 —— 点「立即备份」跑第一次"
+            )
+        )
         self.info_cards["source"][1].setText(self._source_short(task))
         self.info_cards["dest"][1].setText(task.destination or "未设置")
         from ..capabilities import FORMAT_LABELS
@@ -392,7 +466,7 @@ class TasksPage(QWidget):
         if task.last_status == "running":
             self.last_run.set_state("run", "正在备份…")
         elif task.last_run:
-            kind2 = {"success": "ok", "failure": "bad", "skipped": "warn"}.get(task.last_status, "muted")
+            kind2 = {"success": "ok", "failure": "bad", "partial": "warn", "skipped": "warn"}.get(task.last_status, "muted")
             self.last_run.set_state(kind2, f"{self._fmt_time(task.last_run)} · {task.last_message or STATUS_MAP.get(task.last_status, ('', ''))[0]}")
         else:
             self.last_run.set_state("muted", "尚未运行")
@@ -448,7 +522,26 @@ class TasksPage(QWidget):
             lines.append(f"耗时：{human_duration(task.last_duration)}")
         if task.last_message:
             lines.append(f"信息：{task.last_message}")
-        self.result_text.setText("\n".join(lines) if lines else "还没有运行结果。点击「立即备份」开始第一次备份。")
+        self.result_text.setText("\n".join(lines))
+        # 1.1.2：没有结果时显示引导面板，而不是一片空白 + 一行小字
+        has = bool(lines)
+        self.result_scroll.setVisible(has)
+        self.empty_box.setVisible(not has)
+        if not has:
+            from . import DARK as _D
+            from . import LIGHT as _L
+
+            pal = _D if self._dark else _L
+            running = task.last_status == "running"
+            # 用绘制的图形图标，比字符符号干净（原来是一个半圆字符，很怪）
+            self.empty_icon.setPixmap(
+                line_icon("run" if running else "folder", pal.border_strong, 44).pixmap(44, 44)
+            )
+            self.empty_title.setText("正在备份…" if running else "还没有备份记录")
+            self.empty_hint.setText(
+                "完成后这里会显示压缩包名、大小和耗时"
+                if running else "点上面的「立即备份」跑第一次，或编辑任务设置自动计划"
+            )
 
     # ------------------------------------------------------------------
     # 进度

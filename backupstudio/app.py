@@ -174,6 +174,13 @@ def _run_gui_inner(start_minimized: bool = False, open_new: bool = False) -> int
     app.setDesktopFileName("io.github.backupstudio.BackupStudio")
     app.setWindowIcon(app_icon())
     app.setQuitOnLastWindowClosed(False)
+    # 1.1.2：安装中文翻译 —— 否则 QMessageBox 的标准按钮显示 OK/Cancel/&Yes/&No
+    try:
+        from .gui import install_translator
+
+        install_translator(app)
+    except Exception:  # noqa: BLE001 —— 翻译缺失不影响启动
+        log.debug("Qt 中文翻译加载失败", exc_info=True)
     if getattr(sys, "frozen", False) and sys.platform == "win32":
         try:
             import ctypes

@@ -46,7 +46,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{APP_NAME_ZH} · {APP_NAME} {__version__}")
         self.setWindowIcon(app_icon())
         self.resize(1180, 760)
-        self.setMinimumSize(980, 640)
+        # 1.1.2：最小尺寸从 980×640 降到 900×600 —— 1366×768@150% 缩放后
+        # 逻辑分辨率只有 911×512，原来的 980×640 在那种屏上打不开完整窗口。
+        self.setMinimumSize(900, 600)
 
         central = QWidget()
         central.setObjectName("Page")
@@ -82,9 +84,18 @@ class MainWindow(QMainWindow):
 
         state.notified.connect(self._on_notify)
         state.theme_changed.connect(self._apply_theme)
+        state.daemon_state_changed.connect(self._on_daemon_state)
         state.run_started.connect(self._on_run_started)
         state.run_finished.connect(self._on_run_finished)
         self._apply_theme(state.palette)
+
+        # 1.1.2：守护进程状态轮询（原来 UI 从不主动探测，底栏永远是"检测中…"）
+        self._daemon_kind = "muted"
+        self._daemon_timer = QTimer(self)
+        self._daemon_timer.setInterval(8000)
+        self._daemon_timer.timeout.connect(lambda: self.state.poll_daemon_status())
+        self._daemon_timer.start()
+        QTimer.singleShot(400, lambda: self.state.poll_daemon_status())
 
         # **1.1.2 键盘可达性**：在**所有控件创建完成之后**显式串联导航按钮的
         # Tab 顺序。
@@ -106,7 +117,7 @@ class MainWindow(QMainWindow):
     def _build_sidebar(self) -> QWidget:
         side = QFrame()
         side.setObjectName("Card")
-        side.setFixedWidth(216)
+        side.setFixedWidth(224)
         side.setStyleSheet("QFrame#Card { border-radius: 0; border: none; }")
         lay = QVBoxLayout(side)
         lay.setContentsMargins(14, 18, 14, 14)
@@ -116,19 +127,25 @@ class MainWindow(QMainWindow):
         logo = QLabel()
         logo.setPixmap(app_icon().pixmap(QSize(34, 34)))
         names = QVBoxLayout()
-        names.setSpacing(0)
+        names.setSpacing(1)
         t = QLabel(APP_NAME_ZH)
-        t.setStyleSheet("font-size: 16px; font-weight: 700;")
+        t.setStyleSheet("font-size: 12pt; font-weight: 700;")
         s = QLabel(APP_NAME)
         s.setObjectName("Muted")
-        s.setStyleSheet("font-size: 11px;")
+        s.setStyleSheet("font-size: 8pt;")
         names.addWidget(t)
         names.addWidget(s)
         brand.addWidget(logo)
-        brand.addSpacing(8)
+        brand.addSpacing(9)
         brand.addLayout(names, 1)
         lay.addLayout(brand)
-        lay.addSpacing(18)
+        lay.addSpacing(16)
+
+        # 1.1.2：加分组标题，导航区与品牌区有视觉分隔
+        cap = QLabel("导航")
+        cap.setObjectName("Caption")
+        lay.addWidget(cap)
+        lay.addSpacing(2)
 
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
@@ -140,7 +157,7 @@ class MainWindow(QMainWindow):
             btn.setObjectName("NavButton")
             btn.setText(f"   {label}")
             btn.setIcon(line_icon(key, "#94A3B8", 20))
-            btn.setIconSize(QSize(20, 20))
+            btn.setIconSize(QSize(18, 18))
             btn.setCheckable(True)
             # **1.1.2 键盘可达性**：互斥 QButtonGroup 在 show() 时会把
             # **未选中项**的 focusPolicy 改成 NoFocus（Qt 对单选组的既定行为）。
@@ -169,23 +186,62 @@ class MainWindow(QMainWindow):
         # 注：导航按钮的 setTabOrder 在 __init__ 末尾统一做 —— 那时 `self.stack`
         # 与四个页面才建好，这里调用会被后续 addWidget 打乱（实测无效）。
 
+        # 1.1.2：底部状态收进一张小卡片（原来两行裸文字，显得松散）
+        foot = QFrame()
+        foot.setObjectName("SideFooter")
+        fl = QVBoxLayout(foot)
+        fl.setContentsMargins(10, 8, 10, 8)
+        fl.setSpacing(3)
+
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self.side_dot = QLabel("●")
+        self.side_dot.setFixedWidth(9)
         self.side_status = QLabel("守护进程：检测中…")
         self.side_status.setObjectName("Muted")
         self.side_status.setWordWrap(True)
-        self.side_status.setStyleSheet("font-size: 11px;")
-        lay.addWidget(self.side_status)
-        lay.addSpacing(6)
+        self.side_status.setStyleSheet("font-size: 8pt;")
+        row.addWidget(self.side_dot, 0, Qt.AlignmentFlag.AlignTop)
+        row.addWidget(self.side_status, 1)
+        fl.addLayout(row)
+
         ver = QLabel(f"v{__version__} · {'已打包' if getattr(sys, 'frozen', False) else '源码运行'}")
         ver.setObjectName("Muted")
-        ver.setStyleSheet("font-size: 11px;")
-        lay.addWidget(ver)
+        ver.setStyleSheet("font-size: 8pt;")
+        fl.addWidget(ver)
+        lay.addWidget(foot)
+        self._set_side_state("muted")
         return side
+
+    def _set_side_state(self, kind: str) -> None:
+        """底栏状态点颜色（1.1.2：原来永远是"检测中…"，因为信号没接）。"""
+        from . import DARK as _D
+        from . import LIGHT as _L
+
+        pal = _D if getattr(self.state, "palette", _L).dark else _L
+        color = {
+            "ok": pal.success,
+            "bad": pal.danger,
+            "warn": pal.warning,
+            "info": pal.accent,
+        }.get(kind, pal.text_dim)
+        if hasattr(self, "side_dot"):
+            self.side_dot.setStyleSheet(f"color: {color}; font-size: 8pt;")
 
     def _select(self, key: str) -> None:
         order = [k for k, _ in NAV_ITEMS]
         idx = order.index(key) if key in order else 0
         self.stack.setCurrentIndex(idx)
         self.nav_buttons[key].setChecked(True)
+        # 选中项图标换成强调色（视觉上"当前在哪"更明确）
+        try:
+            from .icons import line_icon
+
+            pal = self.state.palette
+            for k2, b2 in self.nav_buttons.items():
+                b2.setIcon(line_icon(k2, pal.accent if k2 == key else pal.text_dim, 18))
+        except Exception:  # noqa: BLE001
+            pass
         page = self.stack.currentWidget()
         # **1.1.2**：`setChecked(True)` 会再次触发 Qt 对互斥组「未选中项
         # 置 NoFocus」的逻辑，所以每次切页后都要把焦点策略补回来。
@@ -368,10 +424,37 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _apply_theme(self, palette) -> None:  # noqa: ANN001
         QApplication.instance().setStyleSheet(stylesheet(palette))
+        self._pal = palette
+        # 1.1.2：导航图标原先写死 #94A3B8（浅色下偏灰、深色下偏亮），
+        # 改为跟随主题的 text_dim / accent
+        from .icons import line_icon
+
+        for key, btn in getattr(self, "nav_buttons", {}).items():
+            active = btn.isChecked()
+            color = palette.accent if active else palette.text_dim
+            btn.setIcon(line_icon(key, color, 18))
+        if hasattr(self, "side_dot"):
+            self._set_side_state(getattr(self, "_daemon_kind", "muted"))
         self.tasks_page.set_palette_mode(palette.dark)
         self.history_page.set_palette_mode(palette.dark)
         self.env_page.set_palette_mode(palette.dark)
         self.settings_page.set_palette_mode(palette.dark)
+
+    def _on_daemon_state(self, info) -> None:  # noqa: ANN001
+        """底栏守护进程状态（1.1.2：此前信号没人接，永远显示"检测中…"）。"""
+        if not isinstance(info, dict):
+            return
+        running = bool(info.get("running"))
+        err = info.get("error") or ""
+        if running:
+            self._daemon_kind = "ok"
+            pid = info.get("pid")
+            self.side_status.setText(f"守护进程运行中{f'（PID {pid}）' if pid else ''}")
+        else:
+            self._daemon_kind = "warn" if err else "muted"
+            self.side_status.setText("守护进程未运行" if not err else "无法探测守护进程")
+            self.side_status.setToolTip(err)
+        self._set_side_state(self._daemon_kind)
 
     def show_main(self) -> None:
         self.showNormal()
