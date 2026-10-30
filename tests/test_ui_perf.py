@@ -103,7 +103,32 @@ class TestEnvironmentPageNonBlocking:
 
         store = TaskStore(Path(tempfile.mkdtemp()) / "tasks.json")
         state = AppState(store)
-        return EnvironmentPage(state, window=None)
+        page = EnvironmentPage(state, window=None)
+        self._created.append(page)
+        return page
+
+    @pytest.fixture(autouse=True)
+    def _cleanup_pages(self, app):
+        """每个用例结束后等后台探测线程收尾并销毁页面。
+
+        不这样做的话：页面（及其后台探测线程）会活到解释器退出，
+        此时 Qt 的 C++ 对象与 Python 线程交错析构 → 进程以**退出码 127**
+        结束。表现就是"所有测试都 passed，但 pytest 返回非 0"，
+        CI 上因此把整个 job 判红（实测）。
+        """
+        self._created = []
+        yield
+        deadline = time.time() + 30
+        for page in self._created:
+            while getattr(page, "_probe_busy", False) and time.time() < deadline:
+                app.processEvents()
+                time.sleep(0.01)
+            page.deleteLater()
+        app.processEvents()
+        for _ in range(10):
+            app.processEvents()
+            time.sleep(0.005)
+        self._created = []
 
     def test_on_shown_returns_immediately(self, app, tmp_path):
         """首次 ``on_shown`` 不得在 UI 线程里跑探测。
