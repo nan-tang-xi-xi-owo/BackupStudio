@@ -453,6 +453,21 @@ def stylesheet(p: Palette, style: str | None = None) -> str:
         width: 24px; border: none; background: {p.surface};
     }}
     QComboBox::drop-down:disabled {{ background: {p.disabled_bg}; }}
+    /* **下拉弹层的黑底问题**（用户截图：弹层整个变成黑块）。
+       原因：QComboBox 的弹层是**一个独立的顶层 QFrame**（不是 QAbstractItemView
+       的子级），QSS 里只写 QComboBox QAbstractItemView 覆盖不到它，
+       系统就用默认（深色）背景填充。
+       修法：
+       1) combobox-popup: 0 —— 强制用真正的 QListView 弹层，QSS 才生效；
+       2) 补 QComboBox QFrame 规则，盖住最外层容器；
+       3) 给 QAbstractItemView 也补背景（原已有，这里确保 item 背景不透明）。 */
+    QComboBox {{
+        combobox-popup: 0;
+    }}
+    QComboBox QFrame {{
+        background: {p.surface}; border: 1px solid {p.border_strong};
+        border-radius: {RI}px;
+    }}
     QComboBox QAbstractItemView {{
         background: {p.surface}; border: 1px solid {p.border_strong}; selection-background-color: {p.selection};
         selection-color: {fg}; outline: none;

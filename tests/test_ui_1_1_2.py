@@ -508,3 +508,78 @@ def test_settings_scroll_area_is_transparent() -> None:
     # 但**不能**给 holder 设 WA_TranslucentBackground，那会让子控件背景也变透明
     assert "holder.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)" not in src, \
         "不要给 holder 设 WA_TranslucentBackground（会波及子控件）"
+
+
+# ── 14. 下拉弹层不得是黑块（1.1.6）──────────────────────────────────
+def test_combo_popup_has_background_rules() -> None:
+    """QComboBox 弹层必须有背景规则，否则会渲染成黑块。
+
+    实测缺陷（用户截图）：打开配色下拉时弹层整个变成黑色。
+    原因：弹层是一个**独立的顶层 QFrame**（不是 QAbstractItemView 的子级），
+    只写 `QComboBox QAbstractItemView` 覆盖不到它。
+    修法需要两样：`combobox-popup: 0`（用真 QListView）+ `QComboBox QFrame` 规则。
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "backupstudio" / "gui" / "__init__.py").read_text(
+        encoding="utf-8"
+    )
+    assert "combobox-popup: 0" in src, "缺少 combobox-popup: 0（否则弹层是原生窗口，QSS 不生效）"
+    assert "QComboBox QFrame" in src, "缺少 QComboBox QFrame 规则（弹层最外层容器会露默认底色）"
+
+
+def test_combo_popup_renders_light() -> None:
+    """实测：四种风格的弹层都必须是浅色，暗像素占比 < 30%。"""
+    import os
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    os.environ.pop("QT_QPA_PLATFORM", None)
+    root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(root))
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    cfg = Path(tempfile.mkdtemp(prefix="pp-", dir=str(root / "build")))
+    os.environ["BACKUPSTUDIO_CONFIG_DIR"] = str(cfg)
+    from backupstudio.gui import stylesheet
+    from backupstudio.gui.appstate import AppState
+    from backupstudio.gui.main_window import MainWindow
+    from backupstudio.store import TaskStore
+
+    ts = TaskStore(cfg / "tasks.json")
+    st = AppState(ts)
+    w = MainWindow(st)
+    w.resize(1000, 680)
+    w.show()
+    for _ in range(8):
+        app.processEvents()
+    try:
+        for style in ("win", "glass", "98"):
+            st.set_style(style)
+            app.setStyleSheet(stylesheet(st.palette))
+            w._select("settings")
+            for _ in range(10):
+                app.processEvents()
+            cb = w._pages["settings"].style_combo
+            cb.showPopup()
+            for _ in range(10):
+                app.processEvents()
+            popup = cb.view().window()
+            img = popup.grab().toImage()
+            if img.isNull():
+                cb.hidePopup()
+                continue
+            dark = sum(
+                1
+                for y in range(0, img.height(), 8)
+                for x in range(0, img.width(), 8)
+                if img.pixelColor(x, y).lightness() < 40
+            )
+            total = len(range(0, img.height(), 8)) * len(range(0, img.width(), 8))
+            ratio = dark * 100.0 / max(total, 1)
+            cb.hidePopup()
+            assert ratio < 30, f"{style} 风格弹层暗像素占比 {ratio:.1f}%（黑块）"
+    finally:
+        w.close()
