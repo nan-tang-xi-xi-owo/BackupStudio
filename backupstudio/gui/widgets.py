@@ -132,11 +132,16 @@ class Card(QFrame):
         g.setColorAt(1.0, QColor(255, 255, 255, 0))
         p.fillPath(path, g)
         # 内高光边
-        p.setPen(QColor(255, 255, 255, 140 if not self._glass_dark else 60))
+        p.setPen(QColor(255, 255, 255, int(200 * self._glass_highlight)
+                        if hasattr(self, "_glass_highlight") else 180))
         p.setBrush(_Qt.BrushStyle.NoBrush)
         p.drawRoundedRect(1, 1, self.width() - 2, self.height() - 2,
                           self._glass_radius, self._glass_radius)
         p.end()
+        # **必须调用 super()**：QFrame 的默认 paintEvent 负责让子控件
+        # 正确合成到父级之上。自绘后不调 super() 会导致子控件（如
+        # 「立即备份」按钮）被父级绘制内容盖住 —— 实测只剩一团模糊影子。
+        return super().paintEvent(event)
 
     def body(self) -> QVBoxLayout:
         return self._layout

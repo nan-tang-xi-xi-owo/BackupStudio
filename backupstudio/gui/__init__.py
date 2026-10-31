@@ -345,6 +345,8 @@ def stylesheet(p: Palette, style: str | None = None) -> str:
         _card_border = f" border: {BW}px solid {p.border}; border-radius: {R}px;"
         _btn_border = f" border: {BW}px solid {p.border}; border-radius: {RB}px;"
 
+    # M3 药丸按钮需要更宽的内距（左右 24dp），其余风格保持 16px
+    _primary_pad = "8px 24px" if _st.key == "mag" else "7px 16px"
     _card_bg = _card_fill + _card_border
     _btn_bg = _btn_fill + _btn_border
 
@@ -395,7 +397,10 @@ def stylesheet(p: Palette, style: str | None = None) -> str:
         border-color: {p.border};
     }}
     QPushButton#Primary {{
-        background: {p.accent}; border: 1px solid {p.accent}; color: {p.accent_text}; font-weight: 600;
+        background: {p.accent}; border: {BW}px solid {p.accent};
+        color: {p.accent_text}; font-weight: 600;
+        border-radius: {RB}px;
+        padding: {_primary_pad};
     }}
     QPushButton#Primary:hover {{ background: {p.accent_hover}; border-color: {p.accent_hover}; }}
     QPushButton#Primary:focus {{

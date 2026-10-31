@@ -78,23 +78,26 @@ STYLES: dict[str, Style] = {
     ),
     "skeuo": Style(
         key="skeuo", name="拟物",
-        radius=9, radius_input=6, radius_button=7, border=1,
-        # 拟物风格要**同时**有立体边框和渐变（bevel 与 gradient 不互斥，
-        # 见 __init__.stylesheet 里的组合分支）
+        # **加重**（用户反馈"要重一些"）：边框 1→2px、圆角收小、阴影加强、
+        # 高光更强，做出厚实的材质感。
+        radius=7, radius_input=5, radius_button=6, border=2,
         bevel=True, gradient=True, translucent=False,
-        highlight=0.35, shadow=4, title_weight=700, letter_spacing=0.1,
+        highlight=0.75, shadow=8, title_weight=700, letter_spacing=0.1,
     ),
     "mag": Style(
         key="mag", name="Google Material",
-        radius=12, radius_input=8, radius_button=20, border=0,
+        # M3：卡片 12dp 圆角、**无边框**、单层阴影；按钮全圆角药丸（20dp）；
+        # 标题字重 500（M3 的 Title 用 Medium 而非 Bold）。
+        radius=12, radius_input=4, radius_button=20, border=0,
         bevel=False, gradient=False, translucent=False,
-        highlight=0.0, shadow=8, title_weight=500, letter_spacing=0.15,
+        highlight=0.0, shadow=6, title_weight=500, letter_spacing=0.15,
     ),
     "glass": Style(
         key="glass", name="液态玻璃",
-        radius=14, radius_input=9, radius_button=10, border=1,
-        bevel=False, gradient=True, translucent=True,
-        highlight=0.8, shadow=10, title_weight=600, letter_spacing=0.0,
+        # Liquid Glass：大圆角 + 半透明 + 强边缘高光 + 层叠阴影
+        radius=16, radius_input=10, radius_button=12, border=1,
+        bevel=False, gradient=False, translucent=True,
+        highlight=1.0, shadow=12, title_weight=600, letter_spacing=0.0,
     ),
 }
 

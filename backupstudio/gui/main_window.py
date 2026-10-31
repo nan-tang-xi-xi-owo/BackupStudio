@@ -559,7 +559,9 @@ class MainWindow(QMainWindow):
         from .widgets import Card
 
         on = _st().translucent
-        alpha = 0.62 if not palette.dark else 0.55
+        # Liquid Glass：tint 必须很低（0.20/0.26），否则模糊后的背景被白色盖住，
+        # 看起来就是一张纯白卡片（实测就是这样，用户反馈"根本不对"）。
+        alpha = 0.20 if not palette.dark else 0.26
         # **只给顶层卡片上玻璃**：嵌套的 CardFlat 小格子（信息卡）数量多、
         # 面积小，给它们各自采样+模糊的收益低、代价高（实测 19 张卡
         # 让切页要十几秒）。顶层卡片负责整体质感就够了。
@@ -675,11 +677,13 @@ class _Backdrop(QWidget):
 
         w, h = self.width(), self.height()
         # 光斑配色：用主题强调色/成功色/警告色的低饱和版本
+        # **光斑必须够明显**：玻璃的折射效果完全依赖背景有明暗/色彩变化。
+        # 若光斑太淡，模糊后就是一片白 —— 那正是"玻璃看起来不对"的根因。
         spots = (
-            (int(w * 0.16), int(h * 0.10), int(max(w, h) * 0.55), pal.accent, 0.30),
-            (int(w * 0.88), int(h * 0.26), int(max(w, h) * 0.42), pal.success, 0.18),
-            (int(w * 0.62), int(h * 0.95), int(max(w, h) * 0.50), pal.warning, 0.14),
-            (int(w * 0.34), int(h * 0.72), int(max(w, h) * 0.38), pal.accent_hover, 0.16),
+            (int(w * 0.14), int(h * 0.08), int(max(w, h) * 0.62), pal.accent, 0.55),
+            (int(w * 0.90), int(h * 0.30), int(max(w, h) * 0.48), pal.success, 0.40),
+            (int(w * 0.58), int(h * 0.98), int(max(w, h) * 0.55), pal.warning, 0.32),
+            (int(w * 0.32), int(h * 0.70), int(max(w, h) * 0.42), pal.accent_hover, 0.38),
         )
         for cx, cy, r, color, alpha in spots:
             g = QRadialGradient(cx, cy, r)
