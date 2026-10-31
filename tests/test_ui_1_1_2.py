@@ -233,3 +233,42 @@ def test_task_item_has_checkbox() -> None:
     assert "self.chk = QCheckBox()" in src
     assert "def set_batch" in src, "缺少 set_batch（批量模式开关）"
     assert "on_check" in src, "复选框没有回传到页面"
+
+
+# ── 9. 历史记录收纳（1.1.3）────────────────────────────────────────
+def test_history_page_paginates() -> None:
+    """历史页必须分页渲染，不能一次把所有记录建成表格行。
+
+    用户实测：history.jsonl 有 4651 条，打开「运行记录」就卡。
+    """
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "backupstudio" / "gui" / "history_page.py").read_text(
+        encoding="utf-8"
+    )
+    for marker, desc in (
+        ("_page_size", "分页大小"),
+        ("_shown", "当前显示条数"),
+        ("def _show_more", "显示更多"),
+        ("def _show_all", "全部显示"),
+        ("def _update_page_info", "计数文案"),
+    ):
+        assert marker in src, f"缺少{desc}（{marker}）"
+    # 必须只渲染前 _shown 条
+    m = re.search(r"def reload\(self\).*?(?=\n    def )", src, re.S)
+    assert m, "找不到 reload"
+    body = m.group(0)
+    assert "view = rows[: self._shown]" in body, "reload 没有截断到 _shown 条"
+    assert "setRowCount(len(view))" in body, "表格行数不是按 view 设置"
+
+
+def test_history_no_resize_to_contents() -> None:
+    """不能用 ResizeToContents：它对每列测量所有行，行多时极慢。"""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "backupstudio" / "gui" / "history_page.py").read_text(
+        encoding="utf-8"
+    )
+    assert "ResizeMode.ResizeToContents)" not in src, "仍在用 ResizeToContents"
+    assert "ResizeMode.Interactive" in src, "应改用固定列宽"

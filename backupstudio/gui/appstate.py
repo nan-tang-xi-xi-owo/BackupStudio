@@ -333,8 +333,14 @@ class AppState(QObject):
         self.notified.emit(title, msg, "success" if ok else "error")
 
     # ------------------------------------------------------------------
-    def history(self) -> list[dict]:
-        return read_history(300)
+    def history(self, limit: int = 3000) -> list[dict]:
+        """最近的历史记录。
+
+        1.1.3：上限从 300 提到 3000 —— 历史页已改成分页渲染（默认只建 100 行），
+        所以多读一些不会卡；反过来，固定 300 会让用户"看不到更早的记录"。
+        真要翻全部 4000+ 条，历史页的"全部显示"按钮会再放大窗口。
+        """
+        return read_history(limit)
 
 
 def config_directory() -> Path:
