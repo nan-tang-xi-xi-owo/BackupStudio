@@ -647,6 +647,18 @@ class MainWindow(QMainWindow):
             self._apply_titlebar_theme(sp)
         except Exception:  # noqa: BLE001
             log.debug("标题栏配色失败", exc_info=True)
+        # 没有自绘标题栏时，让**系统**标题栏跟随深浅色（1.1.4）
+        # 实测：DWMWA_USE_IMMERSIVE_DARK_MODE(20) 可用（白→黑 ΔL=-255），
+        # 但运行期只调 API 不会重绘，必须配合强制重绘（见 winchrome）。
+        if self.titlebar is None:
+            try:
+                from .winchrome import apply_native_dark_titlebar, force_native_repaint
+
+                hwnd = int(self.winId())
+                if apply_native_dark_titlebar(hwnd, sp.dark):
+                    force_native_repaint(hwnd)
+            except Exception:  # noqa: BLE001
+                log.debug("原生标题栏深色适配失败", exc_info=True)
         # 1.1.3：玻璃风格下给卡片装折射层
         try:
             self._install_glass(palette)
