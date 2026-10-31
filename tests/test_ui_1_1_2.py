@@ -473,3 +473,38 @@ def test_winframe_dpi_conversion() -> None:
     assert "ScreenToClient" in src, "必须用 ScreenToClient 转换坐标"
     assert "devicePixelRatioF" in src, "必须考虑 DPR（125% 缩放下否则偏移 25%）"
     assert "c_short" in src, "lParam 的 x/y 是有符号 short，需按 short 解析"
+
+
+# ── 13. 设置页外观区不得水平溢出（1.1.5）────────────────────────────
+def test_settings_appearance_uses_vertical_layout() -> None:
+    """外观区必须是**垂直**布局（每行一个设置项）。
+
+    实测缺陷：曾把 5 组控件塞进一个 QHBoxLayout，水平布局不换行，
+    总宽度超卡片就被裁掉 —— 用户截图里「Material You 源色」右侧被截断。
+    """
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "backupstudio" / "gui" / "settings_page.py").read_text(
+        encoding="utf-8"
+    )
+    assert "appearance = QVBoxLayout()" in src, "外观区必须用 QVBoxLayout（垂直）"
+    assert "appearance = QHBoxLayout()" not in src, "外观区又变回 QHBoxLayout 了"
+
+
+def test_settings_scroll_area_is_transparent() -> None:
+    """设置页的 QScrollArea 必须透明，否则玻璃卡片采样到纯色 viewport。
+
+    实测：设置页卡片被滚动区包着，不设透明时玻璃风格看不出折射
+    （任务页/运行记录页的卡片直接挂在 _Backdrop 下，所以那两个页正常）。
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "backupstudio" / "gui" / "settings_page.py").read_text(
+        encoding="utf-8"
+    )
+    assert "setAutoFillBackground(False)" in src, "滚动区 viewport 未关闭自动填充"
+    assert "QScrollArea { background: transparent" in src, "滚动区未设透明背景"
+    # 但**不能**给 holder 设 WA_TranslucentBackground，那会让子控件背景也变透明
+    assert "holder.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)" not in src, \
+        "不要给 holder 设 WA_TranslucentBackground（会波及子控件）"

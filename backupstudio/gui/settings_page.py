@@ -94,18 +94,30 @@ class SettingsPage(QWidget):
             self.sw_daemon.setChecked(False)
             self.sw_daemon.setToolTip(_flatpak.daemon_hint())
             general.add(muted("⚠ " + _flatpak.daemon_hint().replace("\n", " ")))
-        appearance = QHBoxLayout()
-        appearance.addWidget(QLabel("外观主题"), 1)
+        # **每行一个设置项**（1.1.5）。原来把 5 组控件塞进一个 QHBoxLayout，
+        # 水平布局不换行 → 总宽度超卡片就被裁掉（用户截图可见"截断"）。
+        appearance = QVBoxLayout()
+        appearance.setSpacing(8)
+
+        def _arow(label_text: str, widget) -> None:  # noqa: ANN001
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            lab = QLabel(label_text)
+            lab.setWordWrap(True)
+            lab.setMinimumWidth(150)
+            row.addWidget(lab, 0)
+            row.addWidget(widget, 1)
+            appearance.addLayout(row)
+
+        # 外观主题（跟随系统 / 浅色 / 深色）
         self.theme_combo = Combo()
         self.theme_combo.addItem("跟随系统", "system")
         self.theme_combo.addItem("浅色", "light")
         self.theme_combo.addItem("深色", "dark")
         self.theme_combo.currentIndexChanged.connect(self._on_theme)
-        appearance.addWidget(self.theme_combo)
+        _arow("外观主题", self.theme_combo)
 
-        # ── 外观风格（1.1.3）──
-        # 与配色正交：先选明暗，再选质感风格，可自由组合（6 风格 × 3 配色）。
-        appearance.addWidget(QLabel("外观风格"), 1)
+        # 外观风格（win / mac / 98 / skeuo / mag / glass）
         self.style_combo = Combo()
         from .styles import style_names
 
@@ -115,27 +127,25 @@ class SettingsPage(QWidget):
         self.style_combo.setToolTip(
             "风格决定圆角、立体感、渐变与透明度；配色决定明暗。两者可自由组合。"
         )
-        appearance.addWidget(self.style_combo)
+        _arow("外观风格", self.style_combo)
 
-        # ── Material You 动态配色（1.1.3）──
-        # 依据 AOSP 文档：单一源色 → 5 套色调板 × 13 档 = 65 色，
-        # 再映射到颜色角色。换源色整套配色都变。
-        appearance.addWidget(QLabel("Material You 源色"), 1)
+        # Material You 源色（单一色 → 5 板 × 13 档 = 65 色）
         seed_row = QWidget()
         sl = QHBoxLayout(seed_row)
         sl.setContentsMargins(0, 0, 0, 0)
+        sl.setSpacing(6)
         self.seed_edit = QLineEdit()
         self.seed_edit.setPlaceholderText("#6750A4")
-        self.seed_edit.setMaximumWidth(120)
+        self.seed_edit.setFixedWidth(110)
         self.seed_edit.editingFinished.connect(self._on_seed_changed)
         sl.addWidget(self.seed_edit)
         self.btn_pick_seed = QPushButton("选色…")
         self.btn_pick_seed.clicked.connect(self._pick_seed)
         sl.addWidget(self.btn_pick_seed)
         sl.addStretch(1)
-        appearance.addWidget(seed_row)
+        _arow("Material You 源色", seed_row)
 
-        appearance.addWidget(QLabel("Material You 配色风格"), 1)
+        # Material You 配色风格（Android 13+ 的四个 theme_style）
         self.tonal_combo = Combo()
         for key, name in (
             ("TONAL_SPOT", "TONAL_SPOT（默认）"),
@@ -145,7 +155,8 @@ class SettingsPage(QWidget):
         ):
             self.tonal_combo.addItem(name, key)
         self.tonal_combo.currentIndexChanged.connect(self._on_tonal_changed)
-        appearance.addWidget(self.tonal_combo)
+        _arow("Material You 配色风格", self.tonal_combo)
+
         general.add_layout(appearance)
         lay.addWidget(general)
 
@@ -280,6 +291,22 @@ class SettingsPage(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        # **关键**：滚动区及其 viewport 必须透明，否则玻璃卡片采样到的是
+        # viewport 的纯色底（而不是主窗口的渐变光斑）→ 看起来像纯色卡片。
+        # 用户反馈"液态玻璃貌似有些问题"就是这里：设置页被滚动区包着，
+        # 而任务页/运行记录页的卡片直接挂在 _Backdrop 下，所以那两个页有折射。
+        # 只让**滚动区自身与 viewport** 透明；不要用后代选择器
+        # QScrollArea > QWidget > QWidget —— 那会把内部所有控件（下拉框、
+        # 输入框）的背景也变透明，实测导致它们看起来没有边框。
+        scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollArea > QWidget#qt_scrollarea_viewport { background: transparent; }"
+        )
+        scroll.viewport().setAutoFillBackground(False)
+        # **不要**给 holder 设 WA_TranslucentBackground：它会让子控件
+        # （下拉框/输入框）的背景也变透明，实测在 glass 风格下
+        # 整个 QComboBox 变成纯黑 #000000（win 风格下反而正常）。
+        # 只靠 viewport 的 autoFillBackground=False 就足以让光斑透上来。
         scroll.setWidget(holder)
         outer.addWidget(scroll, 1)
 
