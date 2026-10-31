@@ -580,8 +580,13 @@ class MainWindow(QMainWindow):
             if edges:
                 self.windowHandle().startSystemResize(edges)
                 return
-            # 标题栏高度内的按下 = 拖动窗口（用系统 API 保住 Aero Snap）
-            if e.position().y() <= TITLE_H and self.titlebar is not None:
+            # 标题栏高度内的按下 = 拖动窗口（用系统 API 保住 Aero Snap）。
+            # **必须检查下界**：只看 y <= TITLE_H 会把负坐标也算进来
+            # （滚动区内容滚出可视区后，控件在窗口坐标里 y 为负数），
+            # 结果点击页面内容被误判成「拖标题栏」→ 窗口被拖动，
+            # 外观上像下拉框莫名其妙往下滑（用户反馈的正是这个）。
+            _y = e.position().y()
+            if 0 <= _y <= TITLE_H and self.titlebar is not None:
                 if self.windowHandle().startSystemMove():
                     return
         super().mousePressEvent(e)
@@ -715,7 +720,8 @@ class MainWindow(QMainWindow):
         on = _st().translucent
         # Liquid Glass：tint 必须很低（0.20/0.26），否则模糊后的背景被白色盖住，
         # 看起来就是一张纯白卡片（实测就是这样，用户反馈"根本不对"）。
-        alpha = 0.20 if not palette.dark else 0.26
+        # 更透：0.20 → 0.10（深色 0.14）。玻璃要"看得穿"而不是"糊一层白"。
+        alpha = 0.10 if not palette.dark else 0.14
         # **只给顶层卡片上玻璃**：嵌套的 CardFlat 小格子（信息卡）数量多、
         # 面积小，给它们各自采样+模糊的收益低、代价高（实测 19 张卡
         # 让切页要十几秒）。顶层卡片负责整体质感就够了。
@@ -723,10 +729,20 @@ class MainWindow(QMainWindow):
         # 结果 CardFlat 那批被玻璃模式设过内联样式后再也没被清掉
         # （内联优先级最高 → 那些卡片永远透明无边框 → 切风格看不出变化）。
         # 现在对全部 Card 调 set_glass：顶层开玻璃，其余显式关闭并清内联。
+        # tint 用**表面色的低饱和版本**而非纯白：真玻璃的色调来自环境，
+        # 糊一层纯白会变成磨砂板（用户反馈没有水一样的感觉）。
+        def _tint(src: str) -> str:
+            # 与中性灰混合 50%，压掉饱和、保留一点环境色
+            r, g, b = (int(src.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
+            m = (r + g + b) / 3
+            mix = lambda v: round(v * 0.5 + m * 0.5)  # noqa: E731
+            return f"#{mix(r):02X}{mix(g):02X}{mix(b):02X}"
+
+        _tint_col = _tint(palette.surface)
         for card in self.findChildren(Card):
             is_top = card.objectName() == "Card"
             card.set_glass(on and is_top, radius=_st().radius,
-                           tint=palette.surface, alpha=alpha, dark=palette.dark)
+                           tint=_tint_col, alpha=alpha, dark=palette.dark)
 
     def _on_daemon_state(self, info) -> None:  # noqa: ANN001
         """底栏守护进程状态（1.1.2：此前信号没人接，永远显示"检测中…"）。"""

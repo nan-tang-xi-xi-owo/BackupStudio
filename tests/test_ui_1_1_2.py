@@ -583,3 +583,63 @@ def test_combo_popup_renders_light() -> None:
             assert ratio < 30, f"{style} 风格弹层暗像素占比 {ratio:.1f}%（黑块）"
     finally:
         w.close()
+
+
+# ── 15. 标题栏拖动区必须有下界（1.1.7）──────────────────────────────
+def test_drag_zone_has_lower_bound() -> None:
+    """拖动判定必须检查 y >= 0，不能只判断上界。
+
+    实测缺陷（用户反馈"打开下拉的时候莫名其妙的往下滑了"）：
+    `mousePressEvent` 原写 `if e.position().y() <= TITLE_H`，
+    没有下界 → 滚动区内容滚出可视区后，控件在**窗口坐标**里 y 为负数，
+    点击它们会被误判成"按在标题栏"→ 触发 startSystemMove 拖走整个窗口。
+
+    实测证据（设置页滚动到 400px 时）：
+        theme_combo   窗口内 y=-108
+        style_combo   窗口内 y= -66
+        tonal_combo   窗口内 y=  18   ← 负数与 0..34 都曾误判
+    """
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "backupstudio" / "gui" / "main_window.py").read_text(
+        encoding="utf-8"
+    )
+    m = re.search(r"def mousePressEvent.*?(?=\n    def )", src, re.S)
+    assert m, "找不到 mousePressEvent"
+    body = m.group(0)
+    assert "0 <= _y <= TITLE_H" in body or "0 <= e.position().y() <= TITLE_H" in body, \
+        "拖动判定缺少 y >= 0 下界（负坐标会被误判成标题栏）"
+    # 反例：不应出现无下界的写法
+    assert "e.position().y() <= TITLE_H and" not in body or "0 <=" in body, \
+        "仍有只判断上界的写法"
+
+
+# ── 16. 液态玻璃必须真的"透"（1.1.7）───────────────────────────────
+def test_glass_is_translucent_enough() -> None:
+    """玻璃的模糊层不透明度必须足够低，否则是磨砂白板而非玻璃。
+
+    用户反馈"没有那么透，没有像是水一样的感觉"。
+    实测：`p.setOpacity(0.92)` + tint 0.20 = 磨砂板。
+    """
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "backupstudio" / "gui" / "widgets.py").read_text(
+        encoding="utf-8"
+    )
+    m = re.search(r"p\.setOpacity\((0\.\d+)\)\s*\n\s*p\.drawPixmap", src)
+    assert m, "找不到 drawPixmap 前的不透明度设置"
+    op = float(m.group(1))
+    assert op <= 0.70, f"模糊层不透明度 {op} 太高（>0.70 会变成磨砂白板，看不出水感）"
+
+
+def test_glass_has_refraction() -> None:
+    """玻璃必须做位移折射，而不只是模糊（否则是 glassmorphism 不是液态玻璃）。"""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "backupstudio" / "gui" / "widgets.py").read_text(
+        encoding="utf-8"
+    )
+    assert "displace(" in src, "缺少位移折射"
+    assert "strength=" in src, "折射强度未设置"

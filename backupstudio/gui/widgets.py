@@ -114,8 +114,9 @@ class Card(QFrame):
             for r in (3, 2, 1):
                 small = _box_blur(small, r)
             # **折射**：在低分辨率上做位移重采样（便宜且边缘更柔）
-            small = displace(small, radius=16, strength=0.6,
-                             edge=max(6, min(small.width(), small.height()) // 4))
+            # 折射加大：0.6 → 1.0，边缘弯折更明显（"水"的感觉来自这里）
+            small = displace(small, radius=18, strength=1.0,
+                             edge=max(8, min(small.width(), small.height()) // 3))
             small = _chromatic(small, 1)
             # 放回原尺寸（平滑放大；本来就是模糊图，看不出插值）
             img = small.scaled(w0, h0, _Qt.AspectRatioMode.IgnoreAspectRatio,
@@ -128,7 +129,10 @@ class Card(QFrame):
         path.addRoundedRect(0.5, 0.5, self.width() - 1, self.height() - 1,
                             self._glass_radius, self._glass_radius)
         p.setClipPath(path)
-        p.setOpacity(0.92)
+        # **玻璃的"透"**：模糊层不透明度从 0.92 降到 0.55。
+        # 0.92 等于把背景糊成实心，再叠 tint 就是磨砂白板 ——
+        # 用户反馈"没有那么透、没有水一样的感觉"的根因。
+        p.setOpacity(0.55)
         p.drawPixmap(0, 0, QPixmap.fromImage(img))
         p.setOpacity(1.0)
         tint = QColor(self._glass_tint)
