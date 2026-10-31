@@ -548,12 +548,22 @@ def stylesheet(p: Palette, style: str | None = None) -> str:
     QProgressBar::chunk {{ background: {p.accent}; border-radius: {RI}px; }}
 
     /* ── 滚动条 ── */
-    QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
-    QScrollBar::handle:vertical {{ background: {p.border_strong}; border-radius: 4px; min-height: 30px; }}
-    QScrollBar::handle:vertical:hover {{ background: {p.text_dim}; }}
+    /* 滚动条（1.1.6）：更窄、handle 半透明、与窗口边缘留间距。
+       原来 10px + 实色 border_strong 在玻璃风格下是突兀的深色竖条
+       （用户反馈"边缘不协调"经逐像素证实就是这个）。 */
+    QScrollBar:vertical {{
+        background: transparent; width: 8px;
+        margin: 4px 3px 4px 0;
+    }}
+    QScrollBar::handle:vertical {{ background: rgba({_hex2rgb(p.border_strong)}, 0.55); border-radius: 3px; min-height: 30px; }}
+    QScrollBar::handle:vertical:hover {{ background: rgba({_hex2rgb(p.text_dim)}, 0.75); }}
     QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
-    QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 2px; }}
-    QScrollBar::handle:horizontal {{ background: {p.border_strong}; border-radius: 4px; min-width: 30px; }}
+    QScrollBar:horizontal {{
+        background: transparent; height: 8px;
+        margin: 0 4px 3px 4px;
+    }}
+    QScrollBar::handle:horizontal:hover {{ background: rgba({_hex2rgb(p.text_dim)}, 0.75); }}
+    QScrollBar::handle:horizontal {{ background: rgba({_hex2rgb(p.border_strong)}, 0.55); border-radius: 3px; min-width: 30px; }}
 
     /* ── 提示/菜单 ── */
     QToolTip {{

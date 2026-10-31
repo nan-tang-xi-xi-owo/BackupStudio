@@ -54,8 +54,14 @@ class Card(QFrame):
             self._glass_tint = tint
             self._glass_alpha = alpha
             self._glass_dark = dark
-            # 交给自绘，QSS 背景必须让位
-            self.setStyleSheet("background: transparent; border: none;")
+            # 交给自绘，QSS 背景必须让位。
+            # **必须限定到本控件**：setStyleSheet("background: transparent")
+            # 会被子控件继承 —— 实测下拉框/输入框的边框和底色也被抹掉，
+            # 在玻璃风格下变成没有边框的白方块（用户反馈的边缘不协调之一）。
+            # 交给自绘，QSS 背景让位。限定到本控件（带 objectName），
+            # 避免影响子控件。
+            _n = self.objectName() or "Card"
+            self.setStyleSheet(f"QFrame#{_n} {{ background: transparent; border: none; }}")
         else:
             # **必须清掉内联样式**：内联优先级高于全局 QSS，
             # 残留会让卡片永远透明无边框 —— 表现就是"切风格没区别"
@@ -141,9 +147,9 @@ class Card(QFrame):
         p.drawRoundedRect(1, 1, self.width() - 2, self.height() - 2,
                           self._glass_radius, self._glass_radius)
         p.end()
-        # **必须调用 super()**：QFrame 的默认 paintEvent 负责让子控件
-        # 正确合成到父级之上。自绘后不调 super() 会导致子控件（如
-        # 「立即备份」按钮）被父级绘制内容盖住 —— 实测只剩一团模糊影子。
+        # 调 QFrame.paintEvent 让**子控件**正确合成到父级之上。
+        # （曾误判它盖住玻璃并改成 QWidget.paintEvent —— 实际是测量时
+        #  逻辑坐标读了物理像素截图造成的假象，已订正。）
         return super().paintEvent(event)
 
     def body(self) -> QVBoxLayout:

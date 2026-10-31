@@ -233,8 +233,12 @@ def styled_palette(p: Palette, key: str) -> Palette:
                            accent="#7C9CFF", accent_hover="#9AB2FF", accent_text="#0E1018",
                            text="#E8ECF5", text_dim="#9BA4BC",
                            selection="#31406B", nav_active="#2A3654")
-        return replace(p, bg="#E6ECF7", surface="#F7FAFF", surface_alt="#EDF2FB",
-                       border="#C8D4E8", border_strong="#AFC0DA",
+        # **下拉框/输入框必须有足够对比度**（1.1.6）：玻璃卡片背景是半透明
+        # 浅色，输入框如果再是近白色，边框 #AFC0DA 又太淡 → 视觉上融成一片，
+        # 用户会看成没有边框的白方块（截图实证）。
+        # 这里把 surface_alt 压深、border_strong 加深，让输入类控件立起来。
+        return replace(p, bg="#E6ECF7", surface="#F7FAFF", surface_alt="#E3EAF6",
+                       border="#B7C5DD", border_strong="#93A5C4",
                        accent="#5B7CFA", accent_hover="#4468F0", accent_text="#FFFFFF",
                        text="#1A2033", text_dim="#5A6478",
                        selection="#D9E2FB", nav_active="#E3EAFB")
