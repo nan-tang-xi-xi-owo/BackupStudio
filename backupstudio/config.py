@@ -317,6 +317,10 @@ class AppSettings:
     #: 与 theme_mode **正交** —— 风格管几何质感（圆角/立体/渐变/玻璃），
     #: 配色管明暗（light/dark）。
     ui_style: str = "win"
+    #: Material You 源色（mag 风格用；单一色生成 65 色体系）
+    material_seed: str = "#6750A4"
+    #: Material You 配色风格：TONAL_SPOT | VIBRANT | EXPRESSIVE | SPRITZ
+    material_style: str = "TONAL_SPOT"
     tray_hint_shown: bool = False  # 是否已经提示过「程序在托盘里」
 
     def to_dict(self) -> dict[str, Any]:
@@ -336,6 +340,8 @@ class AppSettings:
             auto_run_backup_daemon=bool(data.get("auto_run_backup_daemon", True)),
             theme_mode=str(data.get("theme_mode", "system") or "system"),
             ui_style=str(data.get("ui_style", "win") or "win"),
+            material_seed=str(data.get("material_seed", "#6750A4") or "#6750A4"),
+            material_style=str(data.get("material_style", "TONAL_SPOT") or "TONAL_SPOT"),
             tray_hint_shown=bool(data.get("tray_hint_shown", False)),
         )
 

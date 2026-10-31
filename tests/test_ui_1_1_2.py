@@ -272,3 +272,55 @@ def test_history_no_resize_to_contents() -> None:
     )
     assert "ResizeMode.ResizeToContents)" not in src, "仍在用 ResizeToContents"
     assert "ResizeMode.Interactive" in src, "应改用固定列宽"
+
+
+# ── 10. Material You 动态配色（1.1.3）──────────────────────────────
+def test_material_you_generates_65_colors() -> None:
+    """Material You：单一源色 → 5 套色调板 × 13 档 = 65 色（AOSP 规格）。"""
+    from backupstudio.gui.mcu import TONES, tonal_palettes
+
+    pal = tonal_palettes("#6750A4")
+    assert len(pal) == 5, f"应有 5 套色调板，实际 {len(pal)}"
+    assert len(TONES) == 13, f"应有 13 档 tone，实际 {len(TONES)}"
+    total = sum(len(v) for v in pal.values())
+    assert total == 65, f"应有 65 色，实际 {total}"
+    for board, row in pal.items():
+        assert len(row) == 13, f"{board} 只有 {len(row)} 档"
+        for tone, color in row.items():
+            assert color.startswith("#") and len(color) == 7, f"{board}/{tone} 颜色非法: {color}"
+
+
+def test_material_you_seed_drives_palette() -> None:
+    """换源色必须带来不同的主色 —— 这是 Material You 的核心特征。"""
+    from backupstudio.gui import LIGHT
+    from backupstudio.gui.styles import set_material_you, styled_palette
+
+    primaries = set()
+    for seed in ("#6750A4", "#B1611C", "#006D3B", "#B3261E"):
+        set_material_you(seed)
+        primaries.add(styled_palette(LIGHT, "mag").accent)
+    set_material_you("#6750A4")
+    assert len(primaries) >= 3, f"不同源色应产生不同主色，实际只有 {len(primaries)} 种"
+
+
+def test_material_you_theme_styles() -> None:
+    """Android 13+ 的四种 theme_style 都应可用且产生不同结果。"""
+    from backupstudio.gui import LIGHT
+    from backupstudio.gui.styles import set_material_you, styled_palette
+
+    out = {}
+    for st in ("TONAL_SPOT", "VIBRANT", "EXPRESSIVE", "SPRITZ"):
+        set_material_you("#6750A4", st)
+        out[st] = styled_palette(LIGHT, "mag").accent
+    set_material_you("#6750A4", "TONAL_SPOT")
+    assert len(set(out.values())) >= 3, f"四种 style 应产生不同主色，实际 {out}"
+
+
+def test_material_you_light_dark_differ() -> None:
+    """浅色/深色两套角色映射必须不同。"""
+    from backupstudio.gui.mcu import scheme
+
+    light = scheme("#6750A4", dark=False)
+    dark = scheme("#6750A4", dark=True)
+    assert light["background"] != dark["background"], "浅色/深色背景不应相同"
+    assert light["primary"] != dark["primary"], "浅色/深色主色不应相同"

@@ -6,8 +6,10 @@ import logging
 import sys
 from pathlib import Path
 
+from PySide6.QtGui import QColor
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QLineEdit,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -114,6 +116,36 @@ class SettingsPage(QWidget):
             "风格决定圆角、立体感、渐变与透明度；配色决定明暗。两者可自由组合。"
         )
         appearance.addWidget(self.style_combo)
+
+        # ── Material You 动态配色（1.1.3）──
+        # 依据 AOSP 文档：单一源色 → 5 套色调板 × 13 档 = 65 色，
+        # 再映射到颜色角色。换源色整套配色都变。
+        appearance.addWidget(QLabel("Material You 源色"), 1)
+        seed_row = QWidget()
+        sl = QHBoxLayout(seed_row)
+        sl.setContentsMargins(0, 0, 0, 0)
+        self.seed_edit = QLineEdit()
+        self.seed_edit.setPlaceholderText("#6750A4")
+        self.seed_edit.setMaximumWidth(120)
+        self.seed_edit.editingFinished.connect(self._on_seed_changed)
+        sl.addWidget(self.seed_edit)
+        self.btn_pick_seed = QPushButton("选色…")
+        self.btn_pick_seed.clicked.connect(self._pick_seed)
+        sl.addWidget(self.btn_pick_seed)
+        sl.addStretch(1)
+        appearance.addWidget(seed_row)
+
+        appearance.addWidget(QLabel("Material You 配色风格"), 1)
+        self.tonal_combo = Combo()
+        for key, name in (
+            ("TONAL_SPOT", "TONAL_SPOT（默认）"),
+            ("VIBRANT", "VIBRANT（更鲜艳）"),
+            ("EXPRESSIVE", "EXPRESSIVE（极鲜艳）"),
+            ("SPRITZ", "SPRITZ（近灰阶）"),
+        ):
+            self.tonal_combo.addItem(name, key)
+        self.tonal_combo.currentIndexChanged.connect(self._on_tonal_changed)
+        appearance.addWidget(self.tonal_combo)
         general.add_layout(appearance)
         lay.addWidget(general)
 
@@ -333,6 +365,38 @@ class SettingsPage(QWidget):
             return
         self._save()
         self.state.set_theme(self.theme_combo.currentData() or "system")
+
+    # ------------------------------------------------------------------
+    # Material You（1.1.3）
+    # ------------------------------------------------------------------
+    def _on_seed_changed(self) -> None:
+        from .mcu import normalize_seed
+
+        seed = normalize_seed(self.seed_edit.text())
+        self.seed_edit.setText(seed)
+        s = self.state.store.settings
+        s.material_seed = seed
+        self.state.store.save()
+        self.state.set_style(self.style_combo.currentData() or "win")
+
+    def _pick_seed(self) -> None:
+        from PySide6.QtWidgets import QColorDialog
+
+        from .mcu import normalize_seed
+
+        cur = normalize_seed(self.seed_edit.text())
+        c = QColorDialog.getColor(QColor(cur), self, "选择 Material You 源色")
+        if c.isValid():
+            self.seed_edit.setText(c.name().upper())
+            self._on_seed_changed()
+
+    def _on_tonal_changed(self) -> None:
+        if self._loading:
+            return
+        s = self.state.store.settings
+        s.material_style = self.tonal_combo.currentData() or "TONAL_SPOT"
+        self.state.store.save()
+        self.state.set_style(self.style_combo.currentData() or "win")
 
     def _on_style(self) -> None:
         """切换外观风格（1.1.3）。"""
