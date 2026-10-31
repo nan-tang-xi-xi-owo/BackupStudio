@@ -417,3 +417,59 @@ def test_frameless_edge_zones_work() -> None:
     mid = w._edge_at(QPoint(450, 300))
     assert not mid, f"中心不应在热区: {mid}"
     w.close()
+
+
+# ── 12. 路线 C：原生框架位（1.1.5）────────────────────────────────
+def test_winframe_constants_and_structure() -> None:
+    """winframe 必须具备路线 C 的三个要素：框架位、NCCALCSIZE、NCHITTEST。"""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "backupstudio" / "gui" / "winframe.py").read_text(
+        encoding="utf-8"
+    )
+    for marker, desc in (
+        ("WS_THICKFRAME", "WS_THICKFRAME 框架位"),
+        ("WS_CAPTION", "WS_CAPTION 框架位"),
+        ("FRAME_BITS", "框架位组合"),
+        ("WM_NCCALCSIZE", "客户区归零消息"),
+        ("WM_NCHITTEST", "命中测试消息"),
+        ("WM_NCLBUTTONDBLCLK", "原生双击消息"),
+        ("DwmExtendFrameIntoClientArea", "阴影恢复"),
+        ("SetWindowLongPtrW", "64 位指针 API"),
+    ):
+        assert marker in src, f"缺少{desc}（{marker}）"
+
+
+def test_winframe_edge_priority_over_caption() -> None:
+    """边缘判定必须**优先于**标题带。
+
+    若顶边被判成 HTCAPTION，上边缘缩放和拖到屏幕顶部的 Aero Snap 都会失效
+    —— 这是设计 Agent 明确提醒的坑。
+    """
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "backupstudio" / "gui" / "winframe.py").read_text(
+        encoding="utf-8"
+    )
+    m = re.search(r"def _hit_test\(.*?(?=\n    def )", src, re.S)
+    assert m, "找不到 _hit_test"
+    body = m.group(0)
+    i_edge = body.find("left, right = x <= m")
+    # 只找函数体里 return 的 HTCAPTION，避免匹配到常量导入
+    i_caption = body.find("return HTCAPTION")
+    assert i_edge != -1, "找不到边缘判定"
+    assert i_caption != -1, "找不到 HTCAPTION 判定"
+    assert i_edge < i_caption, "边缘判定必须在 HTCAPTION 之前（否则 Snap/缩放失效）"
+
+
+def test_winframe_dpi_conversion() -> None:
+    """坐标必须做 DPI 换算：lParam 是物理像素，Qt 是逻辑像素。"""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "backupstudio" / "gui" / "winframe.py").read_text(
+        encoding="utf-8"
+    )
+    assert "ScreenToClient" in src, "必须用 ScreenToClient 转换坐标"
+    assert "devicePixelRatioF" in src, "必须考虑 DPR（125% 缩放下否则偏移 25%）"
+    assert "c_short" in src, "lParam 的 x/y 是有符号 short，需按 short 解析"

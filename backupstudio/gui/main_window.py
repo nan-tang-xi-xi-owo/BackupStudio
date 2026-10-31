@@ -89,8 +89,12 @@ class MainWindow(QMainWindow):
             ol.addWidget(self.titlebar)
             ol.addWidget(central, 1)
             self.setCentralWidget(outer)
-            self.setMouseTracking(True)
-            outer.setMouseTracking(True)
+            # **路线 C**（1.1.5）：把原生框架位 OR 回去 + NCCALCSIZE 归零 +
+            # NCHITTEST 分区。这样拖拽/缩放/Snap 都走系统原生回路，
+            # 而不是 Qt 自己实现的版本（后者 WM_NCHITTEST 全返回 HTCLIENT，
+            # 实测无原生 Snap）。
+            self._chrome = None
+            self._install_native_chrome()
         else:
             self.titlebar = None
             self.setCentralWidget(central)
@@ -607,6 +611,38 @@ class MainWindow(QMainWindow):
             self.titlebar.sync_max_glyph()
         super().changeEvent(e)
 
+    def _install_native_chrome(self) -> None:
+        """安装路线 C 的原生框架处理（仅 Windows）。
+
+        `winId()` 在窗口未显示时可能尚未创建，所以这里用 `singleShot(0)`
+        等窗口真正创建后再装；同时避免在 `__init__` 里过早触碰 HWND。
+        """
+        from PySide6.QtCore import QTimer
+
+        def _do() -> None:
+            try:
+                from .winframe import FramelessChrome
+
+                chrome = FramelessChrome(self, title_height=TITLE_H)
+                # native 双击（Qt 的 mouseDoubleClickEvent 在 HTCAPTION 下收不到）
+                chrome.on_toggle_max = self._toggle_max
+                if chrome.install():
+                    self._chrome = chrome
+                    log.debug("原生框架已安装（路线 C）")
+            except Exception:  # noqa: BLE001
+                log.debug("原生框架安装失败，退回 Qt 拖动", exc_info=True)
+
+        QTimer.singleShot(0, _do)
+
+    def _toggle_max(self) -> None:
+        """最大化/还原（供原生双击与标题栏按钮共用）。"""
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+        if self.titlebar is not None:
+            self.titlebar.sync_max_glyph()
+
     def _apply_titlebar_theme(self, palette) -> None:  # noqa: ANN001
         """标题栏配色跟随主题（1.1.4）。"""
         if self.titlebar is None:
@@ -714,6 +750,13 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        # 1.1.5：卸载窗口子类化，避免窗口销毁后回调悬空
+        chrome = getattr(self, "_chrome", None)
+        if chrome is not None:
+            try:
+                chrome.uninstall()
+            except Exception:  # noqa: BLE001
+                pass
         if (
             self._really_quit
             or not self.state.store.settings.close_to_tray
