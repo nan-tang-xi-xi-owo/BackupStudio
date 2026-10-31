@@ -190,3 +190,46 @@ def test_main_window_lazy_pages() -> None:
     assert '"_pages"' in body or "self._pages" in body, "_apply_theme 应只遍历已创建的页面"
     # 必须有懒加载机制
     assert "def _page" in src and "_prewarm_pages" in src, "缺少懒加载/预热实现"
+
+
+# ── 8. 批量勾选 + 批量删除（1.1.3）────────────────────────────────
+def test_tasks_page_has_batch_delete() -> None:
+    """任务页必须能一键勾选 + 批量删除。
+
+    用户反馈「1205 个测试任务导致卡顿，需要一个一键勾选批量删除」——
+    之前只能一个个进详情页删。
+    """
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "backupstudio" / "gui" / "tasks_page.py").read_text(
+        encoding="utf-8"
+    )
+    for marker, desc in (
+        ("btn_batch", "批量管理按钮"),
+        ("chk_all", "全选复选框"),
+        ("def _on_batch_toggled", "批量模式切换"),
+        ("def _on_select_all", "全选处理"),
+        ("def delete_selected", "批量删除"),
+        ("def _sync_batch_bar", "计数同步"),
+        ("batch_bar", "批量操作条"),
+    ):
+        assert marker in src, f"缺少{desc}（{marker}）"
+    # 批量删除必须二次确认且默认「否」
+    m = re.search(r"def delete_selected\(self\).*?(?=\n    def )", src, re.S)
+    assert m, "找不到 delete_selected"
+    body = m.group(0)
+    assert "QMessageBox" in body and "StandardButton.No" in body, "批量删除缺少确认或默认非「否」"
+    assert "备份文件不会被删除" in body, "确认文案没说清不动备份文件"
+
+
+def test_task_item_has_checkbox() -> None:
+    """列表项必须有复选框（批量模式的勾选载体）。"""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "backupstudio" / "gui" / "tasks_page.py").read_text(
+        encoding="utf-8"
+    )
+    assert "self.chk = QCheckBox()" in src
+    assert "def set_batch" in src, "缺少 set_batch（批量模式开关）"
+    assert "on_check" in src, "复选框没有回传到页面"

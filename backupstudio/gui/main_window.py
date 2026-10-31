@@ -560,7 +560,11 @@ class MainWindow(QMainWindow):
 
         on = _st().translucent
         alpha = 0.62 if not palette.dark else 0.55
-        for card in self.findChildren(Card):
+        # **只给顶层卡片上玻璃**：嵌套的 CardFlat 小格子（信息卡）数量多、
+        # 面积小，给它们各自采样+模糊的收益低、代价高（实测 19 张卡
+        # 让切页要十几秒）。顶层卡片负责整体质感就够了。
+        cards = [c for c in self.findChildren(Card) if c.objectName() == "Card"]
+        for card in cards:
             card.set_glass(on, radius=_st().radius, tint=palette.surface,
                            alpha=alpha, dark=palette.dark)
 
@@ -649,9 +653,18 @@ class _Backdrop(QWidget):
         self.update()
 
     def paintEvent(self, event) -> None:  # noqa: ANN001, N802
-        from PySide6.QtGui import QColor, QPainter, QRadialGradient
+        from PySide6.QtGui import QColor, QPainter, QPixmap, QRadialGradient
 
-        p = QPainter(self)
+        # **缓存**：4 个大径向渐变 + 抗锯齿每次重绘都要几十毫秒，
+        # 而它在尺寸/主题不变时完全一样。缓存成 QPixmap 直接贴。
+        key = (self.width(), self.height(), self._pal.name)
+        if getattr(self, "_bg_cache_key", None) == key:
+            p = QPainter(self)
+            p.drawPixmap(0, 0, self._bg_cache)
+            p.end()
+            return
+        pm = QPixmap(self.size())
+        p = QPainter(pm)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         pal = self._pal
         p.fillRect(self.rect(), QColor(pal.bg))
@@ -678,3 +691,8 @@ class _Backdrop(QWidget):
             p.setPen(Qt.PenStyle.NoPen)
             p.drawEllipse(cx - r, cy - r, r * 2, r * 2)
         p.end()
+        self._bg_cache = pm
+        self._bg_cache_key = key
+        q = QPainter(self)
+        q.drawPixmap(0, 0, pm)
+        q.end()

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -96,6 +97,13 @@ class TaskItemWidget(QWidget):
         lay.setContentsMargins(4, 2, 4, 2)
         lay.setSpacing(9)
 
+        # 1.1.3 批量模式：左侧复选框（默认隐藏）
+        self.chk = QCheckBox()
+        self.chk.setVisible(False)
+        self.chk.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.chk.toggled.connect(self._on_chk)
+        lay.addWidget(self.chk, 0, Qt.AlignmentFlag.AlignVCenter)
+
         # 状态圆点（用文本字符画，无需额外资源）
         self.dot = QLabel("●")
         self.dot.setFixedWidth(10)
@@ -121,6 +129,18 @@ class TaskItemWidget(QWidget):
         col.addWidget(self.sub)
         lay.addLayout(col, 1)
         self.update_task(task)
+
+    def _on_chk(self, checked: bool) -> None:
+        cb = getattr(self, "on_check", None)
+        if callable(cb):
+            cb(self.task.id, checked)
+
+    def set_batch(self, on: bool, checked: bool = False) -> None:
+        """进入/退出批量模式；进入时按外部状态回显勾选。"""
+        self.chk.blockSignals(True)
+        self.chk.setChecked(bool(checked))
+        self.chk.blockSignals(False)
+        self.chk.setVisible(on)
 
     def update_task(self, task: BackupTask) -> None:
         self.task = task
@@ -169,6 +189,9 @@ class TasksPage(QWidget):
         # 已问过「改用内置引擎重试」的任务：本轮 GUI 会话每个任务最多问一次
         # （审查 W-A7-1：强制重试仍失败会再次弹窗，形成无限循环）
         self._force_offered: set[str] = set()
+        # 1.1.3 批量删除：选中的 task id 集合
+        self._batch = False
+        self._selected: set[str] = set()
 
         root = QVBoxLayout(self)
         root.setContentsMargins(26, 22, 26, 22)
@@ -186,6 +209,13 @@ class TasksPage(QWidget):
         self.btn_new.setIconSize(QSize(16, 16))
         self.btn_new.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_new.clicked.connect(self.new_task)
+        # 1.1.3：批量管理入口
+        self.btn_batch = QPushButton("批量管理")
+        self.btn_batch.setCheckable(True)
+        self.btn_batch.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_batch.setToolTip("勾选多个任务后一次性删除")
+        self.btn_batch.toggled.connect(self._on_batch_toggled)
+        header.addWidget(self.btn_batch)
         header.addWidget(self.btn_new)
         root.addLayout(header)
 
@@ -397,6 +427,29 @@ class TasksPage(QWidget):
         splitter.setStretchFactor(splitter.indexOf(right_scroll), 1)
         root.addWidget(splitter, 1)
 
+        # 1.1.3：批量操作条（默认隐藏）
+        self.batch_bar = Card(flat=True, margins=(12, 8, 12, 8))
+        bb = QHBoxLayout()
+        self.chk_all = QCheckBox("全选")
+        self.chk_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.chk_all.toggled.connect(self._on_select_all)
+        bb.addWidget(self.chk_all)
+        self.batch_count = QLabel("已选 0 项")
+        self.batch_count.setObjectName("Muted")
+        bb.addWidget(self.batch_count)
+        bb.addStretch(1)
+        self.btn_del_sel = QPushButton("删除选中")
+        self.btn_del_sel.setObjectName("Danger")
+        self.btn_del_sel.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_del_sel.clicked.connect(self.delete_selected)
+        bb.addWidget(self.btn_del_sel)
+        self.btn_batch_done = QPushButton("退出批量")
+        self.btn_batch_done.clicked.connect(lambda: self.btn_batch.setChecked(False))
+        bb.addWidget(self.btn_batch_done)
+        self.batch_bar.body().addLayout(bb)
+        self.batch_bar.setVisible(False)
+        root.addWidget(self.batch_bar)
+
         state.tasks_changed.connect(self.refresh)
         state.task_updated.connect(self._on_task_updated)
         state.run_started.connect(self._on_run_started)
@@ -422,6 +475,9 @@ class TasksPage(QWidget):
         for t in tasks:
             item = QListWidgetItem()
             widget = TaskItemWidget(t, self._dark)
+            # 1.1.3：批量模式下显示复选框，并按已选集合回显
+            widget.on_check = self._on_item_check
+            widget.set_batch(self._batch, t.id in self._selected)
             item.setSizeHint(QSize(280, 58))
             item.setData(Qt.ItemDataRole.UserRole, t.id)
             self.list.addItem(item)
@@ -436,6 +492,7 @@ class TasksPage(QWidget):
             self._current_id = ""
             self._show_empty()
         self._update_buttons()
+        self._sync_batch_bar()
 
     def _refresh_subtitles(self) -> None:
         for tid, widget in self._items.items():
@@ -777,6 +834,77 @@ class TasksPage(QWidget):
             self._current_id = new.id
             self.refresh()
             self._select_by_id(new.id)
+
+    # ------------------------------------------------------------------
+    # 批量勾选 + 批量删除（1.1.3）
+    # ------------------------------------------------------------------
+    def _on_batch_toggled(self, on: bool) -> None:
+        """进入/退出批量模式。"""
+        self._batch = bool(on)
+        if not on:
+            self._selected.clear()
+        self.batch_bar.setVisible(self._batch)
+        self.btn_batch.setText("退出批量" if self._batch else "批量管理")
+        self.refresh()
+        self._sync_batch_bar()
+
+    def _on_item_check(self, tid: str, checked: bool) -> None:
+        if checked:
+            self._selected.add(tid)
+        else:
+            self._selected.discard(tid)
+        self._sync_batch_bar()
+
+    def _on_select_all(self, on: bool) -> None:
+        """全选 / 全不选。"""
+        if on:
+            self._selected = {t.id for t in self.state.tasks()}
+        else:
+            self._selected.clear()
+        for tid, w in self._items.items():
+            w.chk.blockSignals(True)
+            w.chk.setChecked(tid in self._selected)
+            w.chk.blockSignals(False)
+        self._sync_batch_bar()
+
+    def _sync_batch_bar(self) -> None:
+        """更新「已选 N 项」与按钮可用性。"""
+        n = len(self._selected)
+        total = self.list.count()
+        if hasattr(self, "batch_count"):
+            self.batch_count.setText(f"已选 {n} / {total} 项")
+            self.btn_del_sel.setEnabled(n > 0)
+        if hasattr(self, "chk_all"):
+            self.chk_all.blockSignals(True)
+            self.chk_all.setChecked(total > 0 and n == total)
+            self.chk_all.blockSignals(False)
+
+    def delete_selected(self) -> None:
+        """批量删除选中的任务（二次确认，明确说明不动备份文件）。"""
+        ids = [t.id for t in self.state.tasks() if t.id in self._selected]
+        if not ids:
+            return
+        if len(ids) == 1:
+            self._delete_task(ids[0])
+            self._selected.clear()
+            self._sync_batch_bar()
+            return
+        ret = QMessageBox.question(
+            self,
+            "批量删除任务",
+            f"确定删除选中的 {len(ids)} 个任务吗？\n\n"
+            "只删除任务本身，已有的备份文件不会被删除。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        for tid in ids:
+            self._force_offered.discard(tid)
+            self.state.delete_task(tid)
+        self._selected.clear()
+        self._current_id = ""
+        self.refresh()
 
     def delete_current(self) -> None:
         self._delete_task(self._current_id)

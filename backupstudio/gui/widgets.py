@@ -88,10 +88,23 @@ class Card(QFrame):
         if cached is not None and cached[0] == key:
             img = cached[1]
         else:
-            img = pm.toImage()
-            for r in (6, 4, 2):
-                img = _box_blur(img, r)
-            img = _chromatic(img, 1)
+            # **降采样再模糊**（1.1.3 性能修复）：模糊结果本就看不出细节，
+            # 先缩到最长边 ~96px 再算，计算量降到约 1/20。
+            # 优化前实测：首屏 12.9s / 切页 12.8s。
+            w0, h0 = pm.width(), pm.height()
+            longest = max(w0, h0)
+            small = pm.toImage()
+            if longest > 96:
+                scale = 96.0 / longest
+                small = small.scaled(max(8, int(w0 * scale)), max(8, int(h0 * scale)),
+                                     _Qt.AspectRatioMode.IgnoreAspectRatio,
+                                     _Qt.TransformationMode.SmoothTransformation)
+            for r in (3, 2, 1):
+                small = _box_blur(small, r)
+            small = _chromatic(small, 1)
+            # 放回原尺寸（平滑放大；本来就是模糊图，看不出插值）
+            img = small.scaled(w0, h0, _Qt.AspectRatioMode.IgnoreAspectRatio,
+                               _Qt.TransformationMode.SmoothTransformation)
             self._glass_cache = (key, img)
 
         p = QPainter(self)
