@@ -563,10 +563,14 @@ class MainWindow(QMainWindow):
         # **只给顶层卡片上玻璃**：嵌套的 CardFlat 小格子（信息卡）数量多、
         # 面积小，给它们各自采样+模糊的收益低、代价高（实测 19 张卡
         # 让切页要十几秒）。顶层卡片负责整体质感就够了。
-        cards = [c for c in self.findChildren(Card) if c.objectName() == "Card"]
-        for card in cards:
-            card.set_glass(on, radius=_st().radius, tint=palette.surface,
-                           alpha=alpha, dark=palette.dark)
+        # **所有卡片都要过一遍**：曾经只处理 objectName()=="Card" 的顶层卡片，
+        # 结果 CardFlat 那批被玻璃模式设过内联样式后再也没被清掉
+        # （内联优先级最高 → 那些卡片永远透明无边框 → 切风格看不出变化）。
+        # 现在对全部 Card 调 set_glass：顶层开玻璃，其余显式关闭并清内联。
+        for card in self.findChildren(Card):
+            is_top = card.objectName() == "Card"
+            card.set_glass(on and is_top, radius=_st().radius,
+                           tint=palette.surface, alpha=alpha, dark=palette.dark)
 
     def _on_daemon_state(self, info) -> None:  # noqa: ANN001
         """底栏守护进程状态（1.1.2：此前信号没人接，永远显示"检测中…"）。"""

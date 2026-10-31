@@ -56,6 +56,12 @@ class Card(QFrame):
             self._glass_dark = dark
             # 交给自绘，QSS 背景必须让位
             self.setStyleSheet("background: transparent; border: none;")
+        else:
+            # **必须清掉内联样式**：内联优先级高于全局 QSS，
+            # 残留会让卡片永远透明无边框 —— 表现就是"切风格没区别"
+            # （这是 1.1.3 的真实 bug）。
+            self.setStyleSheet("")
+            self._glass_cache = None
         self.update()
 
     def paintEvent(self, event) -> None:  # noqa: ANN001, N802

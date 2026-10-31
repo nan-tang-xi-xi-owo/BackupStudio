@@ -249,6 +249,13 @@ def stylesheet(p: Palette, style: str | None = None) -> str:
     _st = _style_for(style) if style else _style_current()
     p = _styled_palette(p, _st.key)
     R, RI, RB, BW = _st.radius, _st.radius_input, _st.radius_button, _st.border
+    # 页签形态按风格：98 直角、mac/mag 胶囊、其余常规
+    if _st.key == "98":
+        _tab_radius, _tab_pad = "0px", "7px 14px"
+    elif _st.key in ("mac", "mag"):
+        _tab_radius, _tab_pad = "999px", "7px 18px"
+    else:
+        _tab_radius, _tab_pad = f"{RB}px", "8px 16px"
     fg = p.text
 
     def _hex2rgb(h: str) -> str:
@@ -320,6 +327,20 @@ def stylesheet(p: Palette, style: str | None = None) -> str:
             f" border-top: {BW}px solid rgba(255, 255, 255, {_hl * 0.9});"
             f" border-radius: {RB}px;"
         )
+    elif _st.key == "mag":
+        # Material：卡片**无边框**，靠投影分层；按钮是药丸（radius_button=20）
+        _card_border = (
+            f" border: none; border-bottom: 2px solid {_darker(p.border, 0.30)};"
+            f" border-radius: {R}px;"
+        )
+        _btn_border = f" border: none; border-radius: {RB}px;"
+    elif _st.key == "mac":
+        # macOS：卡片/按钮**无描边**，只用底部一道投影线分层
+        _card_border = (
+            f" border: none; border-bottom: 2px solid {_darker(p.border, 0.22)};"
+            f" border-radius: {R}px;"
+        )
+        _btn_border = f" border: none; border-radius: {RB}px;"
     else:
         _card_border = f" border: {BW}px solid {p.border}; border-radius: {R}px;"
         _btn_border = f" border: {BW}px solid {p.border}; border-radius: {RB}px;"
@@ -328,16 +349,15 @@ def stylesheet(p: Palette, style: str | None = None) -> str:
     _btn_bg = _btn_fill + _btn_border
 
     # mac / Material / 玻璃：底部加深一档模拟投影
+    # 投影线只给「本来就没有边框」的风格（mac/mag），避免与 _card_border
+    # 里的 border-bottom 重复声明（实测会输出两条 border-bottom）。
     _card_shadow = ""
-    if _st.shadow:
-        _card_shadow = (
-            f" border-bottom: {max(2, BW + 1)}px solid {_darker(p.border, 0.18)};"
-        )
     # 焦点环：用 focus_ring 画 2px 外扩边框（QSS 无 box-shadow，
     # 用 border 加粗 + 变色是 Qt 里最可靠的做法）
     return f"""
     QWidget {{
         color: {fg};
+        letter-spacing: {_st.letter_spacing}px;
         font-family: "Segoe UI", "Microsoft YaHei UI", "PingFang SC", "Noto Sans CJK SC", "Helvetica Neue", sans-serif;
         font-size: 10pt;
     }}
@@ -345,11 +365,7 @@ def stylesheet(p: Palette, style: str | None = None) -> str:
 
     /* ── 卡片：靠边框分层（surface vs bg 只有 1.08:1，单靠底色看不出） ── */
     QFrame#Card {{ {_card_bg}{_card_shadow} }}
-    QFrame#CardFlat {{
-        background: {p.surface_alt};
-        border: {BW}px solid {p.border};
-        border-radius: {R}px;
-    }}
+    QFrame#CardFlat {{ background: {p.surface_alt}; border: {BW}px solid {p.border}; border-radius: {R}px; }}
 
     /* ── 字号层级 ── */
     QLabel#H1 {{ font-size: 17pt; font-weight: 600; }}
@@ -357,7 +373,7 @@ def stylesheet(p: Palette, style: str | None = None) -> str:
     QLabel#H3 {{ font-size: 11pt; font-weight: 600; }}
     QLabel#Muted {{ color: {p.text_dim}; }}
     QLabel#Badge {{
-        border-radius: 9px; padding: 2px 10px; font-size: 9pt; font-weight: 600;
+        border-radius: {RB}px; padding: 2px 10px; font-size: 9pt; font-weight: 600;
         background: {p.surface_alt}; color: {p.text_dim};
     }}
     QLabel#ErrorText {{ color: {p.danger}; }}
@@ -396,14 +412,14 @@ def stylesheet(p: Palette, style: str | None = None) -> str:
     QPushButton#Danger:disabled {{ color: {p.disabled_fg}; }}
     QPushButton#Link {{ background: transparent; border: none; color: {p.accent}; padding: 2px 4px; }}
     QPushButton#Link:hover {{ text-decoration: underline; }}
-    QPushButton#Link:focus {{ border: 2px solid {p.focus_ring}; border-radius: 6px; }}
+    QPushButton#Link:focus {{ border: 2px solid {p.focus_ring}; border-radius: {RI}px; }}
     QPushButton#Link:disabled {{ color: {p.disabled_fg}; }}
 
     /* ── 输入类 ── */
     QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox, QDateTimeEdit, QTimeEdit {{
         background: {p.surface};
         border: 1px solid {p.border_strong};
-        border-radius: 8px;
+        border-radius: {RI}px;
         padding: 6px 9px;
         selection-background-color: {p.accent};
         selection-color: {p.accent_text};
@@ -451,7 +467,7 @@ def stylesheet(p: Palette, style: str | None = None) -> str:
 
     /* ── 列表/表格 ── */
     QListWidget, QTreeWidget, QTableWidget {{
-        background: {p.surface}; border: 1px solid {p.border}; border-radius: 12px;
+        background: {p.surface}; border: 1px solid {p.border}; border-radius: {R}px;
         alternate-background-color: {p.surface_alt};
     }}
     /* 只对**真正看不见的**控件去掉 outline：列表/表格需要自己的焦点态，
@@ -461,10 +477,10 @@ def stylesheet(p: Palette, style: str | None = None) -> str:
     }}
     QComboBox QAbstractItemView {{ outline: none; }}
     QTextEdit, QPlainTextEdit {{
-        background: {p.surface_alt}; border: 1px solid {p.border}; border-radius: 10px;
+        background: {p.surface_alt}; border: 1px solid {p.border}; border-radius: {R}px;
     }}
     QSplitter::handle:horizontal {{ width: 10px; }}
-    QListWidget::item {{ border-radius: 10px; padding: 10px 12px; margin: 3px 6px; }}
+    QListWidget::item {{ border-radius: {R}px; padding: 10px 12px; margin: 3px 6px; }}
     QListWidget::item:selected {{ background: {p.selection}; color: {fg}; }}
     QListWidget::item:hover {{ background: {p.surface_alt}; }}
     QTreeWidget::item, QTableWidget::item {{ padding: 6px; }}
@@ -480,10 +496,10 @@ def stylesheet(p: Palette, style: str | None = None) -> str:
     }}
 
     /* ── 页签 ── */
-    QTabWidget::pane {{ border: 1px solid {p.border}; border-radius: 12px; background: {p.surface}; top: -1px; }}
+    QTabWidget::pane {{ border: 1px solid {p.border}; border-radius: {R}px; background: {p.surface}; top: -1px; }}
     QTabBar::tab {{
         background: transparent; padding: 8px 16px; margin-right: 4px;
-        border-radius: 8px; color: {p.text_dim};
+        border-radius: {RI}px; color: {p.text_dim};
     }}
     QTabBar::tab:selected {{ background: {p.nav_active}; color: {p.accent}; font-weight: 600; }}
     QTabBar::tab:hover {{ color: {fg}; }}
@@ -491,7 +507,7 @@ def stylesheet(p: Palette, style: str | None = None) -> str:
 
     /* ── 分组框 ── */
     QGroupBox {{
-        border: 1px solid {p.border}; border-radius: 12px; margin-top: 14px; padding: 14px 12px 12px 12px;
+        border: 1px solid {p.border}; border-radius: {R}px; margin-top: 14px; padding: 14px 12px 12px 12px;
         background: transparent;
     }}
     QGroupBox::title {{
@@ -505,8 +521,8 @@ def stylesheet(p: Palette, style: str | None = None) -> str:
     QCheckBox::indicator:checked {{ border: 1px solid {p.accent}; border-radius: 5px; background: {p.accent}; }}
     QCheckBox::indicator:disabled {{ border-color: {p.border}; background: {p.disabled_bg}; }}
     QCheckBox:focus {{ color: {p.focus_ring}; }}
-    QRadioButton::indicator:unchecked {{ border: 1px solid {p.border_strong}; border-radius: 9px; background: {p.surface}; }}
-    QRadioButton::indicator:checked {{ border: 5px solid {p.accent}; border-radius: 9px; background: {p.surface}; }}
+    QRadioButton::indicator:unchecked {{ border: 1px solid {p.border_strong}; border-radius: {RB}px; background: {p.surface}; }}
+    QRadioButton::indicator:checked {{ border: 5px solid {p.accent}; border-radius: {RB}px; background: {p.surface}; }}
     QRadioButton::indicator:disabled {{ border-color: {p.border}; background: {p.disabled_bg}; }}
     QRadioButton:focus {{ color: {p.focus_ring}; }}
 
@@ -515,16 +531,16 @@ def stylesheet(p: Palette, style: str | None = None) -> str:
     QSlider::sub-page:horizontal {{ background: {p.accent}; border-radius: 3px; }}
     QSlider::handle:horizontal {{
         background: {p.surface}; border: 2px solid {p.accent}; width: 14px; height: 14px;
-        margin: -5px 0; border-radius: 9px;
+        margin: -5px 0; border-radius: {RB}px;
     }}
-    QSlider:focus {{ border: 2px solid {p.focus_ring}; border-radius: 6px; }}
+    QSlider:focus {{ border: 2px solid {p.focus_ring}; border-radius: {RI}px; }}
 
     /* ── 进度条 ── */
     QProgressBar {{
-        background: {p.surface_alt}; border: none; border-radius: 6px; height: 12px; text-align: center;
+        background: {p.surface_alt}; border: none; border-radius: {RI}px; height: 12px; text-align: center;
         color: transparent;
     }}
-    QProgressBar::chunk {{ background: {p.accent}; border-radius: 6px; }}
+    QProgressBar::chunk {{ background: {p.accent}; border-radius: {RI}px; }}
 
     /* ── 滚动条 ── */
     QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
@@ -537,12 +553,12 @@ def stylesheet(p: Palette, style: str | None = None) -> str:
     /* ── 提示/菜单 ── */
     QToolTip {{
         background: {p.surface}; color: {fg}; border: 1px solid {p.border_strong};
-        border-radius: 6px; padding: 6px 8px;
+        border-radius: {RI}px; padding: 6px 8px;
     }}
     QMenu {{
-        background: {p.surface}; border: 1px solid {p.border_strong}; border-radius: 10px; padding: 6px;
+        background: {p.surface}; border: 1px solid {p.border_strong}; border-radius: {R}px; padding: 6px;
     }}
-    QMenu::item {{ padding: 7px 22px 7px 14px; border-radius: 7px; }}
+    QMenu::item {{ padding: 7px 22px 7px 14px; border-radius: {RB}px; }}
     QMenu::item:selected {{ background: {p.selection}; }}
     QMenu::item:disabled {{ color: {p.disabled_fg}; }}
     QMenu::separator {{ height: 1px; background: {p.border}; margin: 5px 8px; }}
@@ -551,14 +567,14 @@ def stylesheet(p: Palette, style: str | None = None) -> str:
     QSplitter::handle {{ background: transparent; }}
 
     /* ── 工具按钮与导航 ── */
-    QToolButton {{ border-radius: 8px; padding: 6px; background: transparent; }}
+    QToolButton {{ border-radius: {RI}px; padding: 6px; background: transparent; }}
     QToolButton:hover {{ background: {p.surface_alt}; }}
     QToolButton:focus {{
         border: 2px solid {p.focus_ring};
         padding: 4px;
     }}
     QToolButton#NavButton {{
-        background: transparent; border: none; border-radius: 10px; padding: 10px 14px;
+        background: transparent; border: none; border-radius: {R}px; padding: 10px 14px;
         text-align: left; color: {p.text_dim}; font-size: 10pt;
     }}
     QToolButton#NavButton:hover {{ background: {p.surface_alt}; color: {fg}; }}
@@ -588,5 +604,5 @@ def stylesheet(p: Palette, style: str | None = None) -> str:
     QLabel#CardCap {{ color: {p.text_dim}; font-size: 9pt; font-weight: 600; }}
     QLabel#CardVal {{ color: {fg}; font-size: 10pt; font-weight: 600; }}
     /* 侧栏底部的状态条 */
-    QFrame#SideFooter {{ background: {p.surface_alt}; border: 1px solid {p.border}; border-radius: 9px; }}
+    QFrame#SideFooter {{ background: {p.surface_alt}; border: 1px solid {p.border}; border-radius: {RB}px; }}
     """
