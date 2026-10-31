@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 
 from .. import APP_NAME, APP_NAME_ZH, __version__
 from . import app_icon, stylesheet, tray_state_icon
+from .titlebar import RESIZE_MARGIN, TITLE_H, TitleBar, prefer_frameless
 from .appstate import AppState
 
 log = logging.getLogger("backupstudio.gui")
@@ -68,7 +69,31 @@ class MainWindow(QMainWindow):
         else:
             central = QWidget()
             central.setObjectName("Page")
-        self.setCentralWidget(central)
+        # ── 自绘标题栏（1.1.4）────────────────────────────────
+        # Win10 上 DWM 的 CAPTION_COLOR 返回 E_INVALIDARG（实测），
+        # 只能靠无边框自绘让标题栏跟随主题。mac/Linux 保持系统标题栏。
+        self._frameless = prefer_frameless()
+        if self._frameless:
+            self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+            outer = QWidget()
+            ol = QVBoxLayout(outer)
+            ol.setContentsMargins(0, 0, 0, 0)
+            ol.setSpacing(0)
+            # 标题只用一份文案：曾出现"备份工坊 · BackupStudio 1.1.1 - 备份工坊"
+            # 的重复尾巴 —— 那是 setApplicationDisplayName 被 Qt 自动追加的。
+            # 只保留一份标题文案。qt 会把 setApplicationDisplayName() 的值
+            # 自动追加到窗口标题尾部，导致出现"… 1.1.1 - 备份工坊"的重复。
+            _t = f"{APP_NAME_ZH} · {APP_NAME} {__version__}"
+            self.setWindowTitle(_t)
+            self.titlebar = TitleBar(self, _t, app_icon())
+            ol.addWidget(self.titlebar)
+            ol.addWidget(central, 1)
+            self.setCentralWidget(outer)
+            self.setMouseTracking(True)
+            outer.setMouseTracking(True)
+        else:
+            self.titlebar = None
+            self.setCentralWidget(central)
         root = QHBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
@@ -522,25 +547,106 @@ class MainWindow(QMainWindow):
         open_in_file_manager(str(config_directory()))
 
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 无边框窗口：拖动 / 边缘缩放（1.1.4）
+    # ------------------------------------------------------------------
+    def _edge_at(self, pos: QPoint):  # noqa: ANN201
+        """判断鼠标是否落在缩放热区，返回 Qt.Edge 组合。"""
+        from PySide6.QtCore import Qt as _Qt
+
+        w, h, m = self.width(), self.height(), RESIZE_MARGIN
+        x, y = pos.x(), pos.y()
+        edges = _Qt.Edge(0)
+        if x <= m:
+            edges |= _Qt.Edge.LeftEdge
+        elif x >= w - m:
+            edges |= _Qt.Edge.RightEdge
+        if y <= m:
+            edges |= _Qt.Edge.TopEdge
+        elif y >= h - m:
+            edges |= _Qt.Edge.BottomEdge
+        return edges
+
+    def mousePressEvent(self, e) -> None:  # noqa: ANN001, N802
+        """标题栏区域拖动窗口；边缘热区启动系统缩放。"""
+        from PySide6.QtCore import Qt as _Qt
+
+        if self._frameless and e.button() == _Qt.MouseButton.LeftButton:
+            edges = self._edge_at(e.position().toPoint())
+            if edges:
+                self.windowHandle().startSystemResize(edges)
+                return
+            # 标题栏高度内的按下 = 拖动窗口（用系统 API 保住 Aero Snap）
+            if e.position().y() <= TITLE_H and self.titlebar is not None:
+                if self.windowHandle().startSystemMove():
+                    return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e) -> None:  # noqa: ANN001, N802
+        """根据位置切换缩放光标。"""
+        from PySide6.QtCore import Qt as _Qt
+
+        if self._frameless:
+            edges = self._edge_at(e.position().toPoint())
+            cur = _Qt.CursorShape.ArrowCursor
+            if edges in (_Qt.Edge.LeftEdge, _Qt.Edge.RightEdge):
+                cur = _Qt.CursorShape.SizeHorCursor
+            elif edges in (_Qt.Edge.TopEdge, _Qt.Edge.BottomEdge):
+                cur = _Qt.CursorShape.SizeVerCursor
+            elif edges:
+                cur = (_Qt.CursorShape.SizeFDiagCursor
+                       if edges & _Qt.Edge.LeftEdge else _Qt.CursorShape.SizeBDiagCursor)
+            self.setCursor(cur)
+        super().mouseMoveEvent(e)
+
+    def changeEvent(self, e) -> None:  # noqa: ANN001, N802
+        """最大化/还原时更新按钮字形。"""
+        from PySide6.QtCore import QEvent
+
+        if e.type() == QEvent.Type.WindowStateChange and self.titlebar is not None:
+            self.titlebar.sync_max_glyph()
+        super().changeEvent(e)
+
+    def _apply_titlebar_theme(self, palette) -> None:  # noqa: ANN001
+        """标题栏配色跟随主题（1.1.4）。"""
+        if self.titlebar is None:
+            return
+        self.titlebar.set_colors(
+            palette.surface, palette.text, palette.border,
+            palette.surface_alt, palette.danger,
+        )
+
     def _apply_theme(self, palette) -> None:  # noqa: ANN001
         # **1.1.2 启动性能**：只对**已创建**的页面调 set_palette_mode。
         # 原来这里直接访问 `self.history_page` / `self.env_page` /
         # `self.settings_page`，在懒加载下会立刻把它们建出来（环境页的
         # 能力探测要 0.9 秒），等于把懒加载省下的时间又花回去。
         # 未创建的页面在 `_page()` 里创建后会自行应用当前主题。
+        # **样式化后的调色板**：stylesheet() 内部会按当前风格调 styled_palette()，
+        # 但 palette 本身没变。标题栏/导航图标等直接取色的控件必须用
+        # 同一份风格化结果，否则会拿到未着色的原色（实测 98 风格下
+        # 标题栏仍是白色）。
+        from .styles import current as _style_current, styled_palette
+
+        sp = styled_palette(palette, _style_current().key)
         QApplication.instance().setStyleSheet(stylesheet(palette))
         self._pal = palette
         # 导航图标跟随主题（原先写死 #94A3B8）
         from .icons import line_icon
 
         for key, btn in getattr(self, "nav_buttons", {}).items():
-            color = palette.accent if btn.isChecked() else palette.text_dim
+            color = sp.accent if btn.isChecked() else sp.text_dim
             btn.setIcon(line_icon(key, color, 18))
         if hasattr(self, "side_dot"):
             self._set_side_state(getattr(self, "_daemon_kind", "muted"))
         for page in getattr(self, "_pages", {}).values():
             if hasattr(page, "set_palette_mode"):
-                page.set_palette_mode(palette.dark)
+                page.set_palette_mode(sp.dark)
+        # 1.1.4：标题栏跟随主题
+        try:
+            self._apply_titlebar_theme(sp)
+        except Exception:  # noqa: BLE001
+            log.debug("标题栏配色失败", exc_info=True)
         # 1.1.3：玻璃风格下给卡片装折射层
         try:
             self._install_glass(palette)

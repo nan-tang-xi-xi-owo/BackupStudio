@@ -324,3 +324,96 @@ def test_material_you_light_dark_differ() -> None:
     dark = scheme("#6750A4", dark=True)
     assert light["background"] != dark["background"], "浅色/深色背景不应相同"
     assert light["primary"] != dark["primary"], "浅色/深色主色不应相同"
+
+
+# ── 11. 自绘标题栏（1.1.4）────────────────────────────────────────
+def test_titlebar_imports_are_module_level() -> None:
+    """RESIZE_MARGIN / TITLE_H 必须在模块级导入。
+
+    实测缺陷（2026-10-31）：它们曾写在 MainWindow.__init__ 内成为局部名，
+    导致 `_edge_at` 与 `mouseMoveEvent` 抛 NameError —— Windows 上
+    窗口一显示、鼠标移过就崩。
+    """
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "backupstudio" / "gui" / "main_window.py").read_text(
+        encoding="utf-8"
+    )
+    # 必须有一行模块级（顶格）导入
+    assert re.search(
+        r"^from \.titlebar import .*RESIZE_MARGIN.*TITLE_H", src, re.M
+    ), "titlebar 的 RESIZE_MARGIN/TITLE_H 未在模块级导入"
+    # __init__ 内不得再出现同名导入（否则又是局部名）
+    init_body = src.split("def __init__(self, state: AppState)", 1)[1].split("\n    def ", 1)[0]
+    assert "from .titlebar import" not in init_body, "__init__ 内仍有 titlebar 导入（会是局部名）"
+
+
+def test_titlebar_follows_palette() -> None:
+    """标题栏配色必须来自风格化后的调色板，且随风格变化。"""
+    import os
+    import tempfile
+    from pathlib import Path
+
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    root = Path(__file__).resolve().parents[1]
+    import sys
+
+    sys.path.insert(0, str(root))
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    cfg = Path(tempfile.mkdtemp(prefix="tb-", dir=str(root / "build")))
+    os.environ["BACKUPSTUDIO_CONFIG_DIR"] = str(cfg)
+    from backupstudio.gui.appstate import AppState
+    from backupstudio.gui.main_window import MainWindow
+    from backupstudio.store import TaskStore
+
+    st = AppState(TaskStore(cfg / "tasks.json"))
+    w = MainWindow(st)
+    w.show()
+    app.processEvents()
+    if w.titlebar is None:
+        w.close()
+        return  # 平台不支持无边框时跳过（mac/Linux）
+    seen = set()
+    for key in ("win", "98", "mag"):
+        st.set_style(key)
+        app.processEvents()
+        seen.add(w.titlebar._bg)
+    assert len(seen) >= 2, f"不同风格的标题栏底色应不同，实际只有 {seen}"
+    w.close()
+
+
+def test_frameless_edge_zones_work() -> None:
+    """边缘热区计算不得抛异常（曾因局部名导入抛 NameError）。"""
+    import os
+    import tempfile
+    from pathlib import Path
+
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    root = Path(__file__).resolve().parents[1]
+    import sys
+
+    sys.path.insert(0, str(root))
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    cfg = Path(tempfile.mkdtemp(prefix="eg-", dir=str(root / "build")))
+    os.environ["BACKUPSTUDIO_CONFIG_DIR"] = str(cfg)
+    from backupstudio.gui.appstate import AppState
+    from backupstudio.gui.main_window import MainWindow
+    from backupstudio.store import TaskStore
+
+    st = AppState(TaskStore(cfg / "tasks.json"))
+    w = MainWindow(st)
+    w.resize(900, 600)
+    w.show()
+    app.processEvents()
+    # 左上角应命中 Top|Left，中心应为 0
+    tl = w._edge_at(QPoint(1, 1))
+    assert tl & Qt.Edge.LeftEdge and tl & Qt.Edge.TopEdge, f"左上角热区错误: {tl}"
+    mid = w._edge_at(QPoint(450, 300))
+    assert not mid, f"中心不应在热区: {mid}"
+    w.close()
