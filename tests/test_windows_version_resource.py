@@ -31,7 +31,19 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_VERSION = "1.1.1"
+# 从唯一真源读取，不再硬编码 —— 每次发版都要改测试是设计缺陷。
+def _src_version() -> str:
+    import re
+    from pathlib import Path as _P
+
+    root = _P(__file__).resolve().parents[1]
+    text = (root / "backupstudio" / "__init__.py").read_text(encoding="utf-8")
+    m = re.search(r'__version__\s*=\s*"([^"]+)"', text)
+    assert m, "backupstudio/__init__.py 里找不到 __version__"
+    return m.group(1)
+
+
+EXPECTED_VERSION = _src_version()
 BUILD_PY = ROOT / "packaging" / "build.py"
 
 
@@ -107,10 +119,11 @@ def test_required_fields_cover_the_six_that_matter(build_mod):
 
 def test_version_file_versions_match(build_mod, version_file):
     text = Path(version_file).read_text(encoding="utf-8")
-    assert "filevers=(1, 1, 1, 0)" in text, f"filevers 不对：\n{text[:600]}"
-    assert "prodvers=(1, 1, 1, 0)" in text, f"prodvers 不对：\n{text[:600]}"
-    assert "'FileVersion', '1.1.1'" in text
-    assert "'ProductVersion', '1.1.1'" in text
+    _t = tuple(int(x) for x in (EXPECTED_VERSION.split(".") + ["0"]*4)[:4])
+    assert f"filevers={_t}" in text, f"filevers 不对：\n{text[:600]}"
+    assert f"prodvers={_t}" in text, f"prodvers 不对：\n{text[:600]}"
+    assert f"'FileVersion', '{EXPECTED_VERSION}'" in text
+    assert f"'ProductVersion', '{EXPECTED_VERSION}'" in text
 
 
 def test_version_file_product_name_and_company_non_empty(build_mod, version_file):
@@ -193,10 +206,13 @@ def test_pyinstaller_reads_fixed_file_info_versions(version_file):
     """固定版本信息（数字部分）也必须真的写进去了。"""
     versioninfo = pytest.importorskip("PyInstaller.utils.win32.versioninfo")
     info = versioninfo.load_version_info_from_text_file(str(version_file))
-    # 版本 1.1.1 的四段编码：MS 存前两段 (1,1)，LS 存后两段 (1,0)
-    assert info.ffi.fileVersionMS == (1 << 16) | 1, "fileVersionMS 不是 1.1"
-    assert info.ffi.fileVersionLS == (1 << 16), "fileVersionLS 不是 .1.0"
-    assert info.ffi.productVersionMS == (1 << 16) | 1
+    # 四段编码：MS 存前两段、LS 存后两段。按 EXPECTED_VERSION 动态算，
+    # 避免每次发版都要改测试（那是设计缺陷）。
+    _a, _b, _c, _d = (int(x) for x in (EXPECTED_VERSION.split(".") + ["0"] * 4)[:4])
+    assert info.ffi.fileVersionMS == ((_a << 16) | _b), f"fileVersionMS 不是 {_a}.{_b}"
+    assert info.ffi.fileVersionLS == ((_c << 16) | _d), f"fileVersionLS 不是 .{_c}.{_d}"
+    assert info.ffi.productVersionMS == ((_a << 16) | _b), f"productVersionMS 不是 {_a}.{_b}"
+    assert info.ffi.productVersionLS == ((_c << 16) | _d), f"productVersionLS 不是 .{_c}.{_d}"
 
 
 # ---------------------------------------------------------------------------

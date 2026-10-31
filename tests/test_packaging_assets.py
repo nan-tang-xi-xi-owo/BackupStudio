@@ -32,7 +32,19 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 ASSETS_TRAY = ROOT / "backupstudio" / "assets" / "tray"
-EXPECTED_VERSION = "1.1.1"
+# 从唯一真源读取，不再硬编码 —— 每次发版都要改测试是设计缺陷。
+def _src_version() -> str:
+    import re
+    from pathlib import Path as _P
+
+    root = _P(__file__).resolve().parents[1]
+    text = (root / "backupstudio" / "__init__.py").read_text(encoding="utf-8")
+    m = re.search(r'__version__\s*=\s*"([^"]+)"', text)
+    assert m, "backupstudio/__init__.py 里找不到 __version__"
+    return m.group(1)
+
+
+EXPECTED_VERSION = _src_version()
 BUNDLE_IDENTIFIER = "io.github.backupstudio.BackupStudio"
 
 
