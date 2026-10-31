@@ -70,7 +70,7 @@ class Card(QFrame):
         from PySide6.QtCore import QPoint, QRect, Qt as _Qt
         from PySide6.QtGui import QColor, QImage, QLinearGradient, QPainter, QPainterPath, QPixmap
 
-        from .glass import _box_blur, _chromatic
+        from .glass import _box_blur, _chromatic, displace
 
         win = self.window()
         if win is None:
@@ -107,6 +107,9 @@ class Card(QFrame):
                                      _Qt.TransformationMode.SmoothTransformation)
             for r in (3, 2, 1):
                 small = _box_blur(small, r)
+            # **折射**：在低分辨率上做位移重采样（便宜且边缘更柔）
+            small = displace(small, radius=16, strength=0.6,
+                             edge=max(6, min(small.width(), small.height()) // 4))
             small = _chromatic(small, 1)
             # 放回原尺寸（平滑放大；本来就是模糊图，看不出插值）
             img = small.scaled(w0, h0, _Qt.AspectRatioMode.IgnoreAspectRatio,

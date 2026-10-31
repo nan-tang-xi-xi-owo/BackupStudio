@@ -193,3 +193,49 @@ class GlassPane(QWidget):
         shade.setColorAt(1.0, QColor(0, 0, 0, 26 if not self._dark else 46))
         p.fillPath(path, shade)
         p.end()
+
+def displace(img: QImage, radius: int, strength: float = 0.55,
+             edge: int = 14) -> QImage:
+    """**真折射**：按边缘位移场重采样（对应资料里的 feDisplacementMap 思路）。
+
+    ## 为什么必须这么做
+
+    资料原文：「玻璃拟态模糊它背后的东西，液态玻璃**折射**它」；
+    「真折射会把面板背后穿过的直线扭曲掉」。盒式模糊做不到这一点 ——
+    那只是把背后糊掉，属于 glassmorphism。
+
+    ## 位移场
+
+    对每个像素，沿「指向中心」的方向按距离查表偏移：
+    * 距边缘 < edge px：位移量从 strength*edge 递减到 0（越靠边折得越狠）
+    * 中心区域：位移 0（保持清晰，不糊）
+    采样用双线性插值，避免锯齿。
+    """
+    w, h = img.width(), img.height()
+    if w < 8 or h < 8 or strength <= 0:
+        return img
+    src = img.convertToFormat(QImage.Format.Format_ARGB32)
+    out = QImage(w, h, QImage.Format.Format_ARGB32)
+    cx, cy = w / 2.0, h / 2.0
+
+    # 预计算每个像素的偏移量与方向（只算一次，供表格复用）
+    for y in range(h):
+        dy_edge = min(y, h - 1 - y)
+        vy = (cy - y)
+        for x in range(w):
+            dx_edge = min(x, w - 1 - x)
+            d_edge = min(dx_edge, dy_edge)
+            if d_edge >= edge:
+                out.setPixel(x, y, src.pixel(x, y))
+                continue
+            # 距边缘越近，折得越狠（平方衰减更自然）
+            t = 1.0 - d_edge / edge
+            amp = strength * edge * t * t
+            vx = (cx - x)
+            norm = (vx * vx + vy * vy) ** 0.5 or 1.0
+            sx = int(round(x + vx / norm * amp))
+            sy = int(round(y + vy / norm * amp))
+            sx = 0 if sx < 0 else (w - 1 if sx >= w else sx)
+            sy = 0 if sy < 0 else (h - 1 if sy >= h else sy)
+            out.setPixel(x, y, src.pixel(sx, sy))
+    return out

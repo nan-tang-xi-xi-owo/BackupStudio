@@ -677,14 +677,25 @@ class _Backdrop(QWidget):
 
         w, h = self.width(), self.height()
         # 光斑配色：用主题强调色/成功色/警告色的低饱和版本
-        # **光斑必须够明显**：玻璃的折射效果完全依赖背景有明暗/色彩变化。
-        # 若光斑太淡，模糊后就是一片白 —— 那正是"玻璃看起来不对"的根因。
-        spots = (
-            (int(w * 0.14), int(h * 0.08), int(max(w, h) * 0.62), pal.accent, 0.55),
-            (int(w * 0.90), int(h * 0.30), int(max(w, h) * 0.48), pal.success, 0.40),
-            (int(w * 0.58), int(h * 0.98), int(max(w, h) * 0.55), pal.warning, 0.32),
-            (int(w * 0.32), int(h * 0.70), int(max(w, h) * 0.42), pal.accent_hover, 0.38),
-        )
+        # **背景必须真的多彩**（用户指出"背景图没变"）：
+        # 原来 4 个光斑全取 palette 字段，而 win 与 glass 的 success/warning
+        # 完全相同、accent 又都是蓝色系 → 两种风格背景几乎一样，折射看不出差别。
+        # 现在玻璃风格用**独立的饱和色板**（紫/青/粉/橙），
+        # 这才有 Liquid Glass 演示里"多彩内容透过玻璃"的观感。
+        if pal.dark:
+            spots = (
+                (int(w * 0.12), int(h * 0.06), int(max(w, h) * 0.70), "#7C4DFF", 0.62),
+                (int(w * 0.92), int(h * 0.28), int(max(w, h) * 0.55), "#00E5FF", 0.50),
+                (int(w * 0.55), int(h * 1.02), int(max(w, h) * 0.62), "#FF4081", 0.42),
+                (int(w * 0.30), int(h * 0.72), int(max(w, h) * 0.48), "#FFAB40", 0.36),
+            )
+        else:
+            spots = (
+                (int(w * 0.12), int(h * 0.06), int(max(w, h) * 0.70), "#8B5CF6", 0.55),
+                (int(w * 0.92), int(h * 0.28), int(max(w, h) * 0.55), "#06B6D4", 0.48),
+                (int(w * 0.55), int(h * 1.02), int(max(w, h) * 0.62), "#EC4899", 0.42),
+                (int(w * 0.30), int(h * 0.72), int(max(w, h) * 0.48), "#F59E0B", 0.38),
+            )
         for cx, cy, r, color, alpha in spots:
             g = QRadialGradient(cx, cy, r)
             c = QColor(color)
