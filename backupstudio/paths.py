@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import getpass
 import os
 import sys
@@ -269,18 +270,35 @@ def runtime_dir() -> Path:
 
 
 def _usable_dir(path: Path, *, what: str) -> bool:
-    """目录可用 = 能创建（或已存在）**并且**确实能往里写文件。"""
+    """目录可用 = 能创建（或已存在）**并且**确实能往里写文件。
+
+    **1.1.2 加固**：单次写入失败就永久回退到安装目录，代价太大
+    （实测打包版一次瞬时 `PermissionError` 就导致配置存到程序目录，
+    多用户/Program Files 场景还会彻底失败）。这里：
+    * 用**唯一文件名**，避免与并发进程撞名；
+    * 失败后**重试 2 次**（指数退避 30ms/90ms），把杀软扫描、
+      索引服务占用这类瞬时冲突挡掉；
+    * 只有连续 3 次都失败才判定不可写。
+    """
     if not _mkdir(path, what=what):
         return False
-    probe = path / f".bs-write-test-{os.getpid()}"
-    try:
-        probe.write_text("ok", encoding="ascii")
-        probe.unlink()
-        return True
-    except OSError as exc:
-        _note(f"{what}目录不可写 {path}：{type(exc).__name__}: {exc}")
-        # 目录存在但不可写：记一下，后续让调用方换位置
-        return False
+    last: OSError | None = None
+    for attempt in range(3):
+        probe = path / f".bs-write-test-{os.getpid()}-{attempt}-{os.urandom(3).hex()}"
+        try:
+            probe.write_text("ok", encoding="ascii")
+            probe.unlink()
+            return True
+        except OSError as exc:
+            last = exc
+            # 目标文件可能已被别的清理逻辑删掉，unlink 失败不算目录不可写
+            with contextlib.suppress(OSError):
+                probe.unlink()
+            if attempt < 2:
+                time.sleep(0.03 * (attempt + 1) ** 2)
+    if last is not None:
+        _note(f"{what}目录不可写 {path}（已重试 3 次）：{type(last).__name__}: {last}")
+    return False
 
 
 def pid_file_path() -> Path:

@@ -9,8 +9,10 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QLabel,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -30,7 +32,14 @@ from .widgets import Card, Combo, muted, title_label
 
 log = logging.getLogger("backupstudio.gui.history")
 
-STATUS = {"success": ("成功", "ok"), "failure": ("失败", "bad"), "skipped": ("跳过", "warn")}
+STATUS = {
+    "success": ("成功", "ok"),
+    "failure": ("失败", "bad"),
+    # **1.1.2 修复**：同 tasks_page —— `engine.py` 会产出 `partial`，
+    # 这里缺这个键时历史记录会显示成原始英文 `partial` 或回落成「未运行过」。
+    "partial": ("部分完成", "warn"),
+    "skipped": ("跳过", "warn"),
+}
 COLUMNS = ["时间", "任务", "状态", "格式", "文件数", "原始大小", "压缩后", "耗时", "校验", "压缩包"]
 
 
@@ -40,6 +49,9 @@ class HistoryPage(QWidget):
         self.state = state
         self.window = window
         self._rows: list[dict] = []
+        # 1.1.3 收纳：分页显示，避免一次建几千个单元格
+        self._page_size = 100
+        self._shown = 100
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(26, 22, 26, 22)
@@ -75,11 +87,37 @@ class HistoryPage(QWidget):
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setShowGrid(False)
         hh = self.table.horizontalHeader()
-        hh.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        # **不要 ResizeToContents**：它对每列测量**所有行**取最大宽度，
+        # 300 行 x 10 列 = 3000 次测量（实测历史页卡顿主因之一）。
+        # 改固定列宽 + 末列拉伸 + 单元格中间省略。
+        hh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        for _i, _w in enumerate([130, 140, 70, 80, 70, 90, 90, 80, 70, 240]):
+            if _i < self.table.columnCount():
+                self.table.setColumnWidth(_i, _w)
         hh.setStretchLastSection(True)
+        self.table.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self.table.setWordWrap(False)
         self.table.itemSelectionChanged.connect(self._show_detail)
         self.table.itemDoubleClicked.connect(lambda _: self._open_selected())
         lay.addWidget(self.table, 3)
+
+        # **收纳**（1.1.3）：默认只渲染最近 100 条，底部提供「显示更多」，
+        # 避免 4651 条历史一次全建（那是打开就卡的主因）。
+        more = QWidget()
+        ml = QHBoxLayout(more)
+        ml.setContentsMargins(0, 2, 0, 2)
+        self.page_info = QLabel("")
+        self.page_info.setObjectName("Muted")
+        ml.addWidget(self.page_info)
+        ml.addStretch(1)
+        self.btn_more = QPushButton("显示更多")
+        self.btn_more.clicked.connect(self._show_more)
+        ml.addWidget(self.btn_more)
+        self.btn_all = QPushButton("全部显示")
+        self.btn_all.setToolTip("记录很多时可能较慢")
+        self.btn_all.clicked.connect(self._show_all)
+        ml.addWidget(self.btn_all)
+        lay.addWidget(more)
 
         detail_card = Card()
         detail_card.add(title_label("详情", 3))
@@ -114,13 +152,23 @@ class HistoryPage(QWidget):
             rows = [r for r in rows if r.get("task_id") == task_id]
         rows.reverse()
         self._rows = rows
-        self.table.setRowCount(len(rows))
+        self._update_page_info(len(rows))
+        # **收纳**：只渲染前 `_shown` 条（默认 100）。4651 条全渲染会卡死。
+        view = rows[: self._shown]
+        self.table.setRowCount(len(view))
+        # 1.1.2：状态色改用主题色（原来写死 #16A34A/#DC2626/#D97706，
+        # 主题切换不跟随；且缺 partial）
+        from . import DARK as _D
+        from . import LIGHT as _L
+
+        _pal = _D if getattr(self, "_dark", False) else _L
         colors = {
-            "success": QColor("#16A34A"),
-            "failure": QColor("#DC2626"),
-            "skipped": QColor("#D97706"),
+            "success": QColor(_pal.success),
+            "failure": QColor(_pal.danger),
+            "partial": QColor(_pal.warning),
+            "skipped": QColor(_pal.warning),
         }
-        for i, r in enumerate(rows):
+        for i, r in enumerate(view):
             ts = str(r.get("finished_at") or r.get("started_at") or "")
             try:
                 pretty = datetime.fromisoformat(ts).strftime("%m-%d %H:%M:%S")
@@ -160,24 +208,52 @@ class HistoryPage(QWidget):
             return self._rows[idx]
         return None
 
+    # ------------------------------------------------------------------
+    # 收纳：分页显示（1.1.3）
+    # ------------------------------------------------------------------
+    def _show_more(self) -> None:
+        self._shown += 200
+        self.reload()
+
+    def _show_all(self) -> None:
+        self._shown = max(len(self._rows), 1)
+        self.reload()
+
+    def _update_page_info(self, total: int) -> None:
+        if not hasattr(self, "page_info"):
+            return
+        self.page_info.setText(f"共 {total} 条，已显示 {min(self._shown, total)} 条")
+        self.btn_more.setVisible(total > self._shown)
+        self.btn_all.setVisible(total > self._shown)
+
     def _show_detail(self) -> None:
         r = self._selected()
         if r is None:
             return
+        # 1.1.2：枚举值翻成中文 —— 原来直接把 `success` / `manual` / `passed`
+        # 这些内部英文码显示给用户（审计实测 15 处技术术语泄漏）
+        st_txt = STATUS.get(str(r.get("status") or ""), (str(r.get("status") or "—"), ""))[0]
+        trig = {
+            "manual": "手动", "schedule": "定时", "daemon": "守护进程",
+            "cli": "命令行", "tray": "托盘菜单", "": "—",
+        }.get(str(r.get("trigger") or ""), str(r.get("trigger") or "—"))
+        ver = {"passed": "通过", "failed": "未通过", "skipped": "未校验", "": "—"}.get(
+            str(r.get("verification") or ""), str(r.get("verification") or "—")
+        )
         lines = [
-            f"任务      : {r.get('task_name')}  ({r.get('task_id')})",
-            f"状态      : {r.get('status')}",
+            f"任务      : {r.get('task_name')}",
+            f"状态      : {st_txt}",
             f"开始      : {r.get('started_at')}",
             f"结束      : {r.get('finished_at')}",
-            f"触发方式  : {r.get('trigger')}",
-            f"格式      : {r.get('format')}  后端: {r.get('backend')}",
+            f"触发方式  : {trig}",
+            f"格式      : {r.get('format')}",
             f"分卷      : {r.get('multivolume') or '无'}",
             f"加密      : {'是' if r.get('encrypted') else '否'} {r.get('encrypt_mode') or ''}",
             f"文件数    : {r.get('files')}  目录数: {r.get('dirs')}  跳过: {r.get('skipped')}",
             f"原始大小  : {human_size(r.get('source_bytes') or 0)}",
             f"压缩后    : {human_size(r.get('archive_bytes') or 0)}",
             f"耗时      : {human_duration(r.get('duration') or 0)}",
-            f"校验      : {r.get('verification')}  {r.get('verification_message') or ''}",
+            f"校验      : {ver}  {r.get('verification_message') or ''}",
             f"压缩包    : {r.get('archive')}",
         ]
         if r.get("volumes") and isinstance(r.get("volumes"), int):

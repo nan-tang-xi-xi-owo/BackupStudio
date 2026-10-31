@@ -773,7 +773,10 @@ class TestRarBombPrecheck:
         arc.write_bytes(b"Rar!\x1a\x07\x00" + b"\x00" * 100)
         with pytest.raises(ex.ExtractionError) as ei:
             ex._check_external_bomb(str(tmp_path / "no-such-unrar.exe"), arc, None, unrar=True)
-        assert "无法预读" in str(ei.value), str(ei.value)
+        # 新文案：不再说"无法预读…可设环境变量关闭上限"（那个开关结构上走不通），
+        # 改为说清"无法读取包信息"并给出真实排查方向
+        text = str(ei.value)
+        assert "无法读取" in text or "无法预读" in text, text
 
 
 class TestUnprotectedPaths:
@@ -923,14 +926,11 @@ class TestBuiltinZipActuallyCompresses:
             assert info.compress_type == zipfile.ZIP_DEFLATED, f"{cls.__name__} 仍未压缩"
 
 
-class TestNoSizeContainerFailClosed:
-    """评审 R2-3（S1）：容器不报解压后大小时，预检必须 fail-closed。
+# ── S1 补测（1.1.7 从 main 合并过来）────────────────────────────
+# 我的 extract.py 早已有 `return total if seen else None` 的 S1 修复，
+# 但缺这 3 条回归测试保护 —— 合并 main 的主要收益就在这里。
 
-    复现：把 200 MiB 全零数据压成 zstd 流、改名为 ``bomb.7z``。
-    7za 能开这个流但 ``l -slt`` 只给出空的 ``Size =``（且没有 ``Path =``），
-    旧实现把"解析不出"当成 0 → 预检认为"声明 0 字节"放行 → 真解压写满磁盘。
-    """
-
+    # main 上的辅助方法：造一个「不报告内容长度」的容器用于 S1 测试
     @staticmethod
     def _make_no_size_archive(path, size=64 * 1024 * 1024):
         zstd = pytest.importorskip("zstandard", reason="需要 zstandard 构造样本")
@@ -950,6 +950,7 @@ class TestNoSizeContainerFailClosed:
         # None = "读不出"，调用方据此拒绝；返回 0 就会被当成"声明 0 字节"放行
         assert ex._declared_unpacked_7z(exe, arc, None) is None
 
+
     def test_extract_refuses_no_size_container(self, tmp_path, monkeypatch):
         from backupstudio import extract as ex
 
@@ -960,9 +961,11 @@ class TestNoSizeContainerFailClosed:
         out = tmp_path / "out"
         ok, msg = ex.extract_archive(arc, out)
         assert ok is False, f"无长度容器被放行：{msg}"
-        assert "无法预读" in msg or "炸弹" in msg, msg
+        # 本分支文案比 main 更具体（说明原因+可能情形），行为一致：都拒绝。
+        assert "无法读取" in msg or "无法预读" in msg or "炸弹" in msg, msg
         written = sum(f.stat().st_size for f in out.rglob("*") if f.is_file()) if out.exists() else 0
         assert written == 0, f"拒绝前已写入 {written} 字节"
+
 
     def test_zero_size_archive_still_allowed(self, tmp_path):
         """反向守卫：真正的 0 字节内容（纯目录包）必须继续放行。
@@ -986,3 +989,4 @@ class TestNoSizeContainerFailClosed:
         assert ex._count_entries_7z(exe, arc, None) is not None
         ok, msg = ex.extract_archive(arc, tmp_path / "out")
         assert ok, f"纯目录 7z 被误拒：{msg}"
+

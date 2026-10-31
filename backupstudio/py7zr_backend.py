@@ -24,6 +24,17 @@ except Exception:  # pragma: no cover
 from .staging import make_staging_dir
 
 
+def _zip_info_level(zi, level: int, *, is_dir: bool = False) -> None:  # noqa: ANN001 - 延迟导入避免循环依赖
+    """转发 ``archives.zip_info_level``（S3：compress_type + compress_level 必须同时设）。
+
+    这里做一层薄包装只为**延迟导入**：``archives`` 在函数体内延迟导入本模块
+    （``from .py7zr_backend import Py7zrCompressor``），模块顶层反向导入会成环。
+    """
+    from .archives import zip_info_level
+
+    zip_info_level(zi, level, is_dir=is_dir)
+
+
 class _Cancelled(Exception):
     """取消信号（由 archives.create_archive 转成 ArchiveCancelled）。"""
 
@@ -86,6 +97,8 @@ class Py7zrCompressor:
     name = "py7zr"
 
     def __init__(self, dest_path: Path, spec, progress) -> None:  # noqa: ANN001
+
+        self.skipped_busy: list[str] = []  # 被占用/无权限的条目（P0：不能假绿）
         if py7zr is None:
             raise RuntimeError("py7zr 未安装：pip install py7zr")
         self.dest = Path(dest_path)
@@ -178,7 +191,9 @@ class Py7zrCompressor:
         zi.external_attr = (0o40755 if is_dir else 0o100644) << 16
         # ZipInfo.compress_type 默认 STORED，会覆盖 ZipFile(compression=...)；
         # 不显式设置则「强制压缩」的 ZIP 产物完全不压缩（审查 Q6）。目录条目保持 STORED。
-        zi.compress_type = zipfile.ZIP_STORED if (is_dir or self.spec.level == 0) else zipfile.ZIP_DEFLATED
+        # S3：**还必须设 compress_level**（Python 3.13+ 才叫 zinfo.compress_level；3.12 及更早是 _compresslevel，
+        # 默认 None → 恒用 zlib 默认 6 → level 1..9 产出完全相同）。
+        _zip_info_level(zi, self.spec.level, is_dir=is_dir)
         try:
             zi.flag_bits |= 0x800  # UTF-8 文件名标志位（中文/emoji 正确显示）
         except Exception:  # noqa: BLE001
@@ -218,6 +233,14 @@ class Py7zrCompressor:
         st = src.stat()
         if self._zip is not None:
             self._check()
+            # 先探测可读性：失败则登记并跳过（P0：不能假绿）
+            try:
+                _probe = open(src, "rb")
+            except PermissionError:
+                self.skipped_busy.append(f"{arcname}（被占用或无权限）")
+                return 0
+            else:
+                _probe.close()
             with open(src, "rb") as fh, self._zip.open(self._zip_info(arcname, mtime or st.st_mtime, False), "w") as out:
                 while True:
                     self._check()
@@ -307,6 +330,8 @@ class ZipFileCompressor:
     name = "zipfile-builtin"
 
     def __init__(self, dest_path: Path, spec, progress) -> None:  # noqa: ANN001
+
+        self.skipped_busy: list[str] = []  # 被占用/无权限的条目（P0：不能假绿）
         import dataclasses
         import zipfile
 
@@ -354,8 +379,9 @@ class ZipFileCompressor:
             ts = (1980, 1, 1, 0, 0, 0)
         zi = zipfile.ZipInfo(arcname + ("/" if is_dir else ""), date_time=ts)
         zi.external_attr = (0o40755 if is_dir else 0o100644) << 16
-        # 同 Py7zrCompressor._zip_info：必须显式设置，否则 STORED 会覆盖全局 compression
-        zi.compress_type = zipfile.ZIP_STORED if (is_dir or self.spec.level == 0) else zipfile.ZIP_DEFLATED
+        # 同 Py7zrCompressor._zip_info：必须显式设置，否则 STORED 会覆盖全局 compression；
+        # 且必须连 compress_level 一起设（S3：Python 3.13+ 才叫 zinfo.compress_level；3.12 及更早是 _compresslevel）。
+        _zip_info_level(zi, self.spec.level, is_dir=is_dir)
         try:
             zi.flag_bits |= 0x800
         except Exception:  # noqa: BLE001
@@ -376,6 +402,14 @@ class ZipFileCompressor:
 
         self._check()
         st = src.stat()
+        # 先探测可读性：失败则登记并跳过（P0：不能假绿）
+        try:
+            _probe = open(src, "rb")
+        except PermissionError:
+            self.skipped_busy.append(f"{arcname}（被占用或无权限）")
+            return 0
+        else:
+            _probe.close()
         with open(src, "rb") as fh, self._zip.open(self._info(arcname, mtime or st.st_mtime, False), "w") as out:
             while True:
                 self._check()

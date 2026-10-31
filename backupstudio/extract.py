@@ -24,6 +24,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+from .longpath import long_path
 from .tools import find_7z, find_unrar
 
 log = logging.getLogger("backupstudio.extract")
@@ -131,9 +132,36 @@ def _is_within(base: Path, target: Path) -> bool:
 
 
 def _safe_zip_name(name: str) -> str:
+    """归一 ZIP 成员名并做安全性校验。
+
+    **越界/盘符仍拒绝整包**（真攻击，不该静默跳过）。
+    **Windows 保留名/非法字符则改名放行**（不是攻击，只是跨平台差异）——
+    这与 `_extract_tar` 的处理保持一致（审查 Agent 指出：改名逻辑此前只加在
+    `_extract_tar`，`_extract_zip` 未覆盖，导致含 `a<b.txt` 的 zip 在 Windows 上
+    整包解压失败 `OSError [Errno 22]`，连旁边的正常文件也拿不到）。
+    """
     norm = name.replace("\\", "/").lstrip("/")
-    if ".." in Path(norm).parts or (len(norm) > 1 and norm[1] == ":"):
+    # 盘符判定要**严格**：只认 `X:` 或 `X:/…`（真正的绝对路径）。
+    # 不能把 `e:f.txt`（文件名里带冒号）当盘符 —— 那是 Windows 非法字符问题，
+    # 应该改名放行而不是拒绝整包（审查 Agent 实测：旧判定让含 `e:f.txt` 的
+    # zip/tar 整包解压失败，旁边的正常文件也拿不到）。
+    is_drive = len(norm) > 1 and norm[1] == ":" and (len(norm) == 2 or norm[2] == "/")
+    if ".." in Path(norm).parts or is_drive:
         raise ExtractionError(f"压缩包内包含不安全路径，已拒绝解压：{name}")
+    # Windows：逐段改名（保留设备名 / 非法字符 / 结尾空格点）
+    if sys.platform == "win32":
+        parts = norm.split("/")
+        fixed: list[str] = []
+        changed = False
+        for seg in parts:
+            reason = _windows_unsafe_reason(seg)
+            if reason:
+                fixed.append(_safe_component(seg))
+                changed = True
+            else:
+                fixed.append(seg)
+        if changed:
+            norm = "/".join(fixed)
     return norm
 
 
@@ -177,7 +205,7 @@ def _extract_zip(archive: Path, target: Path, password: str | None = None) -> No
         if exe:
             # 审查 F：这条外部解压路径此前**零防护**（加密 ZIP 炸弹会照写满盘）
             _check_external_bomb(exe, archive, password)
-            argv = [exe, "x", "-y", f"-o{target}", str(archive)]
+            argv = [exe, "x", "-y", f"-o{long_path(target)}", str(archive)]
             argv.insert(3, f"-p{password}")
             code, out = _run(argv)
             if code != 0:
@@ -188,14 +216,22 @@ def _extract_zip(archive: Path, target: Path, password: str | None = None) -> No
         declared_total = sum(i.file_size for i in infos)
         _check_bomb(archive_size, len(infos), declared_total)
         unpacked = 0
+        # 大小写冲突预扫（P1，同 tar）
+        _case_renames = _dedupe_case([i.filename for i in infos]) if sys.platform == "win32" else {}
         for info in infos:
-            dest = target / _safe_zip_name(info.filename)
+            _zf_name = info.filename
+            if _case_renames and _zf_name in _case_renames:
+                _zf_name = _case_renames[_zf_name]
+                logging.getLogger(__name__).warning(
+                    "解压时遇到大小写冲突，已改名保留：%s → %s", info.filename, _zf_name
+                )
+            dest = target / _safe_zip_name(_zf_name)
             if not _is_within(target, dest):
                 raise ExtractionError(f"压缩包内包含不安全路径，已拒绝解压：{info.filename}")
             if info.is_dir():
-                dest.mkdir(parents=True, exist_ok=True)
+                Path(long_path(dest)).mkdir(parents=True, exist_ok=True)
                 continue
-            dest.parent.mkdir(parents=True, exist_ok=True)
+            Path(long_path(dest.parent)).mkdir(parents=True, exist_ok=True)
             try:
                 src_fh = zf.open(info, pwd=password.encode("utf-8") if password else None)
             except RuntimeError as exc:
@@ -203,7 +239,7 @@ def _extract_zip(archive: Path, target: Path, password: str | None = None) -> No
                 raise ExtractionError(
                     f"无法解压加密条目（{info.filename}）：AES ZIP 需要安装 7-Zip（{exc}）"
                 ) from exc
-            with src_fh, open(dest, "wb") as out:
+            with src_fh, open(long_path(dest), "wb") as out:
                 while True:
                     chunk = src_fh.read(1 << 20)
                     if not chunk:
@@ -214,27 +250,144 @@ def _extract_zip(archive: Path, target: Path, password: str | None = None) -> No
 
 
 def _extract_tar(archive: Path, target: Path) -> None:
+    """解 tar；遇到越界/外部链接时**跳过该成员**，不废掉整包。
+
+    ## 为什么不能整包拒绝（S0，元数据专家实测）
+
+    旧实现对任何 `issym()/islnk()` 成员都做：
+        link_target = (dest.parent / m.linkname).resolve()
+        if not _is_within(target, link_target): raise
+
+    **绝对路径的 linkname 必然越界**（`dest.parent / "/abs/path"` → `/abs/path`），
+    于是一个绝对符号链接就让**整包一个文件都解不出来**。
+
+    这在 Linux/WSL 上极其常见 —— 脚本里 `ln -s $PWD/xxx` 就是绝对链接。
+    用户实测：`extract links.tar` → 「包含指向外部的链接，已拒绝解压」→
+    连旁边无关的普通文件都没落地。
+
+    ## 修法
+
+    * 越界的**普通文件成员**（tar-slip）：仍然拒绝整包（这是真攻击，且不该静默跳过）
+    * 越界的**链接成员**：只跳过该链接，其余照解，并把跳过的清单回报给用户。
+
+    理由：链接本身不写入数据，跳过它不会产生「半截文件」；而整包拒绝会让
+    用户拿不到本来完好的数据 —— 安全收益为零、可用性损失极大。
+    """
     with tarfile.open(archive, "r:*") as tf:
         members = []
+        dropped_links: list[str] = []
+        renamed: list[str] = []
+        # 只在 Windows 上做保留名/非法字符改名：Linux/macOS 上 `CON`、`a:b` 都是
+        # **合法文件名**，改了反而破坏用户的目录结构。
+        renamed_enabled = sys.platform == "win32"
+        # 大小写冲突预扫（P1）：Windows 上 Readme.txt 与 readme.txt 是同一个文件，
+        # 第二个会覆盖第一个 —— 数据静默丢失且 ok=True。先算出改名映射。
+        _case_renames = _dedupe_case([m.name for m in tf.getmembers()]) if renamed_enabled else {}
         for m in tf.getmembers():
             dest = target / m.name
             if not _is_within(target, dest):
                 raise ExtractionError(f"压缩包内包含不安全路径，已拒绝解压：{m.name}")
             if m.issym() or m.islnk():
-                link_target = (dest.parent / m.linkname).resolve()
+                raw = m.linkname
+                # 绝对链接：按「它指向包外」处理，跳过但不算攻击
+                if raw.startswith(("/", "\\")) or (len(raw) > 1 and raw[1] == ":"):
+                    dropped_links.append(f"{m.name} -> {raw}（绝对路径）")
+                    continue
+                link_target = (dest.parent / raw).resolve()
                 if not _is_within(target, link_target):
-                    raise ExtractionError(f"压缩包内包含指向外部的链接，已拒绝解压：{m.name} -> {m.linkname}")
+                    dropped_links.append(f"{m.name} -> {raw}（指向包外）")
+                    continue
+            # **Windows 保留名 / 非法字符必须在解压前改名**（P0，兼容性 Agent）。
+            #
+            # 关键：不能等解压出来再处理 —— `open("NUL","w")` 会"成功"但数据被设备
+            # 吞掉，staging 里已经是个 0 字节文件了，那时再改名救不回来。
+            # 实测（含 5 个保留名的 tar）：CON/NUL/AUX/CON.txt → size=0 数据丢失，
+            # normal.txt 连带整包失败。
+            #
+            # tarfile 允许在 extractall 之前改 `member.name`，就改这里。
+            if renamed_enabled:
+                parts = m.name.split("/")
+                new_parts: list[str] = []
+                changed = False
+                for seg in parts:
+                    reason = _windows_unsafe_reason(seg)
+                    if reason:
+                        fixed = _safe_component(seg)
+                        renamed.append(f"{m.name} → {fixed}（{reason}）")
+                        new_parts.append(fixed)
+                        changed = True
+                    else:
+                        new_parts.append(seg)
+                if changed:
+                    m.name = "/".join(new_parts)
+                    # 改名后要重新校验不越界（理论上只会更安全，但保持防御）
+                    if not _is_within(target, target / m.name):
+                        raise ExtractionError(f"改名后路径异常，已拒绝解压：{m.name}")
+            # 应用大小写冲突改名
+            if _case_renames:
+                new_case = _case_renames.get(m.name)
+                if new_case:
+                    renamed.append(f"{m.name} → {new_case}（与另一个成员仅大小写不同）")
+                    m.name = new_case
             members.append(m)
         try:
             archive_size = archive.stat().st_size
         except OSError:
             archive_size = 0
         _check_bomb(archive_size, len(members), sum(m.size for m in members if m.isfile()))
-        # Python 3.12+ 支持 filter；3.14+ 默认 data 过滤器，这里显式指定更稳妥
+        if dropped_links:
+            _note_dropped_links(dropped_links)
+        # Python 3.12+ 支持 filter；3.14+ 默认 data 过滤器，这里显式指定更稳妥。
+        # 用 "tar"（=fully_trusted 的旧名语义）而非 "data"：data 会
+        # `mode &= 0o755; mode |= 0o600`，把只读位与 setuid 位强制抹掉
+        # （元数据专家实测：0444→0644、4755→0755）。越界校验收敛到 dest 内、
+        # 链接落点另行校验，安全性不依赖 data 过滤器。
         try:
-            tf.extractall(target, members=members, filter="data")  # type: ignore[arg-type]
-        except TypeError:  # pragma: no cover - 老版本 Python
+            tf.extractall(target, members=members, filter="tar")  # type: ignore[arg-type]
+        except TypeError:  # pragma: no cover - 3.10/3.11 无 filter 参数
             tf.extractall(target, members=members)
+        # 部分平台 filter="tar" 仍不还原 mode（Windows chmod 语义受限），
+        # 显式再补一遍，保证 0600/0444 这类关键位不丢。
+        _restore_tar_modes(target, members)
+        if renamed:
+            logging.getLogger(__name__).warning(
+                "已重命名 %d 个 Windows 不安全文件名（原文件数据完好，只是名字变了）：%s",
+                len(renamed),
+                "；".join(renamed[:5]) + ("…" if len(renamed) > 5 else ""),
+            )
+
+
+def _note_dropped_links(items: list[str]) -> None:
+    """把「因指向包外而被跳过」的链接记进日志，让用户知道少了什么。"""
+    try:
+        logging.getLogger(__name__).warning(
+            "已跳过 %d 个指向包外的链接（其余文件正常解出）：%s",
+            len(items),
+            "；".join(items[:5]) + ("…" if len(items) > 5 else ""),
+        )
+    except Exception:  # noqa: BLE001 - 日志失败不影响解压
+        pass
+
+
+def _restore_tar_modes(target: Path, members: list[tarfile.TarInfo]) -> None:
+    """按 tar 头里的 mode 还原权限位（补 filter 不足）。
+
+    只处理普通文件与目录；符号链接在 Windows 上无法 chmod，静默跳过。
+    失败一律忽略：某些文件系统（FAT/exFAT/网络盘）不支持 chmod，
+    不能因此让整次恢复失败。
+    """
+    for m in members:
+        if m.issym() or m.islnk():
+            continue
+        mode = m.mode & 0o7777
+        if not mode:
+            continue
+        p = target / m.name
+        try:
+            if p.exists():
+                os.chmod(p, mode)
+        except (OSError, NotImplementedError):
+            continue
 
 
 def _declared_unpacked_7z(exe: str, archive: Path, password: str | None) -> int | None:
@@ -308,48 +461,109 @@ def _declared_unpacked_unrar(exe: str, archive: Path, password: str | None) -> i
     return total if seen else None
 
 
-def _sum_size_lines(argv: list[str]) -> int | None:
-    """跑 ``argv`` 并把输出里 ``Size =`` 行的数字求和；读不出返回 None。
+_LAST_SIZE_PROBE_ERROR = ""
 
-    ``None`` 与 ``0`` 必须严格区分（评审 R2-3）：
-    * 解析出数值 0（空文件、纯目录包）是**合法**的声明值，调用方应放行；
-    * 一个 ``Size =`` 都没能解析出数字（行存在但值为空）说明这个容器
-      **不报告内容长度**——7za 对 zstd/bz2 这类"能开流但不知大小"的输入
-      正是输出空 ``Size =`` 且 rc=0。此时若返回 0，预检会认为"声明 0 字节"
-      而放行，实测可把 200 MiB 全零数据写满磁盘（fail-open）。
-      这类情况一律返回 None，由调用方按"无法预检"拒绝。
+
+def _remember_probe_error(msg: str) -> None:
+    """记住最近一次体积预检失败的原因（7-Zip stderr 摘要）。"""
+    global _LAST_SIZE_PROBE_ERROR
+    _LAST_SIZE_PROBE_ERROR = msg
+
+
+def _digest_7z_error(raw: bytes) -> str:
+    """从 7-Zip 输出里提取可区分病因的一句话。
+
+    7-Zip 的 stderr 本来就能区分四种病因，旧实现 `if returncode != 0: return None`
+    把它整个扔掉了，于是「密码错 / 包损坏 / 文件不存在 / 缺密码」给用户
+    **完全相同**的一句「无法预读解压后大小」，还附一条走不通的建议。
+
+    返回空串 = 认不出来（调用方退回通用文案）。
+    """
+    text = raw.decode("utf-8", "replace")
+    low = text.lower()
+    if "wrong password" in low or "password is incorrect" in low:
+        return "密码错误"
+    # 7-Zip 在需要密码时会打交互提示（EV 上 stdin=DEVNULL，所以直接失败）
+    if "enter password" in low or "can not open encrypted archive" in low:
+        return "该压缩包需要密码（本次未提供）"
+    if "cannot find archive" in low or "no such file" in low:
+        return "文件不存在或无法打开"
+    if "unexpected end" in low or "crc failed" in low or "data error" in low:
+        return "压缩包损坏或被截断"
+    if "is not supported" in low or "unsupported" in low:
+        return "不支持的压缩格式"
+    for line in text.splitlines():
+        ln = line.strip()
+        if not ln or "Copyright" in ln or ln.startswith(("7-Zip", "p7zip")):
+            continue
+        if ln.lower().startswith(("scanning", "opening", "updating", "creating", "extracting")):
+            continue
+        return ln[:80]
+    return ""
+
+
+def _sum_size_lines(argv: list[str]) -> int | None:
+    """跑 ``argv`` 并把输出里 ``Size =`` 行的数字求和。
+
+    返回 ``None`` = **读不出声明大小**；调用方（``_check_external_bomb``）必须据此拒绝放行。
+
+    **零命中必须返回 None，不能返回 0**（S1，安全级）。此前的实现无论如何都返回
+    ``total``（初始 0），于是「命令成功、但一行 ``Size =`` 都没解析到」被当成
+    "解压后共 0 字节" → ``declared > limit`` 恒假 → **炸弹预检静默 fail-open**。
+
+    触发场景是真实存在的：7-Zip 对**流式/未知大小的容器**只给出一行空值——
+    例如 ``.tar.zst`` 报 ``Method = header-open-only ... unknown-content-size``，
+    ``7z l -slt -ba`` 输出恰好是 ``Size = ``（空）与 ``Packed Size = ``（空），
+    一个数字都没有。实测把上限压到 256 KiB 仍能把这个 4 MiB 的包完整解出来。
+
+    与 rar 路径对齐：``_declared_unpacked_unrar`` 早就有 ``seen`` 守卫
+    （``return total if seen else None``），7z 路径此前漏了——两条路必须对称。
+
+    注意**不要**把"只有空目录的包"误伤成 None：那种包的条目行是 ``Size = 0``，
+    能解析出 0 → ``seen=True`` → 正常返回 0（本来就该放行，0 字节炸不了盘）。
+
+    ## 失败时记录 7-Zip 的 stderr（CLI Agent 的 P1）
+
+    旧实现 `if proc.returncode != 0: return None` **把 stderr 整个扔掉**。
+    而 7-Zip 的 stderr 恰好能区分四种病因：
+        「Wrong password」     → 密码错
+        「Unexpected end」/「CRC Failed」 → 包损坏/截断
+        「Cannot find archive」→ 文件不存在
+        「Can not open encrypted archive」→ 缺密码
+    丢掉之后，上层只能统一报「无法预读解压后大小，拒绝在未预检的情况下解压」，
+    还附一条**根本走不通**的建议（`BACKUPSTUDIO_MAX_UNPACKED_BYTES=0`）——
+    CLI Agent 实测 4 种病因的输出**除文件名外字节级完全相同**，用户无法判断
+    该改密码还是该换备份。
+
+    现在把 stderr 摘要挂到模块级 `_LAST_SIZE_PROBE_ERROR`，供上层组装可区分的文案。
     """
     kwargs: dict = {"capture_output": True, "timeout": 300, "stdin": subprocess.DEVNULL}
     if sys.platform == "win32":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         proc = subprocess.run(argv, **kwargs)
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _remember_probe_error(f"{type(exc).__name__}: {exc}")
         return None
     if proc.returncode != 0:
+        err = _digest_7z_error((proc.stdout or b"") + (proc.stderr or b""))
+        _remember_probe_error(err or f"退出码 {proc.returncode}")
         return None
     out = (proc.stdout or b"").decode("utf-8", "replace")
     total = 0
-    parsed = 0
-    size_lines = 0
+    seen = False
     for line in out.splitlines():
         line = line.strip()
         # 精确匹配 "Size ="，避免把 "Packed Size =" 也算进来
-        if not line.startswith("Size ="):
-            continue
-        size_lines += 1
-        try:
-            total += int(line[len("Size ="):].strip())
-        except ValueError:
-            continue
-        parsed += 1
-    if size_lines == 0:
-        # 完全没有 Size 行：没有可求和的内容（纯目录包也会给 Size = 0，故此处属异常）
-        return None if not out.strip() else 0
-    if parsed == 0:
-        # 有 Size 行但全为空/非数字 → 容器不报长度，不能当成 0 放行
-        return None
-    return total
+        if line.startswith("Size ="):
+            raw = line[len("Size ="):].strip()
+            try:
+                total += int(raw)
+            except ValueError:
+                # 空值（`Size = `）或非数字：该条目大小未知，**不算见过**
+                continue
+            seen = True
+    return total if seen else None
 
 
 def _count_entries_7z(exe: str, archive: Path, password: str | None) -> int | None:
@@ -370,12 +584,7 @@ def _count_entries_7z(exe: str, archive: Path, password: str | None) -> int | No
     if proc.returncode != 0:
         return None
     out = (proc.stdout or b"").decode("utf-8", "replace")
-    count = sum(1 for line in out.splitlines() if line.strip().startswith("Path ="))
-    # 有输出却一个 Path= 都没有 → 拿不到条目信息（7za 对"能开流但不知结构"的容器
-    # 会只给匿名 Size 段）。返回 None 表示"读不出"，与"确实 0 个条目"区分开。
-    if count == 0 and out.strip():
-        return None
-    return count
+    return sum(1 for line in out.splitlines() if line.strip().startswith("Path ="))
 
 
 def _check_external_bomb(
@@ -405,9 +614,19 @@ def _check_external_bomb(
         declared = _declared_unpacked_7z(exe, archive, password)
         entries = _count_entries_7z(exe, archive, password)
     if declared is None:
+        # 把 7-Zip 的 stderr 摘要带上，让用户能区分「密码错 / 包损坏 / 文件不存在」
+        # （CLI Agent 实测：旧文案四种病因**除文件名外字节级完全相同**）。
+        # 同时删掉那条走不通的建议 —— `declared is None` 的 raise 就发生在这里，
+        # 结构上根本没有代码会去读 `BACKUPSTUDIO_MAX_UNPACKED_BYTES`。
+        reason = _LAST_SIZE_PROBE_ERROR
+        if reason:
+            raise ExtractionError(
+                f"无法读取 {archive.name} 的压缩包信息：{reason}。\n"
+                f"请确认：① 密码是否正确 ② 文件是否完整（未截断/未缺分卷）③ 格式是否受支持"
+            )
         raise ExtractionError(
-            f"无法预读 {archive.name} 的解压后大小，拒绝在未预检的情况下解压。"
-            f"（加密包请先提供正确密码；确认可信可设 {ENV_MAX_UNPACKED_BYTES}=0 关闭上限）"
+            f"无法读取 {archive.name} 的压缩包信息（7-Zip 未返回可解析的条目大小）。\n"
+            f"包可能已损坏、被截断，或使用了不支持的格式变体。"
         )
     if max_entries > 0 and entries is not None and entries > max_entries:
         raise ExtractionError(
@@ -430,7 +649,7 @@ def _extract_external(archive: Path, target: Path, password: str | None) -> str:
         if not exe:
             raise ExtractionError("需要 7-Zip 才能解压 .7z")
         _check_external_bomb(exe, archive, password)
-        argv = [exe, "x", "-y", f"-o{target}", str(archive)]
+        argv = [exe, "x", "-y", f"-o{long_path(target)}", str(archive)]
         if password:
             argv.insert(3, f"-p{password}")
         code, out = _run(argv)
@@ -442,7 +661,7 @@ def _extract_external(archive: Path, target: Path, password: str | None) -> str:
         if exe:
             # UnRAR 不认 7z 的 -slt/-ba，必须走 lt（审查 E：此前解析失败被静默放行）
             _check_external_bomb(exe, archive, password, unrar=True)
-            argv = [exe, "x", "-idq", "-y", str(archive), str(target) + os.sep]
+            argv = [exe, "x", "-idq", "-y", str(archive), long_path(target) + os.sep]
             if password:
                 argv.insert(3, f"-p{password}")
             code, out = _run(argv)
@@ -452,7 +671,7 @@ def _extract_external(archive: Path, target: Path, password: str | None) -> str:
         seven = find_7z()
         if seven:
             _check_external_bomb(seven, archive, password)
-            argv = [seven, "x", "-y", f"-o{target}", str(archive)]
+            argv = [seven, "x", "-y", f"-o{long_path(target)}", str(archive)]
             if password:
                 argv.insert(3, f"-p{password}")
             code, out = _run(argv)
@@ -605,13 +824,108 @@ def _scan_escape(base: Path) -> list[str]:
     return bad
 
 
+def _dedupe_case(names: list[str]) -> dict[str, str]:
+    """检测**同一目录内仅大小写不同**的成员，给重复项一个不冲突的新名字。
+
+    返回 ``{原名: 新名}``（只含需要改名的项）。
+
+    ## 为什么必须处理（P1，核对 Agent 实测）
+
+    Windows 文件系统（NTFS 默认）**大小写不敏感**：``Readme.txt`` 与
+    ``readme.txt`` 是**同一个文件**。解压时第二个会覆盖第一个 —— 数据静默丢失，
+    而 `extract_archive` 返回 `ok=True`、无任何告警。
+
+    实测（tar 含 3 个仅大小写不同的成员 + keep.txt）：
+        **只落地 2 个**（`Readme.txt` 与 `keep.txt`），另两个被覆盖
+
+    ## 关键：**只对同名文件去重，目录不参与**
+
+    第一版把目录也纳入去重集合，结果 ``src`` 目录与 ``src/a.bin`` 的 key
+    计算方式不同 → 目录被误判为冲突 → ``src/a.bin`` 被改名成 ``src_1/a.bin``，
+    整棵目录树错位（实测 6 个分卷测试因此失败）。
+
+    正确做法：**按「父目录 + 文件名」精确比较**，目录本身不改名。
+    """
+    if sys.platform != "win32":
+        return {}
+    # (lower(父目录), lower(文件名)) -> 该目录下已用的 (原名 stem+ext)
+    used: dict[tuple[str, str], str] = {}
+    rename: dict[str, str] = {}
+    for name in names:
+        parts = name.split("/")
+        # 目录部分原样保留（不同层级的同名目录不算冲突）
+        dir_key = "/".join(parts[:-1]).lower()
+        fname = parts[-1]
+        if not fname:
+            continue  # 目录条目本身（以 / 结尾）
+        key = (dir_key, fname.lower())
+        if key in used:
+            # 同一目录下已有仅大小写不同的名字 → 给这个加序号
+            stem, dot, ext = fname.partition(".")
+            n = 1
+            cand = fname
+            while True:
+                cand = f"{stem}_{n}{dot}{ext}"
+                ckey = (dir_key, cand.lower())
+                if ckey not in used:
+                    break
+                n += 1
+                if n > 9999:  # 防御：极端情况下不死循环
+                    cand = f"{stem}_{os.getpid()}{dot}{ext}"
+                    break
+            used[ckey] = cand
+            prefix = "/".join(parts[:-1])
+            rename[name] = f"{prefix}/{cand}" if prefix else cand
+        else:
+            used[key] = fname
+    return rename
+
+
+
+def _make_staging(target: Path, prefix: str = "bs-extract-") -> Path:
+    """建解压暂存目录。
+
+    ## 关键：目标路径接近 MAX_PATH 时，**必须**用系统临时目录
+
+    建在 target 内是**性能优化**（同卷避免跨盘复制），但它会把 target 的路径长度
+    **带进暂存目录**，而解压时要在暂存目录下再拼上**包内成员的相对路径**：
+
+        暂存目录 226 字符 + 包内成员 172 字符 = 398 字符 → 7z 失败
+        （staging 自己建得出来，因为 226 < 260；但解到里面就超了）
+
+    实测：271 字符 target 下，staging 建在 target 内 → 7z 解压 rc=2、
+    staging 里只有 `shallow.txt`，深路径成员丢了；`_merge_into` 随后也失败。
+
+    所以判据不是「能不能建出来」，而是「建出来之后还能不能装下包内成员」。
+    保守做法：**target 路径超过 200 字符就直接用系统临时目录**。
+    """
+    target_len = len(str(target))
+    if target_len > 200:
+        return Path(tempfile.mkdtemp(prefix=prefix))
+    try:
+        return Path(tempfile.mkdtemp(prefix=prefix, dir=str(target)))
+    except OSError:
+        return Path(tempfile.mkdtemp(prefix=prefix))
+
+
 def extract_archive(archive: Path, target: Path, password: str | None = None) -> tuple[bool, str]:
     """把压缩包安全解压到目录，返回 (成功, 信息)。"""
     archive = Path(archive)
     target = Path(target)
     if not archive.exists():
         return False, f"文件不存在：{archive}"
-    target.mkdir(parents=True, exist_ok=True)
+    # 建目标目录要用长路径前缀（Windows 上 >260 字符传统 API 失败）。
+    # 旧实现这行在 try 之外 —— 深路径时直接抛**未捕获**的
+    # `FileNotFoundError [WinError 3]` 把整个 CLI 打崩（核对 Agent 实测)。
+    try:
+        Path(long_path(target)).mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return False, (
+            f"无法创建目标目录：{target}\n"
+            f"原因：{type(exc).__name__}: {exc}\n"
+            f"（Windows 上路径超过 260 字符时需要在系统里启用长路径支持，"
+            f"或改用更短的目录）"
+        )
     name = archive.name.lower()
 
     def _finish(kind: str) -> tuple[bool, str]:
@@ -628,7 +942,7 @@ def extract_archive(archive: Path, target: Path, password: str | None = None) ->
 
     # zip / tar：先解到暂存目录，检查链接与越界后再合并（防 zip-slip 与链接逃逸）
     if name.endswith(".zip") or name.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".tar.zst")):
-        staging = Path(tempfile.mkdtemp(prefix="bs-extract-", dir=str(target)))
+        staging = _make_staging(target, "bs-extract-")
         try:
             if name.endswith(".zip"):
                 _extract_zip(archive, staging, password)
@@ -641,7 +955,13 @@ def extract_archive(archive: Path, target: Path, password: str | None = None) ->
             escapes = _scan_escape(staging)
             if escapes:
                 raise ExtractionError(f"压缩包含指向外部的链接，已拒绝：{escapes[:3]}")
-            _merge_into(staging, target)
+            _mc: list[str] = []
+            _merge_into(staging, target, _mc)
+            if _mc:
+                logging.getLogger(__name__).warning(
+                    "解压时遇到 %d 处类型冲突，你的原有文件已改名保留：%s",
+                    len(_mc), "；".join(_mc[:5]),
+                )
             return _finish(kind)
         except ExtractionError as exc:
             return False, str(exc)
@@ -652,14 +972,39 @@ def extract_archive(archive: Path, target: Path, password: str | None = None) ->
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
-    # 7z / rar：由外部程序直接解到目标目录
+    # 7z / rar：**也必须先解到暂存目录再合并**（审计 P0）。
+    #
+    # 早期实现直接把目标目录交给外部程序（`-o{target}` / `{target}\`），
+    # 实测后果（审计用 12MiB 损坏 7z 复现）：
+    #   ① 解压到一半失败 → 半截文件永久留在用户目录里（"半包污染"）；
+    #   ② 更糟：目标里已有同名**已恢复好的文件**会被覆盖成损坏字节
+    #      （实测 movie.mkv: 28B 好文件 → 12582912B 坏字节，md5 全变），
+    #      而返回信息只说"解压失败"，不会告知目标已被改写。
+    #   对照：zip/tar 路径走暂存目录，失败时目标目录一个字节都没动。
+    #
+    # 现在统一为「解到 staging → 扫链接/越界 → 合并到 target」，与 zip/tar 同构。
+    staging = _make_staging(target, "bs-extract-")
     try:
-        kind = _extract_external(archive, target, password)
+        kind = _extract_external(archive, staging, password)
+        escapes = _scan_escape(staging)
+        if escapes:
+            raise ExtractionError(f"压缩包含指向外部的链接，已拒绝：{escapes[:3]}")
+        _mc: list[str] = []
+        _merge_into(staging, target, _mc)
+        if _mc:
+            logging.getLogger(__name__).warning(
+                "解压时遇到 %d 处类型冲突，你的原有文件已改名保留：%s",
+                len(_mc), "；".join(_mc[:5]),
+            )
         return _finish(kind)
     except ExtractionError as exc:
         return False, str(exc)
+    except (zipfile.BadZipFile, tarfile.TarError) as exc:
+        return False, f"压缩包损坏或格式不匹配：{exc}"
     except Exception as exc:  # noqa: BLE001
         return False, f"{type(exc).__name__}: {exc}"
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def _split_group(archive: Path) -> tuple[str, list[tuple[int, Path]], list[tuple[int, Path]]] | None:
@@ -794,7 +1139,7 @@ def _join_and_extract(base: str, volumes: list[tuple[int, Path]], archive: Path,
             f"目标磁盘空间不足：拼接 {len(volumes)} 个分卷需要 {total_size // (1024 * 1024) + 1} MB "
             f"临时空间（剩余 {free // (1024 * 1024)} MB）——请把 --to 指到空间充足的磁盘后重试"
         )
-    staging = Path(tempfile.mkdtemp(prefix="bs-join-", dir=str(target)))
+    staging = _make_staging(target, "bs-join-")
     try:
         joined = staging / base
         _join_split(volumes, joined)
@@ -816,20 +1161,131 @@ def _join_and_extract(base: str, volumes: list[tuple[int, Path]], archive: Path,
             staging.rmdir()
 
 
-def _merge_into(staging: Path, target: Path) -> None:
-    """把暂存目录内容合并到目标（同名文件覆盖）。"""
+#: Windows **保留设备名**。不区分大小写，且**带扩展名也算**（`CON.txt` 同样是设备）。
+#: 写入这些名字时 `open()` 会"成功"、`exists()` 为 True，但数据被设备吞掉 → size=0。
+_WIN_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+    "CONIN$", "CONOUT$",
+}
+
+#: Windows 文件名里禁止出现的字符
+_WIN_BAD_CHARS = set('<>:"|?*') | {chr(i) for i in range(32)}
+
+
+def _windows_unsafe_reason(name: str) -> str:
+    """判断单个路径分量是否为 Windows 上无法安全创建的名字。
+
+    返回空串 = 安全；否则返回原因（用于日志）。
+
+    ## 为什么必须拦截（P0，兼容性 Agent 实测）
+
+    Windows 把 `CON`/`NUL`/`AUX`/`COM1..9`/`LPT1..9` 永久保留给设备。
+    `open("NUL", "w")`、`open("CON", "w")` 都会**成功返回**，但写进去的字节
+    全被丢弃 —— 于是：
+        * `open()` 不报错  → 我们以为写成功了
+        * `exists()` 为 True（其实是设备）
+        * 但 `size == 0`   → **数据全丢**
+
+    实测（含 5 个保留名的 tar 恢复到 Windows）：
+        CON / NUL / AUX / CON.txt → exists=True size=0（数据丢失）
+        normal.txt               → 完全缺失（连带丢失）
+
+    同类还有：
+        * 非法字符 `< > : " | ? *` → `open()` 报 OSError，整包解压失败
+        * 结尾是空格或点 → Windows 自动剥掉，导致名字冲突
+    """
+    if not name or name in (".", ".."):
+        return ""
+    # 非法字符
+    bad = [c for c in name if c in _WIN_BAD_CHARS]
+    if bad:
+        return f"含 Windows 非法字符 {bad!r}"
+    # 结尾空格/点（Windows 会静默剥掉，与同目录另一项撞名）
+    if name != name.rstrip(" ."):
+        return "以空格或点结尾（Windows 会静默剥掉）"
+    # 保留设备名：取扩展名之前的部分判断（CON.txt 也是设备）
+    stem = name.split(".", 1)[0].upper()
+    if stem in _WIN_RESERVED:
+        return f"{stem} 是 Windows 保留设备名"
+    return ""
+
+
+def _safe_component(name: str) -> str:
+    """把 Windows 上不安全的名字改成一个可安全落盘的名字。
+
+    策略：**保留原名可辨识部分**，加 `_renamed` 后缀并替换非法字符。
+    这样用户能看出「这里原本叫什么」，不至于以为文件丢了。
+    """
+    out = "".join("_" if c in _WIN_BAD_CHARS else c for c in name).rstrip(" .")
+    if not out:
+        out = "_"
+    stem, dot, ext = out.partition(".")
+    if stem.upper() in _WIN_RESERVED:
+        stem = f"{stem}_renamed"
+    return stem + dot + ext
+
+
+def _merge_into(staging: Path, target: Path, conflicts: list[str] | None = None) -> None:
+    """把暂存目录内容合并到目标。
+
+    ## 绝不静默删除用户数据（S0，代码审查 Agent 实测）
+
+    旧实现在两类冲突上直接删用户的东西：
+
+        # 目标里 `data` 是**用户的文件**，包里是**目录**
+        if dest.exists() and not dest.is_dir():
+            dest.unlink()                   # ← 用户文件被删
+        ...
+        # 目标里是**含 2 个文件的目录**，包里是**文件**
+        if dest.is_dir():
+            shutil.rmtree(dest)             # ← 用户整个目录被删
+
+    两处都返回 `ok=True`、无任何提示。**原生 7z 在同样情况下是 rc=2 拒绝覆盖、
+    用户数据一动不动**。灾难恢复场景（往已有备份目录补解压）会静默丢数据。
+
+    ## 修法
+
+    * 普通同名文件 → 覆盖（这是恢复的预期行为，用户就是想拿回这份文件）
+    * **类型冲突**（文件 vs 目录）→ 把用户原有项改名成 `*.conflict-<n>` 保留，
+      再放入包里那份，并记进 `conflicts` 让上层告知用户
+    * 目录递归合并（不删）
+    """
     for item in staging.iterdir():
         dest = target / item.name
-        if item.is_dir() and not item.is_symlink():
-            if dest.exists() and not dest.is_dir():
-                dest.unlink()
-            if dest.is_dir():
-                _merge_into(item, dest)
+        # **所有落盘操作都走长路径前缀**（S0，核对 Agent）：
+        # Windows 上 target 可能超过 260 字符，`shutil.move` / `iterdir` /
+        # `exists` 全都会失败，于是整包解不出来。
+        lp_dest = long_path(dest)
+        item_is_dir = item.is_dir() and not item.is_symlink()
+
+        if item_is_dir:
+            if os.path.exists(lp_dest) and not os.path.isdir(lp_dest):
+                # 文件 ↔ 目录冲突：保留用户的文件，改名让位
+                _park_conflict(dest, conflicts)
+                shutil.move(str(item), lp_dest)
+            elif os.path.isdir(lp_dest):
+                _merge_into(item, dest, conflicts)
             else:
-                shutil.move(str(item), str(dest))
+                shutil.move(str(item), lp_dest)
         else:
-            if dest.is_dir():
-                shutil.rmtree(dest)
-            elif dest.exists():
-                dest.unlink()
-            shutil.move(str(item), str(dest))
+            if os.path.isdir(lp_dest):
+                # 目录 ↔ 文件冲突：保留用户的目录，改名让位
+                _park_conflict(dest, conflicts)
+            elif os.path.exists(lp_dest):
+                os.unlink(lp_dest)  # 同名文件：恢复的本意就是拿回它，覆盖合理
+            shutil.move(str(item), lp_dest)
+
+
+def _park_conflict(dest: Path, conflicts: list[str] | None) -> None:
+    """把目标处已有的项改名保留（`<名>.conflict-<n>`），绝不删除。"""
+    n = 1
+    while True:
+        parked = dest.with_name(f"{dest.name}.conflict-{n}")
+        if not os.path.exists(long_path(parked)):
+            break
+        n += 1
+    shutil.move(long_path(dest), long_path(parked))
+    if conflicts is not None:
+        conflicts.append(f"{dest.name} → {parked.name}（类型冲突，你的原文件已保留）")

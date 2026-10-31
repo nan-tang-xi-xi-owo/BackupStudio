@@ -697,13 +697,28 @@ class TestP1BSweepOrphans:
 
         dest = tmp_path / "bak"
         dest.mkdir()
-        # ① 死 pid 的残包：动态找一个"当前确实不存在"的 pid（固定值有极低概率撞上活进程，
-        #    撞上就会让用例随机失败——实证优先，不靠猜）
-        dead_pid = 999999
-        for cand in (999999, 999998, 888888, 777777, 400000, 300000):
-            if not psutil.pid_exists(cand):
-                dead_pid = cand
-                break
+        # ① 死 pid 的残包：**用一个刚退出的真实子进程的 pid**（语义最准）。
+        #
+        # 旧写法从固定候选里挑一个"当前不存在"的 pid —— 但 Windows 的 pid 是
+        # **循环复用**的：若测试执行期间系统恰好在新进程上复用了那个 pid，
+        # `_pid_alive` 返回 True → 残包按"活进程"保护 → 断言失败。
+        # 实测偶发（全量 4 轮里出现过 1 次）。
+        #
+        # 用刚退出的子进程 pid：它曾是真进程、现在确实已死，且短期内不会被复用。
+        import subprocess as _sp
+        import sys as _sys
+
+        _probe = _sp.Popen([_sys.executable, "-c", "pass"])
+        _probe.wait()
+        dead_pid = _probe.pid
+        # 二次确认：若已被复用则换一个（不误报失败）
+        _deadline = time.time() + 2.0
+        while psutil.pid_exists(dead_pid) and time.time() < _deadline:
+            _probe2 = _sp.Popen([_sys.executable, "-c", "pass"])
+            _probe2.wait()
+            dead_pid = _probe2.pid
+        if psutil.pid_exists(dead_pid):
+            pytest.skip(f"pid {dead_pid} 被系统复用，本次无法构造确定的死 pid")
         dead = dest / f"T.zip.bs-tmp-{dead_pid}"
         dead.write_bytes(b"x" * 128)
         old = time.time() - 600  # 已过 5 分钟闸门

@@ -10,6 +10,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import threading
@@ -296,6 +297,63 @@ def _verify_7z_py7zr(main: Path, password: str | None) -> tuple[bool | None, str
     return False, f"py7zr 校验失败：条目 {bad} 的 CRC 不匹配"
 
 
+def _assert_bare_tar_eof(path: Path) -> None:
+    """确认**裸 tar** 的末尾是真正的「归档结束」标记（红队 F1，P0）。
+
+    ## 缺陷
+
+    `tarfile` 读到全零块头就认为归档结束 —— 如果文件被**截断在某个 512 边界、
+    且落点恰好是零填充**（文件数据块之后的 padding、或空目录项之后），
+    tarfile 会当成「正常结束」，返回已读到的那些成员，**完全不知道后面还有
+    内容被截掉**。
+
+    实测（5 个 512 字节文件，逐个边界截断）：
+        截断到 512/1536/2560/3584 字节 → verify 返回 **passed**
+        但成员数只有 1/2/3/4（应为 5）→ 尾部文件全丢而界面全绿
+
+    对照：压缩过的 tar.gz 不会中招（gzip 流尾 CRC 会报错）。所以这是**裸 tar 特有**。
+
+    ## 判据
+
+    tar 的规范结束标记是**两个连续的全零 512 块**。正常写出的 tar 末尾通常是
+    「数据 + 零填充到块 + 至少两个零块」，且总长是 512 的整数倍。
+
+    但**「末尾有两个零块」还不够** —— 截断到 512（只有目录头那块）时，
+    那 512 字节本身可能不是零块。真正能区分的是：
+
+      * **文件总长必须是 512 的整数倍**（截断到非块边界必然不是）
+      * **末尾必须存在至少两个全零块**（正常结束标记）
+
+    两者同时满足才是「有完整结束标记的 tar」。截断到 512/1536/2560/3584 时，
+    末尾那块是**数据或文件头**（非全零）→ 判失败。
+
+    抛 `ValueError` 让上层 `except Exception` 归类为校验失败。
+    """
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise ValueError(f"无法读取文件大小：{exc}") from exc
+
+    if size == 0:
+        raise ValueError("空文件（0 字节），不是有效 tar")
+    if size % 512 != 0:
+        raise ValueError(
+            f"tar 长度 {size} 不是 512 的整数倍（{size % 512} 字节余数）"
+            "——文件被截断，缺少完整的归档结束标记"
+        )
+
+    # 末尾至少要有两个全零块（1024 字节）
+    tail_len = min(1024, size)
+    with open(path, "rb") as fh:
+        fh.seek(size - tail_len)
+        tail = fh.read(tail_len)
+    if tail != bytes(tail_len):
+        raise ValueError(
+            "tar 末尾不是全零结束块 ——文件被截断，尾部内容已丢失"
+            "（tarfile 会把它误当成正常结束）"
+        )
+
+
 def verify_archive(main: Path, fmt: str, password: str | None = None) -> tuple[bool | None, str]:
     """校验压缩包完整性。
 
@@ -453,6 +511,16 @@ def verify_archive(main: Path, fmt: str, password: str | None = None) -> tuple[b
                         if f is not None:
                             while f.read(1 << 20):
                                 pass
+            # **只有裸 tar 才做「结束标记」检查**（红队 F1，P0）。
+            #
+            # 不压缩的 tar 没有流尾 CRC：tarfile 读到零块就停 —— 截断在 512 边界
+            # 且落点是零填充时会被误判为「正常结束」，尾部文件静默丢失而 verify 全绿。
+            #
+            # **压缩过的 tar（tar.gz/bz2/xz）绝不能走这个检查**：它们的文件长度
+            # 取决于压缩率（实测 1150 字节），根本不是 512 的倍数；而且它们已有
+            # 更强的保证 —— 上面「把压缩流独立解压到 EOF」会触发流尾 CRC，截断必报错。
+            if fmt == "tar":
+                _assert_bare_tar_eof(main)
             return True, f"{count} 个条目校验通过（内容已读透）"
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
@@ -469,13 +537,19 @@ class CleanupItem:
     files: list[str]
     size: int
     mtime: float
-    managed: bool = False  # True = 可信备份（计入份数，可自动淘汰）；False = 旧包/不可信
+    managed: bool = False  # True = 有已提交（committed）清单；**不等于**「可计入配额」
     complete: bool = True  # False = 缺卷/残包
     stem: str = ""  # manifest stem（managed 时用于清单清理）
     reclaimable: bool = False  # True = 不可信但可回收（committing / partial / unverified）
     # manifest 状态（committed / committing / partial / unverified；无清单时为空串）。
     # P0 修复必需：仅凭 reclaimable 无法区分「中断/失败残包」与「只是没验过」。
     state: str = ""
+    # 「可计入 keep_last 配额」的**唯一**判据（S2，数据丢失级）。
+    # 只有 committed + 卷齐全（complete）才是「一份完整可信备份」。幽灵组（清单在、
+    # 卷全丢）与缺卷残包都是 False：它们不占配额，但由 incomplete 桶负责回收。
+    countable: bool = False
+    # 清单已提交、但卷不齐（含卷全丢的幽灵组）：不占配额，可被回收清理。
+    incomplete: bool = False
 
 
 def _is_unverified(b: CleanupItem) -> bool:
@@ -512,6 +586,26 @@ def find_backup_blobs(task: BackupTask) -> list[CleanupItem]:
     from .util import sanitize_component
 
     task_prefix = sanitize_component(task.name or "").lower()
+    # 同目录下**其它任务**的名字：用来排除「前缀相同但其实是别人」的包
+    # （P0：ackup 不能吞 ackup_photos_2026…。仅靠名字形状无法区分，
+    #  必须知道「另一个任务叫什么」才能判准。）
+    other_prefixes: tuple[str, ...] = ()
+    try:
+        from .paths import config_dir
+        from .store import TaskStore
+
+        _all = TaskStore(config_dir() / "tasks.json").list_tasks()
+        other_prefixes = tuple(
+            sorted(
+                {
+                    sanitize_component(t.name or "").lower()
+                    for t in _all
+                    if t.id != task.id and t.name
+                }
+            )
+        )
+    except Exception:  # noqa: BLE001 - 拿不到任务列表就退化为「只看自己前缀」
+        other_prefixes = ()
     blobs: list[CleanupItem] = []
     for g in collect_groups(folder, ext, fmts=all_exts):
         # 只保留与该任务格式匹配的组（后缀启发式组）；manifest 组按 fmt 字段过滤
@@ -522,7 +616,7 @@ def find_backup_blobs(task: BackupTask) -> list[CleanupItem]:
             if g.manifest.task_id:
                 if g.manifest.task_id != task.id:
                     continue
-            elif not _group_belongs_to_name(g, task_prefix):
+            elif not _group_belongs_to_name(g, task_prefix, other_prefixes):
                 continue
             mtime = g.committed_at or (min(f.stat().st_mtime for f in g.files) if g.files else 0.0)
         else:
@@ -530,7 +624,7 @@ def find_backup_blobs(task: BackupTask) -> list[CleanupItem]:
                 continue
             # 无清单旧包：按归档名前缀归属（`{name}_{datetime}` 模板保证前缀可判；
             # 同秒重名的 `_N` 后缀与分卷 `.partNN` 都在前缀之后，天然满足）
-            if task_prefix and not _group_belongs_to_name(g, task_prefix):
+            if task_prefix and not _group_belongs_to_name(g, task_prefix, other_prefixes):
                 continue
             mtime = g.committed_at
         blobs.append(
@@ -544,18 +638,67 @@ def find_backup_blobs(task: BackupTask) -> list[CleanupItem]:
                 stem=g.stem,
                 reclaimable=g.reclaimable,
                 state=(g.manifest.state if g.manifest is not None else ""),
+                countable=g.countable,
+                incomplete=g.incomplete,
             )
         )
     return sorted(blobs, key=lambda b: b.mtime)
 
 
-def _group_belongs_to_name(g, task_prefix: str) -> bool:
-    """归档组是否属于该任务（按主文件名前缀判断）。
+#: 产物主名尾部的时间戳形状：``YYYYMMDD_HHMMSS``（可选 ``_序号`` 去重后缀）。
+#: `_group_belongs_to_name` 用它做**精确**归属判定，而不是裸前缀匹配。
+_STAMP_RE = re.compile(r"^_(\d{8}_\d{6})(?:_\d+)?$")
 
-    前缀匹配用组内文件的主名（collect_groups 已去掉分卷/重名后缀）；任务名
-    互为前缀（Task / TaskA）时要求前缀后紧跟分隔符 `_`，避免 Task 任务误认领
-    TaskA_2026… 的包。
+
+def _group_belongs_to_name(g, task_prefix: str, other_prefixes: tuple[str, ...] = ()) -> bool:
+    """归档组是否属于该任务。
+
+    ## 为什么不能用裸前缀 + `_` 判定（P0，保留策略 Agent 实测）
+
+    旧实现：
+
+        base == prefix or (base.startswith(prefix) and base[len(prefix)] == "_")
+
+    对 `Task` / `TaskA` 有效（次字符是 `A`），但对**下划线分隔的多段名无效**：
+
+        task_prefix = "backup"
+        base        = "backup_photos_20261029_120000"
+        startswith("backup") → True
+        base[6]              → "_"     ← 命中！
+
+    实测后果：`backup` 任务跑一次保留策略，就按自己的配额把 `backup_photos`
+    的包（**包括它唯一的一份**）删掉，`backup_photos` 归零。
+
+    触发窗口正是**升级用户**：`task_id` 是 1.1 才引入的清单字段，历史清单没有，
+    只能靠名字判定归属。两个任务共用备份目录 + 名字有公共前缀即命中。
+
+    ## 修法：前缀之后**不能是「另一个任务的名字 + 分隔符」**
+
+    产物名恒为 ``<任务名>_<后缀>``。真正要排除的是「剩余部分其实是**别的任务名**
+    的开头」，这才是 `backup` 吞掉 `backup_photos_2026…` 的机理。
+
+    因此判定改为：
+      1. 剩余部分 == ``_YYYYMMDD_HHMMSS[_序号]`` → **归属**（产品标准形状）
+      2. 剩余部分的**第一段**（到下一个 ``_`` 为止）全部是数字 → **归属**
+         （``mt`` + ``_legacy0`` 例外？不 —— 见下）
+      3. 否则 → **不归属**（`backup` 对 `backup_photos_…`：首段 `photos` 非数字）
+
+    但 ``mt_legacy0.zip`` 相对任务 ``mt`` 的剩余是 ``_legacy0``，首段 ``legacy0``
+    也不是数字 —— 而它**确实是 ``mt`` 任务的旧包**（测试与升级用户都依赖这个）。
+
+    → 所以仅靠名字无法区分 ``mt`` 的 ``mt_legacy0`` 与 ``backup`` 的
+      ``backup_photos_2026``。二者形状相同，**信息不足**。
+
+    ## 最终判据：**用已知任务名做排除**（信息最全，且不误伤）
+
+    调用方（`find_backup_blobs`）能拿到「同一目录下所有任务的 name」。
+    判据改为：剩余部分若以**另一个任务名**开头（后接 ``_`` 或结束），
+    且那个名字比本任务名更长 → 判为别人的包。
     """
+    return _belongs(g, task_prefix, other_prefixes)
+
+
+def _belongs(g, task_prefix: str, others: tuple[str, ...]) -> bool:  # noqa: ANN001
     if not task_prefix:
         return True
     for f in g.files:
@@ -565,8 +708,25 @@ def _group_belongs_to_name(g, task_prefix: str) -> bool:
             if i >= 0:
                 base = base[:i]
                 break
-        if base == task_prefix or (base.startswith(task_prefix) and base[len(task_prefix) : len(task_prefix) + 1] == "_"):
-            return True
+        if not base.startswith(task_prefix):
+            continue
+        rest = base[len(task_prefix) :]
+        if not rest:
+            continue
+        # 若剩余部分其实是**另一个任务的完整名**开头 → 别人的包（P0 修复核心）
+        stolen = False
+        for other in others:
+            if not other or other == task_prefix or len(other) <= len(task_prefix):
+                continue
+            if not other.startswith(task_prefix):
+                continue
+            tail = other[len(task_prefix) :]
+            if rest == tail or rest.startswith(tail + "_"):
+                stolen = True
+                break
+        if stolen:
+            continue
+        return True
     return False
 
 
@@ -633,6 +793,7 @@ def apply_retention(
                     mtime=time.time(),
                     managed=True,  # 本轮刚产出的托管组（清单稍后/刚写入）——只为计数
                     complete=True,
+                    countable=True,  # 本轮产物卷已全部落盘 → 它占一个 keep_last 配额
                     stem="",  # 无清单：删除环节本就会跳过，且不会去 delete_manifest
                 )
             )
@@ -644,16 +805,22 @@ def apply_retention(
     def _protected(b: CleanupItem) -> bool:
         return any(str(Path(f).resolve()).lower() in protected_set for f in b.files)
 
-    # 三类对象必须分开算（审查 A3 + P0 回归）：
-    # * trusted     —— 可信备份（manifest 状态 = committed）：**唯一**计入份数/天数/总量的对象；
+    # 五类对象必须分开算（审查 A3 + P0 回归 + S2）：
+    # * trusted     —— 可信备份（manifest committed **且卷齐全**）：**唯一**计入份数/天数/
+    #                  总量的对象。S2 修复前这里用的是 `managed`（只要求 committed），
+    #                  于是幽灵组（清单在、卷全丢，files=[]）也占一个配额：实测
+    #                  keep_last=2 + 1 个幽灵组 → 只剩 1 份真备份（静默多删一份）。
     # * unverified  —— 「写完了但没验过」（verify=False 的产物）：**也是一份备份**，
     #                  必须计入份数。否则 verify=False 的用户每次备份都会把上一份当残包删掉
-    #                  （P0 数据丢失：实测 keep_last=30 连跑 3 次只剩 1 份）；
-    # * junk        —— 中断/失败残组（committing / partial）：不是备份，也不该永久占盘 → 回收；
+    #                  （P0 数据丢失：实测 keep_last=30 连跑 3 次只剩 1 份）。
+    #                  与 trusted 一样要求卷齐全——缺卷的 unverified 也恢复不了。
+    # * incomplete  —— 清单已提交/未验证但**卷不齐**（含卷全丢的幽灵组）：S2 新增。
+    #                  不是「一份完整备份」→ **不占配额**；但占着清单和盘 → 可回收（见下）。
+    # * junk        —— 中断/失败残组（committing / partial 状态）：不是备份，也不该永久占盘 → 回收；
     # * legacy      —— 无清单旧包：E5 红线，默认只读（include_legacy=True 才参与淘汰）。
     # 本次刚产出的组即使在 retention 时仍是 committing，也必须按"一份备份"计入份数，
     # 否则 keep_last 永远少算一份（原实现的 protected 兜底就是这个作用，不能丢）。
-    trusted = [b for b in blobs if b.managed or _protected(b)]
+    trusted = [b for b in blobs if b.countable or _protected(b)]
     junk = [
         b
         for b in blobs
@@ -662,17 +829,57 @@ def apply_retention(
     unverified = [
         b
         for b in blobs
-        if b.reclaimable and not b.managed and not _protected(b) and _is_unverified(b)
+        if b.reclaimable
+        and not b.managed
+        and not _protected(b)
+        and _is_unverified(b)
+        and b.complete  # 缺卷的 unverified 同样不占配额（S2）
+    ]
+    # incomplete：**卷不齐**的组——含「卷全丢」的幽灵组，以及缺卷的 unverified。
+    # 刻意用 `managed or _is_unverified` 收口（committing/partial 已经在 junk 桶里），
+    # 且不在 junk/unverified 桶里重复出现（它们的判据都要求 complete 或非 managed）。
+    incomplete = [
+        b
+        for b in blobs
+        if not _protected(b) and not b.complete and (b.managed or _is_unverified(b))
     ]
     legacy = [b for b in blobs if not b.managed and not b.reclaimable and not _protected(b)]
     trusted += unverified  # 无条件计入：没验过 ≠ 不是备份
     trusted += legacy if include_legacy else []
     trusted.sort(key=lambda b: b.mtime)
     junk.sort(key=lambda b: b.mtime)
+    incomplete.sort(key=lambda b: b.mtime)
 
     expired: list[CleanupItem] = []
     # 0) 中断/失败残组：不是备份 → 直接回收（在飞的本次产物除外；默认 move 到回收目录，可反悔）
     expired.extend(junk)
+    # 0b) 残包（审查 S2）：卷不齐 → 不是一份完整备份，不占 keep_last 配额，但必须能回收，
+    #     否则「空清单永久占盘」。两种情形处置不同：
+    #     * 幽灵组（files 为空）：盘上没有任何用户数据，只剩一份**孤儿清单** → 回收
+    #       （实际动作只是删掉那个 .json，不碰任何备份文件）；
+    #     * 缺卷残包（还有部分卷）：已无法完整恢复，但卷本身仍是用户数据 → 只在**已被一份
+    #       更新的完整备份取代**时才回收。这样既清得掉垃圾，又不会因为"备份盘瞬时不可读 →
+    #       全部卷被误判缺失"而把用户唯一的一份备份清走（默认 move 模式还会先进回收站）。
+    newest_complete = max((b.mtime for b in trusted), default=0.0)
+    # 幽灵清单的回收闸门：**目录里必须至少有一份看得见的完整备份**才动手。
+    # 理由：`collect_groups` 用 `Path.is_file()` 判定卷在不在，而 pathlib 在 OSError
+    # （网络盘掉线、介质尚未挂载、权限瞬时收紧）时**返回 False 而不抛异常**。那种时刻
+    # 所有清单的卷会"同时消失"——如果照样把清单全删了，用户的备份会退化成无清单旧包，
+    # 从此受 E5 迁移红线保护而**永不自动清理**（磁盘悄悄涨），且丢失全部元数据。
+    # 要求"存在一份完整备份"等价于"此刻这个卷确实读得出来"，是廉价而有效的健全性检查。
+    directory_trustworthy = bool(trusted)
+    for b in incomplete:
+        if not b.files:
+            if directory_trustworthy:
+                expired.append(b)  # 幽灵组：只有孤儿清单，删除不触及任何备份文件
+            else:
+                log.warning(
+                    "跳过回收幽灵清单 %s：本目录没有可见的完整备份，"
+                    "卷可能只是瞬时不可读（若是真的丢了，请手动清理该 .json）",
+                    b.stem,
+                )
+        elif b.mtime < newest_complete:
+            expired.append(b)  # 缺卷残包，且已被更新的完整备份取代
 
     if not trusted and not expired:
         return []
@@ -893,7 +1100,15 @@ def sweep_orphans(destinations: Iterable[Path | str]) -> list[Path]:
                 continue  # 原则 2：还可能是活的，或没到兜底年龄
             try:
                 if entry.is_dir() and not entry.is_symlink():
-                    shutil.rmtree(entry)
+                    # force_rmtree 而非裸 rmtree：暂存目录里可能有只读文件，
+                    # 裸 rmtree 遇 WinError 5 会静默失败 → 明文永久残留
+                    # （用户测试 P0：源含只读文件时，加密备份旁永久留明文副本）
+                    from .staging import force_rmtree
+
+                    if not force_rmtree(entry):
+                        log.warning(
+                            "清扫崩溃残包未删净（可能仍含明文）：%s", entry
+                        )
                 else:
                     entry.unlink()
                 removed.append(entry)
@@ -1174,7 +1389,8 @@ class TaskEngine:
         # 3b. 空间检查（审查 E1-1.8/D-f6）：按后端形态估磁盘峰值——
         # 外部 7z/rar 需 源tar + 成品 两份（≈2×）；内置引擎 ≈1×；
         # 通用分卷再乘一份完整成品的余量。不足时阻止（不再只 warning）。
-        needed = sum(i.size for i in items)
+        # 只累加非目录条目：目录 size 是子树合计，加进来会重复计数
+        needed = sum(i.size for i in items if not i.is_dir)
         avail = free_space(dest_dir)
         if avail and needed:
             external = engine_choice.name.startswith(("7z:", "rar"))
@@ -1290,6 +1506,20 @@ class TaskEngine:
         record.duration = round(time.monotonic() - started, 2)
         if record.status != "failure":
             record.status = "success" if record.verification != "failed" else "failure"
+
+        # 6b. 有文件因「被占用 / 无权限」被跳过时，**不能报 success**（用户测试 P0）：
+        #     实测：Excel/PSD 打开着的文件会被跳过，其余文件正常备份，但旧实现
+        #     仍然 status=success + verification=passed。用户看到绿勾就去睡觉，
+        #     真出事时才发现那几份关键文档根本不在包里。
+        #     语义上这是「部分完成」——用 partial，并把清单留在 warnings/errors 里。
+        _busy = getattr(result, "skipped_busy", None) or []
+        if _busy and record.status == "success":
+            record.status = "partial"
+            record.errors.append(
+                f"有 {len(_busy)} 个文件未备份（被占用或无权限）："
+                + "；".join(_busy[:5])
+                + ("…" if len(_busy) > 5 else "")
+            )
 
         # 7. 保留策略（只用「是否刚生成」作保护，旧的同名包照常淘汰）
         #    仅在**本轮成功**时执行（审查 W-A1-4 c9，数据丢失级）：

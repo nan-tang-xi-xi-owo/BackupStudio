@@ -174,6 +174,13 @@ def _run_gui_inner(start_minimized: bool = False, open_new: bool = False) -> int
     app.setDesktopFileName("io.github.backupstudio.BackupStudio")
     app.setWindowIcon(app_icon())
     app.setQuitOnLastWindowClosed(False)
+    # 1.1.2：安装中文翻译 —— 否则 QMessageBox 的标准按钮显示 OK/Cancel/&Yes/&No
+    try:
+        from .gui import install_translator
+
+        install_translator(app)
+    except Exception:  # noqa: BLE001 —— 翻译缺失不影响启动
+        log.debug("Qt 中文翻译加载失败", exc_info=True)
     if getattr(sys, "frozen", False) and sys.platform == "win32":
         try:
             import ctypes
@@ -698,7 +705,22 @@ def _cmd_task(store, args) -> int:  # noqa: ANN001
                 print(f"无法创建备份目录：{exc}", file=sys.stderr)
                 return 2
         store.upsert(task)
-        store.save()
+        # LockTimeout 必须转成人话 + 非 0 退出码（并发 Agent 取证）：
+        # 旧实现锁超时后静默降级、无锁覆写，然后照样打印「已创建任务」并 return 0
+        # —— 用户看到成功，任务却不存在。现在要么真写成，要么明确失败。
+        try:
+            store.save()
+        except Exception as exc:  # noqa: BLE001
+            from .filelock import LockTimeout
+
+            if isinstance(exc, LockTimeout):
+                print(
+                    f"配置正被另一个进程占用，任务未保存：{exc}\n"
+                    "请稍后重试（若持续失败，检查是否有卡住的 backupstudio 进程）。",
+                    file=sys.stderr,
+                )
+                return 1
+            raise
         print(f"已创建任务 {task.id}：{task.name}（{task.schedule.describe()}）")
         return 0
     if args.action == "rm":

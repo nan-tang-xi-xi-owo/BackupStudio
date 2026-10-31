@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QIcon, QPainter
+from . import DARK, LIGHT
+from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtGui import QColor, QIcon, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractButton,
     QComboBox,
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QSizePolicy,
     QStyle,
     QVBoxLayout,
     QWidget,
@@ -34,6 +36,125 @@ class Card(QFrame):
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(*margins)
         self._layout.setSpacing(10)
+
+    # ── 玻璃风格（1.1.3）──────────────────────────────────────
+    # 不用覆盖层控件（会和孙级按钮抢 z-order），直接在本控件 paintEvent
+    # 里画「采样背景 → 模糊 → 色散 → 高光」。
+    _glass_on: bool = False
+    _glass_radius: int = 14
+    _glass_tint: str = "#F7FAFF"
+    _glass_alpha: float = 0.62
+    _glass_dark: bool = False
+
+    def set_glass(self, on: bool, *, radius: int = 14, tint: str = "#F7FAFF",
+                  alpha: float = 0.62, dark: bool = False) -> None:
+        self._glass_on = on
+        if on:
+            self._glass_radius = radius
+            self._glass_tint = tint
+            self._glass_alpha = alpha
+            self._glass_dark = dark
+            # 交给自绘，QSS 背景必须让位。
+            # **必须限定到本控件**：setStyleSheet("background: transparent")
+            # 会被子控件继承 —— 实测下拉框/输入框的边框和底色也被抹掉，
+            # 在玻璃风格下变成没有边框的白方块（用户反馈的边缘不协调之一）。
+            # 交给自绘，QSS 背景让位。限定到本控件（带 objectName），
+            # 避免影响子控件。
+            _n = self.objectName() or "Card"
+            self.setStyleSheet(f"QFrame#{_n} {{ background: transparent; border: none; }}")
+        else:
+            # **必须清掉内联样式**：内联优先级高于全局 QSS，
+            # 残留会让卡片永远透明无边框 —— 表现就是"切风格没区别"
+            # （这是 1.1.3 的真实 bug）。
+            self.setStyleSheet("")
+            self._glass_cache = None
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: ANN001, N802
+        if not self._glass_on:
+            return super().paintEvent(event)
+        from PySide6.QtCore import QPoint, QRect, Qt as _Qt
+        from PySide6.QtGui import QColor, QImage, QLinearGradient, QPainter, QPainterPath, QPixmap
+
+        from .glass import _box_blur, _chromatic, displace
+
+        win = self.window()
+        if win is None:
+            return super().paintEvent(event)
+        # 采样背后（临时隐藏自己避免递归重绘）
+        self.setVisible(False)
+        try:
+            top_left = self.mapTo(win, QPoint(0, 0))
+            pm = QPixmap(self.size())
+            pm.fill(_Qt.GlobalColor.transparent)
+            win.render(pm, QPoint(0, 0), QRect(top_left, self.size()))
+        finally:
+            self.setVisible(True)
+
+        # **缓存**：模糊+色散是整个玻璃效果里最贵的两步（实测 19 张卡
+        # 会让截图脚本跑不动）。按「尺寸 + 窗口内坐标 + 主题」缓存，
+        # 尺寸不变时不重算 —— 拖动/缩放时会重算，滚动不受影响。
+        key = (self.width(), self.height(), top_left.x(), top_left.y(),
+               self._glass_tint, self._glass_dark)
+        cached = getattr(self, "_glass_cache", None)
+        if cached is not None and cached[0] == key:
+            img = cached[1]
+        else:
+            # **降采样再模糊**（1.1.3 性能修复）：模糊结果本就看不出细节，
+            # 先缩到最长边 ~96px 再算，计算量降到约 1/20。
+            # 优化前实测：首屏 12.9s / 切页 12.8s。
+            w0, h0 = pm.width(), pm.height()
+            longest = max(w0, h0)
+            small = pm.toImage()
+            if longest > 96:
+                scale = 96.0 / longest
+                small = small.scaled(max(8, int(w0 * scale)), max(8, int(h0 * scale)),
+                                     _Qt.AspectRatioMode.IgnoreAspectRatio,
+                                     _Qt.TransformationMode.SmoothTransformation)
+            for r in (3, 2, 1):
+                small = _box_blur(small, r)
+            # **折射**：在低分辨率上做位移重采样（便宜且边缘更柔）
+            # 折射加大：0.6 → 1.0，边缘弯折更明显（"水"的感觉来自这里）
+            small = displace(small, radius=18, strength=1.0,
+                             edge=max(8, min(small.width(), small.height()) // 3))
+            small = _chromatic(small, 1)
+            # 放回原尺寸（平滑放大；本来就是模糊图，看不出插值）
+            img = small.scaled(w0, h0, _Qt.AspectRatioMode.IgnoreAspectRatio,
+                               _Qt.TransformationMode.SmoothTransformation)
+            self._glass_cache = (key, img)
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(0.5, 0.5, self.width() - 1, self.height() - 1,
+                            self._glass_radius, self._glass_radius)
+        p.setClipPath(path)
+        # **玻璃的"透"**：模糊层不透明度从 0.92 降到 0.55。
+        # 0.92 等于把背景糊成实心，再叠 tint 就是磨砂白板 ——
+        # 用户反馈"没有那么透、没有水一样的感觉"的根因。
+        p.setOpacity(0.55)
+        p.drawPixmap(0, 0, QPixmap.fromImage(img))
+        p.setOpacity(1.0)
+        tint = QColor(self._glass_tint)
+        tint.setAlphaF(self._glass_alpha)
+        p.fillPath(path, tint)
+        # 顶部高光
+        g = QLinearGradient(0, 0, self.width() * 0.6, self.height())
+        g.setColorAt(0.0, QColor(255, 255, 255, 90 if not self._glass_dark else 46))
+        g.setColorAt(0.35, QColor(255, 255, 255, 22 if not self._glass_dark else 10))
+        g.setColorAt(1.0, QColor(255, 255, 255, 0))
+        p.fillPath(path, g)
+        # 内高光边
+        p.setPen(QColor(255, 255, 255, int(200 * self._glass_highlight)
+                        if hasattr(self, "_glass_highlight") else 180))
+        p.setBrush(_Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(1, 1, self.width() - 2, self.height() - 2,
+                          self._glass_radius, self._glass_radius)
+        p.end()
+        # 调 QFrame.paintEvent 让**子控件**正确合成到父级之上。
+        # （曾误判它盖住玻璃并改成 QWidget.paintEvent —— 实际是测量时
+        #  逻辑坐标读了物理像素截图造成的假象，已订正。）
+        return super().paintEvent(event)
 
     def body(self) -> QVBoxLayout:
         return self._layout
@@ -63,18 +184,21 @@ class Badge(QLabel):
     """小徽章：可用/不可用、状态等。"""
 
     COLORS = {
-        "ok": ("#16A34A", "#DCFCE7"),
-        "warn": ("#B45309", "#FEF3C7"),
-        "bad": ("#B91C1C", "#FEE2E2"),
-        "info": ("#1D4ED8", "#DBEAFE"),
-        "muted": ("#4B5563", "#E5E7EB"),
+        # 1.1.2：改为从 Palette 派生（原值与 Palette 不一致：
+        # Badge 用 #16A34A、StatusPill 用 #22C55E、Palette 用 #127F3A，
+        # 同一语义三个不同绿）
+        "ok": (LIGHT.success, "#DCFCE7"),
+        "warn": (LIGHT.warning, "#FEF3C7"),
+        "bad": (LIGHT.danger, "#FEE2E2"),
+        "info": (LIGHT.accent, "#DBEAFE"),
+        "muted": (LIGHT.text_dim, "#E5E7EB"),
     }
     DARK_COLORS = {
-        "ok": ("#6EE7B7", "#14372B"),
-        "warn": ("#FCD34D", "#3A2E10"),
-        "bad": ("#FCA5A5", "#3B1717"),
-        "info": ("#93C5FD", "#152B4D"),
-        "muted": ("#CBD5E1", "#2A2F3D"),
+        "ok": (DARK.success, "#14372B"),
+        "warn": (DARK.warning, "#3A2E10"),
+        "bad": (DARK.danger, "#3B1717"),
+        "info": (DARK.accent, "#152B4D"),
+        "muted": (DARK.text_dim, "#2A2F3D"),
     }
 
     def __init__(self, text: str = "", kind: str = "muted", parent: QWidget | None = None) -> None:
@@ -117,7 +241,15 @@ class StatusPill(QWidget):
         self.set_state("muted", "")
 
     def set_state(self, kind: str, text: str) -> None:
-        color = {"ok": "#22C55E", "warn": "#F59E0B", "bad": "#EF4444", "run": "#3B82F6"}.get(kind, "#9CA3AF")
+        # 1.1.2：改用 Palette 语义色（原 #22C55E 与 Badge 的 #16A34A、
+        # Palette 的 #127F3A 是三个不同的绿）
+        _pal = DARK if getattr(self, "_dark", False) else LIGHT
+        color = {
+            "ok": _pal.success,
+            "warn": _pal.warning,
+            "bad": _pal.danger,
+            "run": _pal.accent,
+        }.get(kind, _pal.text_dim)
         self.dot.setStyleSheet(f"color: {color}; font-size: 14px;")
         self.text.setText(text)
 
@@ -185,26 +317,89 @@ class Switch(QAbstractButton):
         super().__init__(parent)
         self.setCheckable(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedSize(42, 24)
+        # 1.1.2：42×24 → 46×26（原尺寸低于 WCAG 2.1 AA 的 24×24 底线，
+        # 且 24 高时圆角弧度显得局促）
+        self.setFixedSize(46, 26)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._dark = dark
 
     def set_dark(self, dark: bool) -> None:
         self._dark = dark
         self.update()
 
+    def sizeHint(self) -> QSize:  # noqa: N802
+        return QSize(46, 26)
+
     def paintEvent(self, event) -> None:  # noqa: ANN001, N802
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         on = self.isChecked()
-        track_on = QColor("#4F6BED") if not self._dark else QColor("#7C8CF8")
-        track_off = QColor("#CBD5E1") if not self._dark else QColor("#3A4056")
+        # 1.1.2：改用 Palette（原 track_off 浅色 #CBD5E1 不在 Palette 里）
+        _pal = DARK if self._dark else LIGHT
+        track_on = QColor(_pal.accent)
+        # 关闭态轨道加深，保证与卡片底 ≥1.9:1，一眼能看出"关着"
+        track_off = QColor(_pal.text_dim if self._dark else "#AEB8CC")
+        disabled = not self.isEnabled()
+        if disabled:
+            track_on = QColor(_pal.border)
+            track_off = QColor(_pal.border)
+
+        h = self.height()
+        r = h / 2
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(track_on if on else track_off)
-        p.drawRoundedRect(self.rect(), 12, 12)
-        knob = QColor("#FFFFFF") if not self._dark else QColor("#E6E8F0")
+        p.drawRoundedRect(self.rect(), r, r)
+
+        knob = QColor(_pal.surface if disabled else (_pal.accent_text if self._dark else "#FFFFFF"))
+        d = h - 6
+        x = self.width() - d - 3 if on else 3
         p.setBrush(knob)
-        x = self.width() - 21 if on else 3
-        p.drawEllipse(x, 3, 18, 18)
+        p.drawEllipse(x, 3, d, d)
+
+        # 焦点环（WCAG：焦点必须可见）
+        if self.hasFocus():
+            pen = QPen(QColor(_pal.focus_ring))
+            pen.setWidth(2)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), r - 1, r - 1)
+
+
+class ElideLabel(QLabel):
+    """单行省略号标签：宽度不足时显示 `…`，完整内容放 tooltip。
+
+    1.1.2 新增。改造前长路径/长任务名是**硬截断**（实测副标题需 372px
+    实得 240px，右侧内容直接消失且无提示），用户看不出被截掉了什么。
+    """
+
+    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._full = ""
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(0)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802
+        self._full = text or ""
+        self.setToolTip(self._full)
+        super().setText(self._full)
+
+    def full_text(self) -> str:
+        return self._full
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        s = super().minimumSizeHint()
+        return QSize(24, s.height())
+
+    def paintEvent(self, event) -> None:  # noqa: ANN001, N802
+        from PySide6.QtGui import QPainter as _QP
+
+        p = _QP(self)
+        fm = self.fontMetrics()
+        avail = self.contentsRect().width()
+        txt = fm.elidedText(self._full, Qt.TextElideMode.ElideMiddle, avail) if avail > 0 else ""
+        p.setPen(self.palette().color(self.foregroundRole()))
+        p.drawText(self.contentsRect(), int(self.alignment()), txt)
 
 
 class Combo(QComboBox):

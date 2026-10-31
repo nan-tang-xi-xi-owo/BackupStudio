@@ -23,6 +23,19 @@
   <developer_name>BackupStudio contributors</developer_name>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="1.1.1" date="2026-10-29">
+      <description>
+        <p>数据安全修复版：修掉 22 个「报成功但实际丢数据」的缺陷，其中 3 个灾难级。</p>
+        <ul>
+          <li>FIFO / 设备文件不再让备份永久卡死</li>
+          <li>恢复时「文件 ↔ 目录」重名不再删掉用户文件</li>
+          <li>源文件被占用时不再产出错位坏包（此前会报「校验通过」）</li>
+          <li>并发建任务不再丢失（此前 20 并发丢 90%）</li>
+          <li>裸 tar 截断不再假通过校验</li>
+          <li>Windows 保留名（CON/NUL）与长路径不再静默丢数据</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.1.0" date="2026-10-24">
       <description>
         <p>Trust batch: retention no longer deletes across tasks, tar-family verification detects corruption, split volumes can be restored in-app, encryption state is probed rather than assumed, and cross-process locking was hardened.</p>

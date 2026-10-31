@@ -80,21 +80,44 @@ class TestDirLock:
             "from backupstudio.locks import acquire_dir_lock, LockTimeout\n"
             "try:\n"
             "    lk = acquire_dir_lock(Path(sys.argv[1]), 'race', timeout=0)\n"
-            "    print('ACQUIRED')\n"
-            "    time.sleep(1.0)\n"
+            "    print('ACQUIRED', flush=True)\n"
+            # 持锁时长必须覆盖 p2 的启动窗口（解释器启动 + 导入 + 尝试拿锁，
+            # 在慢 runner 上可达 1 秒以上）。原来 1.0 秒在 CI 上不够 ——
+            # p1 会在 p2 尝试前释放，两个都 ACQUIRED（run #50 Linux job 实证）。
+            "    time.sleep(4.0)\n"
             "    lk.release()\n"
             "except LockTimeout:\n"
-            "    print('TIMEOUT')\n",
+            "    print('TIMEOUT', flush=True)\n",
             encoding="utf-8",
         )
         p1 = subprocess.Popen([sys.executable, str(script), str(tmp_path)],
-                              stdout=subprocess.PIPE, text=True, encoding="utf-8")
-        time.sleep(0.4)  # 确保 p1 先拿到
+                              stdout=subprocess.PIPE, text=True, encoding="utf-8",
+                              bufsize=1)  # 行缓冲：能读到 "ACQUIRED" 那一行
+        # **不能用 time.sleep(0.4) 猜**（CI 上偶发失败）：
+        # 慢 runner 上 p1 可能在 0.4 秒时还没完成解释器启动 + 导入，
+        # p2 就抢先拿到锁 → 互斥判据失败。
+        # 实测：run #50 的 Linux job 因此红（ACQ-STOLEN）。
+        # 改为**阻塞等 p1 明确报告已持锁**，再加一个上限防死等。
+        got = None
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            line = p1.stdout.readline() if p1.stdout else ""
+            if line:
+                got = line.strip()
+                break
+            if p1.poll() is not None:
+                break
+            time.sleep(0.02)
+        assert got == "ACQUIRED", f"p1 未能先持锁（拿到 {got!r}）"
         p2 = subprocess.Popen([sys.executable, str(script), str(tmp_path)],
                               stdout=subprocess.PIPE, text=True, encoding="utf-8")
-        out1, _ = p1.communicate(timeout=30)
+        # p1 的第一行已被上面的 readline() 消费（那是它持锁的证据），
+        # communicate() 只能拿到剩下的；把它拼回去再比较。
+        rest1, _ = p1.communicate(timeout=30)
+        out1 = (got or "") + (rest1 or "")
         out2, _ = p2.communicate(timeout=30)
-        results = sorted([out1.strip(), out2.strip()])
+        results = sorted([out1.strip().splitlines()[0] if out1.strip() else "",
+                          out2.strip().splitlines()[0] if out2.strip() else ""])
         assert results == ["ACQUIRED", "TIMEOUT"], results
 
 

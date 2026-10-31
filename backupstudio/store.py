@@ -302,28 +302,101 @@ class TaskStore:
 
     def save(self) -> None:
         with self._lock:
-            # 加载曾失败且原文件仍在：先保全迁移，禁绝不覆盖（防数据丢失链）
-            if self._load_error is not None and self.path.exists():
-                stamp = datetime.now().strftime("%Y%m%d%H%M%S")
-                rescue = self.path.with_name(self.path.name + f".rescue-{stamp}")
-                try:
-                    self.path.replace(rescue)
-                    log.warning("配置读取曾失败（%s）；原文件已保全为 %s，避免覆写", self._load_error, rescue)
-                except OSError:
-                    log.error("配置读取曾失败且无法保全原文件，取消本次保存以避免覆写 %s", self.path)
-                    raise
-                self._load_error = None
-                self._disk_stamp = self._stat_stamp()
-            else:
-                # 覆写前先看磁盘有没有被外部（CLI/守护进程/另一份界面）改动过：
-                # 有则三方合并，绝不全量覆写掉外部新增/修改的任务（W-A7-2 S1）。
-                # 读不到磁盘内容时 _merge_locked 自行保守跳过（只写自己）。
-                self._merge_from_disk_quiet()
-            data = self._snapshot()
-            save_json_atomic(self.path, data)
-            self._undo.append({"saved_at": data["saved_at"], "data": copy.deepcopy(data["tasks"])})
-            del self._undo[:-20]
-            self._after_write()
+            # **跨进程排他锁**（用户测试 P0：8 并发 task add 只活 1 个）。
+            # 线程锁管不了 CLI/daemon/GUI 多进程；不加这把锁时，8 个进程会
+            # 同时读到同一份旧快照、都认为"无外部改动"，然后各自整体覆写，
+            # 后写者抹掉前写者。实测丢失率 7/8。
+            #
+            # 持锁范围覆盖「读磁盘 → 合并 → 原子写」整段，使读-改-写成为临界区。
+            from .filelock import FileLock
+
+            with FileLock(self.path):
+                # 锁内重读磁盘，干掉 TOCTOU（路径 B）：_load() 的「读内容」与
+                # 「取 (mtime,size) 指纹」不原子，若别的进程在两者之间写盘，
+                # external_changed() 会误判"无外部改动" → 持锁也跳过合并。
+                # 基线一旦出自锁外，锁就白加了。
+                self._save_locked()
+
+
+    def _save_locked(self) -> None:
+        """真正的保存逻辑（调用方必须已持有跨进程锁）。"""
+        # 加载曾失败且原文件仍在：先保全迁移，**再从保全文件回读合并**（P0）。
+        #
+        # 旧实现只做 `path.replace(rescue)` 然后写自己内存里的内容 ——
+        # 而内存是空的（正是"加载失败"导致的），于是 **10 个任务只剩本次这 1 个**。
+        # 红队实测：一次瞬态 OSError（Windows 上 os.replace 与 open 的共享冲突，
+        # `save_json_atomic` 自己都为此重试 12 次，说明这个瞬态是**已知会发生的**）
+        # 就能让用户任务整库消失，且 rc=0。
+        #
+        # 保全方向（不覆写）是对的，但**保全之后必须把能读出来的都读回来**。
+        if self._load_error is not None and self.path.exists():
+            stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            rescue = self.path.with_name(self.path.name + f".rescue-{stamp}")
+            try:
+                self.path.replace(rescue)
+                log.warning("配置读取曾失败（%s）；原文件已保全为 %s，避免覆写", self._load_error, rescue)
+            except OSError:
+                log.error("配置读取曾失败且无法保全原文件，取消本次保存以避免覆写 %s", self.path)
+                raise
+            self._load_error = None
+            # **关键：从保全文件回读，把用户原有的任务救回来**
+            try:
+                recovered = load_json(rescue, {})
+                if isinstance(recovered, dict) and isinstance(recovered.get("tasks"), list):
+                    self._merge_locked(recovered)
+                    log.warning(
+                        "已从保全文件 %s 回读并合并 %d 个任务（避免整库丢失）",
+                        rescue.name,
+                        len(recovered.get("tasks") or []),
+                    )
+            except Exception as exc:  # noqa: BLE001 - 回读失败也不能阻止保存
+                log.error("从保全文件回读失败（任务可能仍需人工从 %s 恢复）：%s", rescue.name, exc)
+            self._disk_stamp = self._stat_stamp()
+        else:
+            # **锁内无条件重读磁盘再合并**（TOCTOU 修复，并发 Agent 验证的形状）。
+            #
+            # 旧写法 `self._merge_from_disk_quiet()` 先问 `external_changed()`，
+            # 而它按 `(mtime, size)` 指纹判断 —— 指纹撞车率实测 2.6%（300 次
+            # os.replace 有 10 次相邻指纹完全相同），且 `_load()` 里「读内容」与
+            # 「取指纹」本身不原子（读在加锁之前）：
+            #   A 读到旧内容 → B 写盘 → A 才 stat 到新文件 → 判定"无外部改动"
+            #   → **持锁也跳过合并** → 整库覆写。
+            # 确定性复现：A、B 全程都持锁，TASK-B 仍被静默抹掉。
+            #
+            # 现在锁已经拿到了，磁盘就是权威 —— 无条件读、无条件合并。
+            # **注意：整个过程只合并这一次**（早前版本在 save() 里再加一次
+            # `_reload_under_lock()`，造成双重合并 → 20 并发丢 93%，已回滚）。
+            self._merge_from_disk_locked()
+        data = self._snapshot()
+        save_json_atomic(self.path, data)
+        self._undo.append({"saved_at": data["saved_at"], "data": copy.deepcopy(data["tasks"])})
+        del self._undo[:-20]
+        self._after_write()
+
+    def _merge_from_disk_locked(self) -> None:
+        """**锁内**无条件重读磁盘并合并（TOCTOU 修复）。
+
+        与 `_merge_from_disk_quiet()` 的区别：**不问 `external_changed()`**。
+        锁已经在手，磁盘就是当前真相，指纹判断只会带来漏判（实测撞车率 2.6%，
+        且「读内容」与「取指纹」不原子）。
+
+        读失败时保持保守：只写自己内存里的内容，绝不清空别人的任务。
+        """
+        try:
+            disk_raw = load_json(self.path, {})
+        except Exception as exc:  # noqa: BLE001 - 瞬态读失败：保守，只写自己
+            log.warning("锁内读取磁盘失败（本次只写自己内存的内容）：%s", exc)
+            return
+        before = set(self.tasks)
+        try:
+            self._merge_locked(disk_raw)
+        except Exception as exc:  # noqa: BLE001 - 合并异常不应阻止保存
+            log.warning("锁内合并外部改动失败（本次只写自己内存的内容）：%s", exc)
+            return
+        self._disk_stamp = self._stat_stamp()
+        if set(self.tasks) - before:
+            # 界面这次保存吸收到外部任务：让下一次轮询刷新列表（不丢显示）
+            self._absorbed_on_save = True
 
     def _merge_from_disk_quiet(self) -> None:
         """把磁盘内容三方合并进内存；任何读取异常都按"无外部改动"处理。"""
@@ -432,17 +505,24 @@ class TaskStore:
         with self._lock:
             if not self._undo:
                 return False
-            snapshot = self._undo.pop()
-            self.tasks = {}
-            for item in snapshot["data"]:
-                t = BackupTask.from_dict(item)
-                self.tasks[t.id] = t
-            # 回退是"用旧快照覆盖"，同样先合并：否则撤销一次保存会顺手抹掉
-            # 期间外部（CLI/守护进程）新增的任务。旧快照的字段仍然优先（d == 基线 → 用内存）。
-            self._merge_from_disk_quiet()
-            data = self._snapshot()
-            save_json_atomic(self.path, data)
-            self._after_write()
+            # **必须持跨进程锁**（并发 Agent 确定性复现）：
+            # 这是全仓库唯一一条「锁外整库写」路径。不加锁时与 `save()` 并发会
+            # 互相覆写 —— 实测 CLI 打印「已创建任务」rc=0，随后被 GUI 的 undo
+            # 静默抹掉。
+            from .filelock import FileLock
+
+            with FileLock(self.path):
+                snapshot = self._undo.pop()
+                self.tasks = {}
+                for item in snapshot["data"]:
+                    t = BackupTask.from_dict(item)
+                    self.tasks[t.id] = t
+                # 回退是"用旧快照覆盖"，同样先合并：否则撤销一次保存会顺手抹掉
+                # 期间外部（CLI/守护进程）新增的任务。锁已在手 → 用锁内重读版本。
+                self._merge_from_disk_locked()
+                data = self._snapshot()
+                save_json_atomic(self.path, data)
+                self._after_write()
             return True
 
     # ------------------------------------------------------------------

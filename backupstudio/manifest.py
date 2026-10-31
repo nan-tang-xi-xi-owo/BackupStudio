@@ -222,13 +222,41 @@ class BackupGroup:
 
     @property
     def managed(self) -> bool:
-        """是否是「一份可信备份」（可计入份数、可安全参与自动淘汰）。"""
+        """清单是否已**提交**（``committed``）。
+
+        **注意：这不等于「一份可信备份」**（S2，数据丢失级）。清单只记录"当初写完了"，
+        卷还在不在是另一回事（``complete``）。判断"能不能算一份、能不能参与份数配额"
+        必须用 :attr:`countable`，否则幽灵组（清单在、卷全丢）会占掉 keep_last 的一个
+        配额，把真备份挤掉：实测 ``keep_last=2`` + 1 个幽灵组 → 只剩 1 份真备份。
+        """
         return self.manifest is not None and self.manifest.is_committed
+
+    @property
+    def countable(self) -> bool:
+        """是否是「一份可计入配额的完整可信备份」（S2 的修复口径）。
+
+        三个条件**必须同时成立**，缺一即不该占 keep_last 的配额：
+
+        1. 有清单（无清单旧包走 E5 迁移红线，默认只读）；
+        2. 清单状态是 ``committed``（``unverified`` / ``committing`` / ``partial``
+           都不是「可信」——前者由 P0 修复单独计数，后两者是残包）；
+        3. ``complete``：清单声明的**全部卷都在盘上**。
+
+        幽灵组（``files=[]``）与缺卷残包 ``complete=False`` 因此**不占配额**，
+        但仍可被回收（见 ``apply_retention`` 的 ``incomplete`` 桶）——否则空清单会
+        永久占盘，而缺卷残包也永远清不掉。
+        """
+        return self.managed and self.complete
 
     @property
     def reclaimable(self) -> bool:
         """是否可被保留策略回收（不是可信备份，但占着盘 —— 审查 A3）。"""
         return self.manifest is not None and self.manifest.is_reclaimable
+
+    @property
+    def incomplete(self) -> bool:
+        """清单已提交、但卷不齐（含"卷全丢"的幽灵组）—— 是残包，不是一份备份。"""
+        return self.managed and not self.complete
 
 
 # 分卷名 → 组主名 + 卷序号（审查 A2）。三种真实形态，与 main 的 volume_glob_paths 对齐：

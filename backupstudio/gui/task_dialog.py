@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTime
+from PySide6.QtCore import Qt, QThread, QTime, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -123,6 +123,81 @@ class TaskDialog(QDialog):
         self._load_task()
         self._refresh_capabilities()
         self._loading = False
+        # 1.1.2：脏标记基线（用于"关掉对话框会丢修改"的确认）
+        self._snapshot = self._form_signature()
+
+    def _form_signature(self) -> tuple:
+        """当前表单内容指纹（1.1.2）。
+
+        不硬编码字段名（容易写错/后续改名失效），改为遍历本对话框里
+        所有输入类控件，按 objectName + 当前值收集。
+        """
+        try:
+            from PySide6.QtWidgets import (
+                QAbstractSpinBox,
+                QCheckBox,
+                QComboBox,
+                QLineEdit,
+                QPlainTextEdit,
+                QTextEdit,
+            )
+
+            vals: list[tuple[str, str]] = []
+            for w in self.findChildren(QLineEdit):
+                vals.append((w.objectName() or f"le{len(vals)}", w.text()))
+            for w in self.findChildren(QPlainTextEdit):
+                vals.append((w.objectName() or f"pte{len(vals)}", w.toPlainText()))
+            for w in self.findChildren(QTextEdit):
+                vals.append((w.objectName() or f"te{len(vals)}", w.toPlainText()))
+            for w in self.findChildren(QComboBox):
+                vals.append((w.objectName() or f"cb{len(vals)}", str(w.currentData())))
+            for w in self.findChildren(QAbstractSpinBox):
+                vals.append((w.objectName() or f"sb{len(vals)}", w.text()))
+            for w in self.findChildren(QCheckBox):
+                vals.append((w.objectName() or f"ck{len(vals)}", str(w.isChecked())))
+            return tuple(vals)
+        except Exception:  # noqa: BLE001
+            return ()
+
+    def _is_dirty(self) -> bool:
+        return self._form_signature() != getattr(self, "_snapshot", ())
+
+    def reject(self) -> None:  # noqa: D401
+        """取消/关闭前确认（1.1.2）。
+
+        审计实测：修改任务名后直接关窗口**没有任何提示**，改动静默丢失。
+        """
+        if not getattr(self, "_loading", False) and self._is_dirty():
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setWindowTitle("放弃修改？")
+            box.setText("有未保存的修改，关闭后会丢失。")
+            box.setStandardButtons(
+                QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel
+            )
+            box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+            box.button(QMessageBox.StandardButton.Discard).setText("放弃修改")
+            box.button(QMessageBox.StandardButton.Cancel).setText("继续编辑")
+            if box.exec() != QMessageBox.StandardButton.Discard:
+                return
+        super().reject()
+
+    def closeEvent(self, event) -> None:  # noqa: ANN001, N802
+        if not getattr(self, "_loading", False) and self._is_dirty():
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setWindowTitle("放弃修改？")
+            box.setText("有未保存的修改，关闭后会丢失。")
+            box.setStandardButtons(
+                QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel
+            )
+            box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+            box.button(QMessageBox.StandardButton.Discard).setText("放弃修改")
+            box.button(QMessageBox.StandardButton.Cancel).setText("继续编辑")
+            if box.exec() != QMessageBox.StandardButton.Discard:
+                event.ignore()
+                return
+        super().closeEvent(event)
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -154,7 +229,7 @@ class TaskDialog(QDialog):
         self.enabled_switch = Switch(dark=self._dark)
         row = QHBoxLayout()
         row.addWidget(self.enabled_switch)
-        row.addWidget(muted("停用后不会按计划自动执行，仍可手动备份"))
+        row.addWidget(muted("停用后不自动执行计划，仍可手动备份"))
         row.addStretch(1)
         form.addRow("启用任务", self._wrap(row))
         basic.add_layout(form)
@@ -648,12 +723,20 @@ class TaskDialog(QDialog):
         # 保留预览（审查 E1-1.8/D-r5）：保存前就能看到"将清理 N 份（X GB）"
         self.ret_preview = muted("")
         ret.add(self.ret_preview)
+        # 1.1.2：**防抖**。原来 5 个 valueChanged 直接连到预览函数，
+        # 而预览会同步扫盘（`preview_retention`）—— 实测 400 个历史包 /
+        # 4000 个文件时，改一个数字界面**卡 9.9 秒**，且期间无任何提示。
+        # 现在改成 250ms 防抖：连续拨动滚轮/输入只算一次。
+        self._ret_timer = QTimer(self)
+        self._ret_timer.setSingleShot(True)
+        self._ret_timer.setInterval(250)
+        self._ret_timer.timeout.connect(self._async_preview)
         for sig in (
             self.ret_count.valueChanged, self.ret_days.valueChanged,
             self.ret_gb.valueChanged, self.ret_action.currentIndexChanged,
         ):
-            sig.connect(self._update_retention_preview)
-        self.ret_enabled.toggled.connect(self._update_retention_preview)
+            sig.connect(self._schedule_retention_preview)
+        self.ret_enabled.toggled.connect(self._schedule_retention_preview)
         lay.addWidget(ret)
 
         notif = Card()
@@ -673,6 +756,96 @@ class TaskDialog(QDialog):
 
     def _on_ret_action(self) -> None:
         self.ret_dir.setVisible(self.ret_action.currentData() == "move")
+
+    def _schedule_retention_preview(self, *_args) -> None:
+        """防抖入口：250ms 内多次改动只跑一次（1.1.2）。"""
+        if not self.ret_enabled.isChecked():
+            self.ret_preview.setText("")
+            self._ret_timer.stop()
+            return
+        if self.ret_preview.text().strip() == "":
+            self.ret_preview.setText("保留预览：正在统计历史备份…")
+        self._ret_timer.start()
+
+    def _preview_params(self):  # noqa: ANN201
+        """当前保留参数快照（用于缓存键）。"""
+        return (
+            normalize_path(self.dest_path.path()),
+            self.fmt_combo.currentData(),
+            self.ret_count.value(),
+            self.ret_days.value(),
+            self.ret_gb.value(),
+            self.ret_action.currentData(),
+        )
+
+    def _async_preview(self) -> None:
+        """在后台线程做 dry-run，避免扫盘把界面卡住（1.1.2）。
+
+        实测（400 个历史包 / 4000 个文件）：同步调 `preview_retention()`
+        单次耗时 **9.9 秒**，期间窗口完全无响应。防抖只能减少次数，
+        真正解决要在后台跑。
+        """
+        key = self._preview_params()
+        cached = getattr(self, "_ret_cache", None)
+        if cached and cached[0] == key:
+            self.ret_preview.setText(cached[1])
+            return
+        self._ret_gen = getattr(self, "_ret_gen", 0) + 1
+        gen = self._ret_gen
+
+        outer = self
+
+        class _Probe(QThread):
+            done = Signal(int, str)
+
+            def run(self) -> None:  # noqa: D401
+                try:
+                    text = outer._compute_preview_text()
+                except Exception as exc:  # noqa: BLE001
+                    text = f"保留预览：统计失败（{exc}）"
+                self.done.emit(gen, text)
+
+        probe = _Probe(self)
+        probe.done.connect(self._on_preview_done)
+        # 1.1.2：上一轮的探针若还在跑，先等它收尾再起新的，
+        # 避免同时多个扫盘线程 + 对象被 GC 时 "QThread: Destroyed while running"
+        old = getattr(self, "_ret_probe", None)
+        if old is not None and old.isRunning():
+            old.wait(2000)
+        probe.start()
+        self._ret_probe = probe  # 防 GC
+
+    def _on_preview_done(self, gen: int, text: str) -> None:
+        if gen != getattr(self, "_ret_gen", 0):
+            return  # 已有更新的请求，丢弃旧结果
+        self._ret_cache = (self._preview_params(), text)
+        self.ret_preview.setText(text)
+
+    def _compute_preview_text(self) -> str:
+        """真正做 dry-run 并返回要显示的文案（纯计算，可在子线程跑）。"""
+        dest = normalize_path(self.dest_path.path())
+        if not dest or not Path(dest).is_dir():
+            return "保留预览：备份位置尚不存在，暂无历史备份可评估"
+        from ..config import RetentionPolicy
+        from ..engine import TaskEngine
+        from ..util import human_size
+
+        probe = BackupTask.from_dict(self._task.to_dict())
+        probe.destination = dest
+        probe.options.fmt = self.fmt_combo.currentData() or probe.options.fmt
+        probe.retention = RetentionPolicy(
+            enabled=True,
+            keep_last=self.ret_count.value(),
+            keep_days=self.ret_days.value(),
+            max_total_gb=self.ret_gb.value(),
+            on_cleanup=self.ret_action.currentData() or "move",
+        )
+        will_process = TaskEngine().preview_retention(probe)
+        if not will_process:
+            return "保留预览：按当前规则，现有备份都不会被清理"
+        total = sum(Path(f).stat().st_size for f in will_process if Path(f).is_file())
+        action = "移入回收站" if probe.retention.on_cleanup == "move" else "直接删除"
+        return f"保留预览：将{action} {len(will_process)} 份旧备份，共 {human_size(total)}"
 
     def _update_retention_preview(self, *_args) -> None:
         """dry-run 保留策略，显示"将清理 N 份（X GB）"（审查 E1-1.8/D-r5）。"""
@@ -810,9 +983,10 @@ class TaskDialog(QDialog):
         available = entry.get("available", False)
         self.fmt_status.setText(format_status_line(fmt, entry) if entry else "")
         self.fmt_status.setObjectName("SuccessText" if available else "ErrorText")
-        self.fmt_status.setStyleSheet(
-            f"color: {'#16A34A' if available else '#DC2626'}; font-weight: 600;"
-        )
+        # 1.1.2：这里原本在 setObjectName 之后**又用内联样式覆盖**，
+        # 等于把全局 QSS 的 SuccessText/ErrorText 规则废掉 ——
+        # 主题切换时颜色不跟着变。删掉内联，让全局 QSS 接管。
+        self.fmt_status.setStyleSheet("")
         # 缺失软件
         while self.fmt_missing_lay.count():
             item = self.fmt_missing_lay.takeAt(0)

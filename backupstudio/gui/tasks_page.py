@@ -8,6 +8,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -28,13 +29,18 @@ from ..schedule import describe_next
 from ..util import human_duration, human_size, reveal_file
 from .appstate import AppState
 from .icons import line_icon
-from .widgets import Badge, Card, StatusPill, muted, title_label
+from .widgets import Badge, Card, ElideLabel, StatusPill, muted, title_label
 
 log = logging.getLogger("backupstudio.gui.tasks")
 
 STATUS_MAP = {
     "success": ("成功", "ok"),
     "failure": ("失败", "bad"),
+    # **1.1.2 修复**：`engine.py` 会产出 `status="partial"`（有文件被占用/无权限，
+    # 备份完成了但不完整）。这里原本没有这个键 → `.get()` 回落到默认值
+    # 「未运行过」，即**部分失败的备份在列表里显示成"从没跑过"**，
+    # 用户会以为定时任务没生效，实际是备份不完整需要处理。
+    "partial": ("部分完成", "warn"),
     "skipped": ("已跳过", "warn"),
     "running": ("运行中", "info"),
     "": ("未运行过", "muted"),
@@ -74,38 +80,97 @@ _FORCE_RETRY_EXCLUDES = (
 
 
 class TaskItemWidget(QWidget):
-    """列表中的任务条目。"""
+    """列表中的任务条目（1.1.2 重做）。
+
+    改动：
+    - 标题改用 `ElideLabel`（长任务名不再撑破/硬截断）
+    - 副标题只显示「格式 · 下次时间」，**去掉重复的路径**
+      （路径在右侧详情里已有，重复显示既挤又乱）
+    - 左侧加状态色圆点，一眼看出成功/失败/未运行
+    """
 
     def __init__(self, task: BackupTask, dark: bool = False) -> None:
         super().__init__()
         self.task = task
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(2, 2, 2, 2)
-        lay.setSpacing(5)
+        self._dark = dark
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(4, 2, 4, 2)
+        lay.setSpacing(9)
+
+        # 1.1.3 批量模式：左侧复选框（默认隐藏）
+        self.chk = QCheckBox()
+        self.chk.setVisible(False)
+        self.chk.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.chk.toggled.connect(self._on_chk)
+        lay.addWidget(self.chk, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        # 状态圆点（用文本字符画，无需额外资源）
+        self.dot = QLabel("●")
+        self.dot.setFixedWidth(10)
+        lay.addWidget(self.dot, 0, Qt.AlignmentFlag.AlignTop)
+
+        col = QVBoxLayout()
+        col.setSpacing(3)
+        col.setContentsMargins(0, 0, 0, 0)
+
         top = QHBoxLayout()
-        top.setSpacing(8)
-        self.title = QLabel(task.name)
-        self.title.setStyleSheet("font-weight: 600; font-size: 14px;")
+        top.setSpacing(6)
+        self.title = ElideLabel(task.name)
+        self.title.setStyleSheet("font-weight: 600; font-size: 11pt;")
         self.badge = Badge("", "muted")
         self.badge.set_dark(dark)
         top.addWidget(self.title, 1)
-        top.addWidget(self.badge)
-        lay.addLayout(top)
-        self.sub = QLabel("")
+        top.addWidget(self.badge, 0)
+        col.addLayout(top)
+
+        self.sub = ElideLabel("")
         self.sub.setObjectName("Muted")
-        self.sub.setStyleSheet("font-size: 12px;")
-        self.sub.setWordWrap(False)
-        lay.addWidget(self.sub)
+        self.sub.setStyleSheet("font-size: 9pt;")
+        col.addWidget(self.sub)
+        lay.addLayout(col, 1)
         self.update_task(task)
+
+    def _on_chk(self, checked: bool) -> None:
+        cb = getattr(self, "on_check", None)
+        if callable(cb):
+            cb(self.task.id, checked)
+
+    def set_batch(self, on: bool, checked: bool = False) -> None:
+        """进入/退出批量模式；进入时按外部状态回显勾选。"""
+        self.chk.blockSignals(True)
+        self.chk.setChecked(bool(checked))
+        self.chk.blockSignals(False)
+        self.chk.setVisible(on)
 
     def update_task(self, task: BackupTask) -> None:
         self.task = task
         self.title.setText(task.name)
         text, kind = STATUS_MAP.get(task.last_status, ("未运行过", "muted"))
         self.badge.set_state(text, kind)
+        self._set_dot(kind)
         sched = task.schedule.describe()
         when = describe_next(task, datetime.now())
-        self.sub.setText(f"{sched} · 下次 {when}   |   {task.destination or '未设置位置'}")
+        fmt = (task.options.fmt or "").upper()
+        self.sub.setText(f"{fmt} · {sched} · 下次 {when}")
+        self.sub.setToolTip(f"{sched} · 下次 {when}\n{task.destination or '未设置位置'}")
+
+    def _set_dot(self, kind: str) -> None:
+        from . import DARK as _D
+        from . import LIGHT as _L
+
+        pal = _D if self._dark else _L
+        color = {
+            "ok": pal.success,
+            "bad": pal.danger,
+            "warn": pal.warning,
+            "info": pal.accent,
+        }.get(kind, pal.border_strong)
+        self.dot.setStyleSheet(f"color: {color}; font-size: 11pt;")
+
+    def set_dark(self, dark: bool) -> None:
+        self._dark = dark
+        self.badge.set_dark(dark)
+        self.update_task(self.task)
 
 
 class TasksPage(QWidget):
@@ -124,6 +189,9 @@ class TasksPage(QWidget):
         # 已问过「改用内置引擎重试」的任务：本轮 GUI 会话每个任务最多问一次
         # （审查 W-A7-1：强制重试仍失败会再次弹窗，形成无限循环）
         self._force_offered: set[str] = set()
+        # 1.1.3 批量删除：选中的 task id 集合
+        self._batch = False
+        self._selected: set[str] = set()
 
         root = QVBoxLayout(self)
         root.setContentsMargins(26, 22, 26, 22)
@@ -141,6 +209,13 @@ class TasksPage(QWidget):
         self.btn_new.setIconSize(QSize(16, 16))
         self.btn_new.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_new.clicked.connect(self.new_task)
+        # 1.1.3：批量管理入口
+        self.btn_batch = QPushButton("批量管理")
+        self.btn_batch.setCheckable(True)
+        self.btn_batch.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_batch.setToolTip("勾选多个任务后一次性删除")
+        self.btn_batch.toggled.connect(self._on_batch_toggled)
+        header.addWidget(self.btn_batch)
         header.addWidget(self.btn_new)
         root.addLayout(header)
 
@@ -158,6 +233,12 @@ class TasksPage(QWidget):
         self.list.setStyleSheet("QListWidget { background: transparent; border: none; }")
         self.list.currentItemChanged.connect(self._on_select)
         self.list.itemDoubleClicked.connect(lambda _: self.edit_current())
+        # **1.1.2 一键删除**：列表右键菜单 + Delete 键。
+        # 之前只有右侧详情区一个「删除」按钮、且必须先选中任务才可用，
+        # 用户反馈"备份任务里没有一键删除"。
+        self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self._on_list_menu)
+        self.list.installEventFilter(self)
         left.add(self.list, 1)
         empty = muted("还没有任务。点击右上角「新建任务」开始。")
         left.add(empty)
@@ -169,39 +250,46 @@ class TasksPage(QWidget):
         rl = QVBoxLayout()
         rl.setSpacing(12)
         top = QHBoxLayout()
-        self.detail_title = title_label("选择一个任务", 2)
+        self.detail_title = ElideLabel("选择一个任务")
+        self.detail_title.setStyleSheet("font-size: 12pt; font-weight: 600;")
         self.detail_badge = Badge("", "muted")
         self.detail_badge.set_dark(self._dark)
         top.addWidget(self.detail_title, 1)
-        top.addWidget(self.detail_badge)
+        top.addWidget(self.detail_badge, 0)
         rl.addLayout(top)
 
-        self.detail_sub = muted("")
+        # 1.1.2：副标题改为「上次运行」摘要 —— 原来这里显示来源路径，
+        # 与下面「来源」卡片完全重复（同一路径在详情里出现两次）
+        self.detail_sub = ElideLabel("")
+        self.detail_sub.setObjectName("Muted")
+        self.detail_sub.setStyleSheet("font-size: 9pt;")
         rl.addWidget(self.detail_sub)
 
         from PySide6.QtWidgets import QGridLayout
 
         info_grid = QGridLayout()
-        info_grid.setSpacing(10)
-        self.info_cards: dict[str, tuple[Card, QLabel]] = {}
+        # **1.1.2 矮窗口**：间距 10→8、卡片内距 14/10→12/7，四张卡合计省约 30px。
+        # 实拍确认逻辑高 648 时「最近一次结果」被压到底部边缘。
+        info_grid.setSpacing(8)
+        self.info_cards: dict[str, tuple[Card, ElideLabel]] = {}
         for idx, (key, label) in enumerate((
             ("source", "来源"),
             ("dest", "备份位置"),
             ("format", "压缩格式"),
             ("schedule", "计划"),
         )):
-            c = Card(flat=True, margins=(14, 10, 14, 10))
+            c = Card(flat=True, margins=(12, 7, 12, 7))
             cap = QLabel(label)
-            cap.setObjectName("Muted")
-            cap.setStyleSheet("font-size: 11px;")
-            val = QLabel("—")
-            val.setWordWrap(True)
-            val.setStyleSheet("font-size: 13px; font-weight: 600;")
+            cap.setObjectName("CardCap")
+            # 路径可能很长：用省略号 + tooltip，不再硬截断
+            val = ElideLabel("—")
+            val.setObjectName("CardVal")
             val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             c.add(cap)
             c.add(val)
-            c.setMinimumWidth(240)
+            c.setMinimumWidth(140)
             info_grid.addWidget(c, idx // 2, idx % 2)
+            info_grid.setColumnStretch(idx % 2, 1)
             self.info_cards[key] = (c, val)
         rl.addLayout(info_grid)
 
@@ -268,7 +356,7 @@ class TasksPage(QWidget):
         self.result_text.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         self.result_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.result_text.setStyleSheet(
-            "font-family: 'Cascadia Mono','Consolas','Menlo',monospace; font-size: 12px;"
+            "font-family: 'Cascadia Mono','Consolas','Menlo',monospace; font-size: 9pt;"
             "background: transparent; padding: 4px 2px;"
         )
         result_holder = QWidget()
@@ -283,14 +371,84 @@ class TasksPage(QWidget):
         scroll.setStyleSheet("QScrollArea { background: transparent; border: none; } QScrollArea > QWidget > QWidget { background: transparent; }")
         scroll.viewport().setAutoFillBackground(False)
         scroll.setWidget(result_holder)
+        self.result_scroll = scroll
         rl.addWidget(scroll, 1)
+
+        # 1.1.2：空状态 —— 一张"还没有结果"的引导面板，替代原来孤零零的「—」
+        self.empty_box = QWidget()
+        ev = QVBoxLayout(self.empty_box)
+        ev.setContentsMargins(0, 0, 0, 0)
+        ev.setSpacing(8)
+        ev.addStretch(1)
+        self.empty_icon = QLabel()
+        self.empty_icon.setObjectName("EmptyIcon")
+        self.empty_icon.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.empty_title = QLabel("还没有备份记录")
+        self.empty_title.setObjectName("EmptyTitle")
+        self.empty_title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.empty_hint = QLabel("点上面的「立即备份」跑第一次，或编辑任务设置自动计划")
+        self.empty_hint.setObjectName("EmptyHint")
+        self.empty_hint.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.empty_hint.setWordWrap(True)
+        for w in (self.empty_icon, self.empty_title, self.empty_hint):
+            ev.addWidget(w)
+        ev.addStretch(1)
+        rl.addWidget(self.empty_box, 1)
+        self.empty_box.hide()
 
         right.add_layout(rl)
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([340, 760])
+        # **1.1.2 窄窗口**：左栏最小 260，右栏信息卡 2×150=300，加边距约 650。
+        # 窗口被压窄时若左栏还占 340，右侧会被挤出去。
+        self._splitter = splitter
+        splitter.setChildrenCollapsible(False)
+        left.setMinimumWidth(260)
+        left.setMaximumWidth(430)
+        # **1.1.2 矮窗口**：右侧「标题+4 张信息卡+按钮行」是固定高度，
+        # 窗口高度 < 约 620 逻辑像素时底部会被裁掉（实拍截图确认：
+        # 「最近一次结果」和按钮只露出一半）。给整个右栏加外层滚动区，
+        # 内容超出时可滚动，不再被硬裁。
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        right_scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollArea > QWidget > QWidget { background: transparent; }"
+        )
+        right_scroll.viewport().setAutoFillBackground(False)
+        # Card 作为滚动内容时不能有最大高度限制，否则又被压扁
+        right.setMinimumHeight(0)
+        right_scroll.setWidget(right)
+        splitter.addWidget(right_scroll)
+        splitter.setStretchFactor(splitter.indexOf(right_scroll), 1)
         root.addWidget(splitter, 1)
+
+        # 1.1.3：批量操作条（默认隐藏）
+        self.batch_bar = Card(flat=True, margins=(12, 8, 12, 8))
+        bb = QHBoxLayout()
+        self.chk_all = QCheckBox("全选")
+        self.chk_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.chk_all.toggled.connect(self._on_select_all)
+        bb.addWidget(self.chk_all)
+        self.batch_count = QLabel("已选 0 项")
+        self.batch_count.setObjectName("Muted")
+        bb.addWidget(self.batch_count)
+        bb.addStretch(1)
+        self.btn_del_sel = QPushButton("删除选中")
+        self.btn_del_sel.setObjectName("Danger")
+        self.btn_del_sel.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_del_sel.clicked.connect(self.delete_selected)
+        bb.addWidget(self.btn_del_sel)
+        self.btn_batch_done = QPushButton("退出批量")
+        self.btn_batch_done.clicked.connect(lambda: self.btn_batch.setChecked(False))
+        bb.addWidget(self.btn_batch_done)
+        self.batch_bar.body().addLayout(bb)
+        self.batch_bar.setVisible(False)
+        root.addWidget(self.batch_bar)
 
         state.tasks_changed.connect(self.refresh)
         state.task_updated.connect(self._on_task_updated)
@@ -317,7 +475,10 @@ class TasksPage(QWidget):
         for t in tasks:
             item = QListWidgetItem()
             widget = TaskItemWidget(t, self._dark)
-            item.setSizeHint(QSize(280, 64))
+            # 1.1.3：批量模式下显示复选框，并按已选集合回显
+            widget.on_check = self._on_item_check
+            widget.set_batch(self._batch, t.id in self._selected)
+            item.setSizeHint(QSize(280, 58))
             item.setData(Qt.ItemDataRole.UserRole, t.id)
             self.list.addItem(item)
             self.list.setItemWidget(item, widget)
@@ -331,6 +492,7 @@ class TasksPage(QWidget):
             self._current_id = ""
             self._show_empty()
         self._update_buttons()
+        self._sync_batch_bar()
 
     def _refresh_subtitles(self) -> None:
         for tid, widget in self._items.items():
@@ -351,12 +513,13 @@ class TasksPage(QWidget):
     def _show_empty(self) -> None:
         self.detail_title.setText("选择一个任务")
         self.detail_badge.setVisible(False)
-        self.detail_sub.setText("")
+        self.detail_sub.setText("左侧选一个任务，这里会显示它的来源、目标与最近一次结果")
         for _, val in self.info_cards.values():
             val.setText("—")
-        self.result_text.setText("—")
+        self.result_text.setText("")
+        self.result_scroll.hide()
+        self.empty_box.hide()
         self.last_run.set_state("muted", "")
-
     def _show_task(self, task_id: str) -> None:
         task = self.state.get(task_id)
         if task is None:
@@ -366,7 +529,12 @@ class TasksPage(QWidget):
         text, kind = STATUS_MAP.get(task.last_status, ("未运行过", "muted"))
         self.detail_badge.setVisible(True)
         self.detail_badge.set_state(text, kind)
-        self.detail_sub.setText(self._describe_sources(task))
+        self.detail_sub.setText(
+            (
+                f"上次运行 {self._fmt_time(task.last_run)} · 用时 {human_duration(task.last_duration)}"
+                if task.last_run else "还没有运行记录 —— 点「立即备份」跑第一次"
+            )
+        )
         self.info_cards["source"][1].setText(self._source_short(task))
         self.info_cards["dest"][1].setText(task.destination or "未设置")
         from ..capabilities import FORMAT_LABELS
@@ -387,7 +555,7 @@ class TasksPage(QWidget):
         if task.last_status == "running":
             self.last_run.set_state("run", "正在备份…")
         elif task.last_run:
-            kind2 = {"success": "ok", "failure": "bad", "skipped": "warn"}.get(task.last_status, "muted")
+            kind2 = {"success": "ok", "failure": "bad", "partial": "warn", "skipped": "warn"}.get(task.last_status, "muted")
             self.last_run.set_state(kind2, f"{self._fmt_time(task.last_run)} · {task.last_message or STATUS_MAP.get(task.last_status, ('', ''))[0]}")
         else:
             self.last_run.set_state("muted", "尚未运行")
@@ -443,7 +611,26 @@ class TasksPage(QWidget):
             lines.append(f"耗时：{human_duration(task.last_duration)}")
         if task.last_message:
             lines.append(f"信息：{task.last_message}")
-        self.result_text.setText("\n".join(lines) if lines else "还没有运行结果。点击「立即备份」开始第一次备份。")
+        self.result_text.setText("\n".join(lines))
+        # 1.1.2：没有结果时显示引导面板，而不是一片空白 + 一行小字
+        has = bool(lines)
+        self.result_scroll.setVisible(has)
+        self.empty_box.setVisible(not has)
+        if not has:
+            from . import DARK as _D
+            from . import LIGHT as _L
+
+            pal = _D if self._dark else _L
+            running = task.last_status == "running"
+            # 用绘制的图形图标，比字符符号干净（原来是一个半圆字符，很怪）
+            self.empty_icon.setPixmap(
+                line_icon("run" if running else "folder", pal.border_strong, 44).pixmap(44, 44)
+            )
+            self.empty_title.setText("正在备份…" if running else "还没有备份记录")
+            self.empty_hint.setText(
+                "完成后这里会显示压缩包名、大小和耗时"
+                if running else "点上面的「立即备份」跑第一次，或编辑任务设置自动计划"
+            )
 
     # ------------------------------------------------------------------
     # 进度
@@ -648,8 +835,130 @@ class TasksPage(QWidget):
             self.refresh()
             self._select_by_id(new.id)
 
+    # ------------------------------------------------------------------
+    # 批量勾选 + 批量删除（1.1.3）
+    # ------------------------------------------------------------------
+    def _on_batch_toggled(self, on: bool) -> None:
+        """进入/退出批量模式。"""
+        self._batch = bool(on)
+        if not on:
+            self._selected.clear()
+        self.batch_bar.setVisible(self._batch)
+        self.btn_batch.setText("退出批量" if self._batch else "批量管理")
+        self.refresh()
+        self._sync_batch_bar()
+
+    def _on_item_check(self, tid: str, checked: bool) -> None:
+        if checked:
+            self._selected.add(tid)
+        else:
+            self._selected.discard(tid)
+        self._sync_batch_bar()
+
+    def _on_select_all(self, on: bool) -> None:
+        """全选 / 全不选。"""
+        if on:
+            self._selected = {t.id for t in self.state.tasks()}
+        else:
+            self._selected.clear()
+        for tid, w in self._items.items():
+            w.chk.blockSignals(True)
+            w.chk.setChecked(tid in self._selected)
+            w.chk.blockSignals(False)
+        self._sync_batch_bar()
+
+    def _sync_batch_bar(self) -> None:
+        """更新「已选 N 项」与按钮可用性。"""
+        n = len(self._selected)
+        total = self.list.count()
+        if hasattr(self, "batch_count"):
+            self.batch_count.setText(f"已选 {n} / {total} 项")
+            self.btn_del_sel.setEnabled(n > 0)
+        if hasattr(self, "chk_all"):
+            self.chk_all.blockSignals(True)
+            self.chk_all.setChecked(total > 0 and n == total)
+            self.chk_all.blockSignals(False)
+
+    def delete_selected(self) -> None:
+        """批量删除选中的任务（二次确认，明确说明不动备份文件）。"""
+        ids = [t.id for t in self.state.tasks() if t.id in self._selected]
+        if not ids:
+            return
+        if len(ids) == 1:
+            self._delete_task(ids[0])
+            self._selected.clear()
+            self._sync_batch_bar()
+            return
+        ret = QMessageBox.question(
+            self,
+            "批量删除任务",
+            f"确定删除选中的 {len(ids)} 个任务吗？\n\n"
+            "只删除任务本身，已有的备份文件不会被删除。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        for tid in ids:
+            self._force_offered.discard(tid)
+            self.state.delete_task(tid)
+        self._selected.clear()
+        self._current_id = ""
+        self.refresh()
+
     def delete_current(self) -> None:
-        tid = self._current_id
+        self._delete_task(self._current_id)
+
+    # ------------------------------------------------------------------
+    # 一键删除入口（1.1.2）：右键菜单 + Delete 键
+    # ------------------------------------------------------------------
+    def eventFilter(self, obj, event) -> bool:  # noqa: ANN001, N802
+        from PySide6.QtCore import QEvent
+
+        if obj is getattr(self, "list", None) and event.type() == QEvent.Type.KeyPress:
+            if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+                tid = self._id_at_current_row()
+                if tid:
+                    self._delete_task(tid)
+                    return True
+        return super().eventFilter(obj, event)
+
+    def _id_at_current_row(self) -> str:
+        item = self.list.currentItem()
+        if item is None:
+            return ""
+        return str(item.data(Qt.ItemDataRole.UserRole) or "")
+
+    def _on_list_menu(self, pos) -> None:  # noqa: ANN001
+        from PySide6.QtWidgets import QMenu
+
+        item = self.list.itemAt(pos)
+        if item is None:
+            return
+        tid = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        if not tid or self.state.get(tid) is None:
+            return
+        self.list.setCurrentItem(item)
+
+        menu = QMenu(self)
+        act_run = menu.addAction("立即备份")
+        act_edit = menu.addAction("编辑…")
+        act_dup = menu.addAction("复制")
+        menu.addSeparator()
+        act_del = menu.addAction("删除任务…")
+        act_run.triggered.connect(lambda: self._with_id(tid, self.run_current))
+        act_edit.triggered.connect(lambda: self._with_id(tid, self.edit_current))
+        act_dup.triggered.connect(lambda: self._with_id(tid, self.duplicate_current))
+        act_del.triggered.connect(lambda: self._delete_task(tid))
+        menu.exec(self.list.viewport().mapToGlobal(pos))
+
+    def _with_id(self, tid: str, fn) -> None:  # noqa: ANN001
+        """先切到该任务再执行操作（右键菜单项可能不是当前行）。"""
+        self._current_id = tid
+        self._select_by_id(tid)
+        fn()
+
+    def _delete_task(self, tid: str) -> None:
         task = self.state.get(tid) if tid else None
         if task is None:
             return

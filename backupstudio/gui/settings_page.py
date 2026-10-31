@@ -6,8 +6,10 @@ import logging
 import sys
 from pathlib import Path
 
+from PySide6.QtGui import QColor
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QLineEdit,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -92,14 +94,69 @@ class SettingsPage(QWidget):
             self.sw_daemon.setChecked(False)
             self.sw_daemon.setToolTip(_flatpak.daemon_hint())
             general.add(muted("⚠ " + _flatpak.daemon_hint().replace("\n", " ")))
-        appearance = QHBoxLayout()
-        appearance.addWidget(QLabel("外观主题"), 1)
+        # **每行一个设置项**（1.1.5）。原来把 5 组控件塞进一个 QHBoxLayout，
+        # 水平布局不换行 → 总宽度超卡片就被裁掉（用户截图可见"截断"）。
+        appearance = QVBoxLayout()
+        appearance.setSpacing(8)
+
+        def _arow(label_text: str, widget) -> None:  # noqa: ANN001
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            lab = QLabel(label_text)
+            lab.setWordWrap(True)
+            lab.setMinimumWidth(150)
+            row.addWidget(lab, 0)
+            row.addWidget(widget, 1)
+            appearance.addLayout(row)
+
+        # 外观主题（跟随系统 / 浅色 / 深色）
         self.theme_combo = Combo()
         self.theme_combo.addItem("跟随系统", "system")
         self.theme_combo.addItem("浅色", "light")
         self.theme_combo.addItem("深色", "dark")
         self.theme_combo.currentIndexChanged.connect(self._on_theme)
-        appearance.addWidget(self.theme_combo)
+        _arow("外观主题", self.theme_combo)
+
+        # 外观风格（win / mac / 98 / skeuo / mag / glass）
+        self.style_combo = Combo()
+        from .styles import style_names
+
+        for key, name in style_names():
+            self.style_combo.addItem(name, key)
+        self.style_combo.currentIndexChanged.connect(self._on_style)
+        self.style_combo.setToolTip(
+            "风格决定圆角、立体感、渐变与透明度；配色决定明暗。两者可自由组合。"
+        )
+        _arow("外观风格", self.style_combo)
+
+        # Material You 源色（单一色 → 5 板 × 13 档 = 65 色）
+        seed_row = QWidget()
+        sl = QHBoxLayout(seed_row)
+        sl.setContentsMargins(0, 0, 0, 0)
+        sl.setSpacing(6)
+        self.seed_edit = QLineEdit()
+        self.seed_edit.setPlaceholderText("#6750A4")
+        self.seed_edit.setFixedWidth(110)
+        self.seed_edit.editingFinished.connect(self._on_seed_changed)
+        sl.addWidget(self.seed_edit)
+        self.btn_pick_seed = QPushButton("选色…")
+        self.btn_pick_seed.clicked.connect(self._pick_seed)
+        sl.addWidget(self.btn_pick_seed)
+        sl.addStretch(1)
+        _arow("Material You 源色", seed_row)
+
+        # Material You 配色风格（Android 13+ 的四个 theme_style）
+        self.tonal_combo = Combo()
+        for key, name in (
+            ("TONAL_SPOT", "TONAL_SPOT（默认）"),
+            ("VIBRANT", "VIBRANT（更鲜艳）"),
+            ("EXPRESSIVE", "EXPRESSIVE（极鲜艳）"),
+            ("SPRITZ", "SPRITZ（近灰阶）"),
+        ):
+            self.tonal_combo.addItem(name, key)
+        self.tonal_combo.currentIndexChanged.connect(self._on_tonal_changed)
+        _arow("Material You 配色风格", self.tonal_combo)
+
         general.add_layout(appearance)
         lay.addWidget(general)
 
@@ -234,6 +291,22 @@ class SettingsPage(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        # **关键**：滚动区及其 viewport 必须透明，否则玻璃卡片采样到的是
+        # viewport 的纯色底（而不是主窗口的渐变光斑）→ 看起来像纯色卡片。
+        # 用户反馈"液态玻璃貌似有些问题"就是这里：设置页被滚动区包着，
+        # 而任务页/运行记录页的卡片直接挂在 _Backdrop 下，所以那两个页有折射。
+        # 只让**滚动区自身与 viewport** 透明；不要用后代选择器
+        # QScrollArea > QWidget > QWidget —— 那会把内部所有控件（下拉框、
+        # 输入框）的背景也变透明，实测导致它们看起来没有边框。
+        scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollArea > QWidget#qt_scrollarea_viewport { background: transparent; }"
+        )
+        scroll.viewport().setAutoFillBackground(False)
+        # **不要**给 holder 设 WA_TranslucentBackground：它会让子控件
+        # （下拉框/输入框）的背景也变透明，实测在 glass 风格下
+        # 整个 QComboBox 变成纯黑 #000000（win 风格下反而正常）。
+        # 只靠 viewport 的 autoFillBackground=False 就足以让光斑透上来。
         scroll.setWidget(holder)
         outer.addWidget(scroll, 1)
 
@@ -257,6 +330,7 @@ class SettingsPage(QWidget):
         self.sw_close_tray.setChecked(s.close_to_tray)
         self.sw_daemon.setChecked(s.auto_run_backup_daemon)
         self.theme_combo.select_data(s.theme_mode)
+        self.style_combo.select_data(getattr(s, "ui_style", "win") or "win")
         n = s.notifications
         self.sw_notif.setChecked(n.enabled)
         self.sw_tray_msg.setChecked(n.tray)
@@ -279,7 +353,10 @@ class SettingsPage(QWidget):
             self.lbl_config.setText(
                 f"{st.get('actual')}  ⚠ 已回退（首选 {st.get('preferred')} 不可写）"
             )
-            self.lbl_config.setStyleSheet("color:#B45309;")
+            # 1.1.2：同上，走主题的 warning 色
+            self.lbl_config.setObjectName("WarningText")
+            self.lbl_config.style().unpolish(self.lbl_config)
+            self.lbl_config.style().polish(self.lbl_config)
             self.lbl_config.setToolTip(str(st.get("reason") or ""))
         self._loading = False
         self._refresh_daemon()
@@ -294,6 +371,7 @@ class SettingsPage(QWidget):
         # 门户授权的子进程，用户看到的是"定时备份永不执行"且没有提示）。
         s.auto_run_backup_daemon = self.sw_daemon.isChecked() if daemon_available() else False
         s.theme_mode = self.theme_combo.currentData() or "system"
+        s.ui_style = self.style_combo.currentData() or "win"
         n = s.notifications
         n.enabled = self.sw_notif.isChecked()
         n.tray = self.sw_tray_msg.isChecked()
@@ -314,6 +392,44 @@ class SettingsPage(QWidget):
             return
         self._save()
         self.state.set_theme(self.theme_combo.currentData() or "system")
+
+    # ------------------------------------------------------------------
+    # Material You（1.1.3）
+    # ------------------------------------------------------------------
+    def _on_seed_changed(self) -> None:
+        from .mcu import normalize_seed
+
+        seed = normalize_seed(self.seed_edit.text())
+        self.seed_edit.setText(seed)
+        s = self.state.store.settings
+        s.material_seed = seed
+        self.state.store.save()
+        self.state.set_style(self.style_combo.currentData() or "win")
+
+    def _pick_seed(self) -> None:
+        from PySide6.QtWidgets import QColorDialog
+
+        from .mcu import normalize_seed
+
+        cur = normalize_seed(self.seed_edit.text())
+        c = QColorDialog.getColor(QColor(cur), self, "选择 Material You 源色")
+        if c.isValid():
+            self.seed_edit.setText(c.name().upper())
+            self._on_seed_changed()
+
+    def _on_tonal_changed(self) -> None:
+        if self._loading:
+            return
+        s = self.state.store.settings
+        s.material_style = self.tonal_combo.currentData() or "TONAL_SPOT"
+        self.state.store.save()
+        self.state.set_style(self.style_combo.currentData() or "win")
+
+    def _on_style(self) -> None:
+        """切换外观风格（1.1.3）。"""
+        if self._loading:
+            return
+        self.state.set_style(self.style_combo.currentData() or "win")
 
     def _on_autostart(self, checked: bool) -> None:
         if self._loading:

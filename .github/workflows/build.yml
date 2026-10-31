@@ -12,7 +12,7 @@ permissions:
 
 env:
   PYTHON_VERSION: "3.12"
-  APP_VERSION: "1.1.0"
+  APP_VERSION: "1.1.1"
   # B2：**必须显式设 PYTHONIOENCODING=utf-8**，不能只靠 PYTHONUTF8。
   # 原因（实测）：PYTHONUTF8=1 只把 *默认* 编码切到 UTF-8；一旦环境里同时存在
   # PYTHONIOENCODING（本机/镜像预设、或 pyinstaller 子进程继承来的值），
@@ -62,6 +62,75 @@ jobs:
           python -c "from backupstudio.tools import find_7z; import sys; got=find_7z(); print('find_7z ->', got); sys.exit(0 if got is None else 1)"
           python -m pytest tests -q
           Rename-Item -Path tools/win32/_7z_off -NewName 7z
+
+  test-linux:
+    name: 单元测试（Linux）
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+        cache: pip
+    - name: 安装依赖
+      run: 'python -m pip install --upgrade pip
+
+        pip install -r requirements.txt -r requirements-dev.txt'
+    - name: 准备 7-Zip 与 Qt 运行时（系统包）
+      run: |
+        sudo apt-get update -qq
+        # PySide6 的 wheel 自带 Qt 库，但依赖系统的 libEGL/libGL/xkbcommon/xcb-*。
+        # GitHub 的 ubuntu runner 不像桌面版装了这些；不装的话所有依赖 qapp
+        # fixture 的测试会在 setup 阶段 ImportError: libEGL.so.1。
+        sudo apt-get install -y -qq p7zip-full libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libdbus-1-3 libfontconfig1 libxrender1 libxi6 libxtst6 libnss3 libasound2
+        echo '--- 7-Zip ---'
+        command -v 7z 7za 7zz || true
+        7z i 2>/dev/null | head -3 || 7za i 2>/dev/null | head -3 || true
+        echo '--- Qt 关键库 ---'
+        for lib in libEGL.so.1 libGL.so.1 libxkbcommon-x11.so.0; do
+          if ldconfig -p | grep -q "$lib"; then echo "  [有] $lib"; else echo "  [缺] $lib"; fi
+        done
+    - name: 版本一致性门禁（env.APP_VERSION == backupstudio.__version__）
+      run: |
+        pkg_ver="$(python -c 'import backupstudio; print(backupstudio.__version__)')"
+        env_ver="${{ env.APP_VERSION }}"
+        echo "env.APP_VERSION=$env_ver  package.__version__=$pkg_ver"
+        if [ "$env_ver" != "$pkg_ver" ]; then
+          echo "::error::版本漂移：env.APP_VERSION=$env_ver 但 backupstudio.__version__=$pkg_ver"
+          echo "::error::请同步 .github/workflows/build.yml 的 env.APP_VERSION 与 backupstudio/__init__.py"
+          exit 1
+        fi
+        echo "版本一致：$env_ver"
+
+    - name: pytest（Linux + 系统 7z）
+      env:
+        # CI 无显示器：Qt 必须用 offscreen 平台插件
+        QT_QPA_PLATFORM: offscreen
+      run: |
+        python -m pytest tests -q --basetemp="$PWD/build-bt" -rs
+
+  test-macos:
+    name: 单元测试（macOS arm64）
+    runs-on: macos-15
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+        cache: pip
+    - name: 安装依赖
+      run: 'python -m pip install --upgrade pip
+
+        pip install -r requirements.txt -r requirements-dev.txt'
+    - name: 准备 7-Zip（brew）
+      run: 'brew install p7zip || true
+
+        command -v 7z 7za 7zz || true'
+    - name: pytest（macOS + 系统 7z）
+      env:
+        QT_QPA_PLATFORM: offscreen
+      run: |
+        python -m pytest tests -q --basetemp="$PWD/build-bt" -rs
 
   windows:
     name: Windows exe / 安装包
@@ -220,7 +289,13 @@ jobs:
     name: macOS arm64 dmg
     # B5：macos-14 已 deprecated（2026-11-02 完全下线），迁到 macos-15
     runs-on: macos-15
-    needs: test
+    # **只依赖 	est，不依赖 	est-macos**（打包与单测解耦）：
+    # macOS arm64 runner 容量不足时 	est-macos 会排队 15 分钟后被平台取消，
+    # 若这里是 [test, test-macos]，dmg 会陪着一起 skip —— 一挂全挂。
+    # 而 	est 是跨平台纯 Python 单测（Windows 上跑），门禁强度不受影响。
+    # 另注：macos-15-intel 是**另一个资源池**（历史 30 次 0 取消），
+    # 它没必要陪 arm64 一起等。
+    needs: [test]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -282,7 +357,13 @@ jobs:
     # B5：macos-13 已于 2025-12-08 退役（runner 永远排队 → 24h 后 cancelled），
     # 官方指定迁移目标为 macos-15-intel（最后一个 x86_64 镜像）
     runs-on: macos-15-intel
-    needs: test
+    # **只依赖 	est，不依赖 	est-macos**（打包与单测解耦）：
+    # macOS arm64 runner 容量不足时 	est-macos 会排队 15 分钟后被平台取消，
+    # 若这里是 [test, test-macos]，dmg 会陪着一起 skip —— 一挂全挂。
+    # 而 	est 是跨平台纯 Python 单测（Windows 上跑），门禁强度不受影响。
+    # 另注：macos-15-intel 是**另一个资源池**（历史 30 次 0 取消），
+    # 它没必要陪 arm64 一起等。
+    needs: [test]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -337,7 +418,7 @@ jobs:
   linux-appimage:
     name: Linux AppImage
     runs-on: ubuntu-22.04
-    needs: test
+    needs: [test, test-linux]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -372,7 +453,7 @@ jobs:
   linux-flatpak:
     name: Flatpak
     runs-on: ubuntu-22.04
-    needs: test
+    needs: [test, test-linux]
     container:
       # B6：原镜像 bilelmoussaoui/flatpak-github-actions:kde-6.8 的 tag **从未发布**
       # （实测 Docker Hub 27 个 tag，最大 kde-6.7），docker pull 直接 404 → job 必红。
@@ -389,6 +470,10 @@ jobs:
           manifest-path: packaging/io.github.backupstudio.BackupStudio.yml
           cache-key: flatpak-${{ github.sha }}
           build-bundle: true
+          # N1：flatpak-builder 自带 upload-artifact（默认 true），会与下一步
+          # 手动上传的 linux-flatpak 重复（同 digest 同大小），导致 Release 上
+          # 出现两个一模一样的 flatpak。这里关掉，只保留我们自己的 artifact。
+          upload-artifact: false
       # R-4：构建"成功"不等于包能用——此前 --no-deps 让 job 绿着产出
       # ImportError 的坏包。这一步必须让 job 失败，不许 || true 吞掉。
       - name: 冒烟测试（Flatpak）
@@ -509,22 +594,139 @@ jobs:
 
   release:
     name: 发布 Release
-    if: startsWith(github.ref, 'refs/tags/')
+    # ## if 条件的三个部分，缺一不可（全部有实证，见下）
+    #
+    # 1. `!cancelled()` —— **上游被 cancelled / skipped 时仍运行**
+    #    macOS arm64 runner 容量不足时 GitHub 会把 test-macos 判为 cancelled
+    #    （runner_id=0、steps=0、排队 901 秒后放弃），needs 里含它 → 默认的
+    #    success 语义会让本 job 永久 skip。
+    #
+    #    机制：官方实现 `CancelledFunction.cs` 是
+    #        `return jobStatus == ActionResult.Cancelled;`
+    #    读的是 **JobContext.Status（整个 run 的状态）**，代码里没有任何遍历
+    #    needs 的逻辑 —— 所以上游 job 被取消不会让它返回 true。
+    #    但**整个 workflow 被用户 Cancel** 时它返回 true → 本 job 不跑（正确）。
+    #
+    # 2. `!failure()` —— **上游真失败时必须拦住**（实测发现的缺口）
+    #    实证矩阵（本仓库 6 个探针 run）：
+    #        上游 cancelled → `!cancelled()` 放行  ✅ 期望放行
+    #        上游 skipped   → `!cancelled()` 放行  ✅ 期望放行
+    #        上游 failure   → `!cancelled()` **仍放行**  ❌ 期望拦住！
+    #    即 `!cancelled()` 挡不住 failure。若 Windows/Linux 构建真失败，
+    #    release 仍会发版 —— 只靠「门禁 B」兜底太晚。加上 `!failure()` 后三者全对。
+    #
+    # 3. tag 判断 —— 只有打 tag 才发版（分支 push 不发）
+    #
+    # ## 为什么不用 `always()`（同样实证）
+    # 手动 Cancel 整个 run 后：
+    #     `always()` 的 job        → **success，3 个 step 真跑完了**（会发版！）
+    #     `!cancelled()` 的 job    → cancelled，steps=0，不分配 runner
+    # 官方文档也警告 always() 用于关键任务可能让 workflow 挂起到超时。
+    #
+    # ## 为什么 needs 必须保留 macOS 三项
+    # `needs` 同时承担「成功后」和「之后」两件事（官方原文：
+    # "must complete successfully **before this job will run**"）。
+    # 删掉 macOS 会让 release 与 dmg job 并行 → `download-artifact` 抢跑
+    # → 门禁 B 对**健康构建**误报红。保留 needs + `!cancelled()` 才是对的。
+    if: ${{ !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
-    needs: [windows, macos-arm64, macos-x64, linux-appimage, linux-flatpak]
+    # **needs 必须保留 macOS 三项**，即使它们可能被取消。
+    #
+    # 为什么不能删（红队实测的依赖闭包）：GitHub 文档说 needs 承担两件事 ——
+    # 「成功后」**和**「之后」（"must complete successfully **before this job
+    # will run**"）。删掉 macOS 的 needs 不只解除门禁，还**删掉了排序**：
+    # macos-arm64/macos-x64 会与 release 并行 → **即使 macOS 完全正常**，
+    # release 也可能抢先 download 到「缺 2 个 dmg」→ 门禁 B 误报红。
+    #
+    # 正确做法是保留 needs（保住顺序）+ 用 `!cancelled()` 解除「必须成功」：
+    # 上游被 cancelled/skipped 时 release 仍运行，同样不被 macOS 阻塞，且无竞态。
+    #
+    # 缺硬件产物由「门禁 B」显式拦住（绝不静默发残缺版）。
+    needs: [windows, macos-arm64, macos-x64, linux-appimage, linux-flatpak, test-linux, test-macos]
     steps:
+      # 门禁 A 要读 backupstudio/__init__.py，所以不能只 sparse-checkout docs。
+      # 仓库本身不大，全量 checkout 更省心。
       - uses: actions/checkout@v4
-        with:
-          sparse-checkout: docs
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
+      # ── 门禁 A：tag 必须与源码版本号一致 ──
+      # 原门禁只比对 env.APP_VERSION ↔ __version__（同源于仓库，与 tag 无关）。
+      # 打 v1.2.0 而源码仍是 1.1.1 时，会发出「标题是 v1.2.0、文件名全是 1.1.1」
+      # 的 release —— 用户完全无法从文件名看出问题。
+      - name: 门禁 A —— tag 与源码版本号一致
+        shell: bash
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME#v}"
+          # **必须 import 取真值，不能用正则扫文件**（红队实测的 fail-open）：
+          # `re.search` 无行首锚定，会匹配到注释行 ——
+          #     # __version__ = "1.1.1"     ← 注释抢先匹配
+          #     __version__ = "1.1.0"      ← 真值
+          # tag=v1.1.1 时 rc=0 放行并打印 ✅，而实际版本是 1.1.0。
+          # import 是唯一真源，也与 test-linux job 与 packaging/build.py 一致。
+          ver=$(python3 -c 'import backupstudio; print(backupstudio.__version__)')
+          echo "tag=$tag  源码 __version__=$ver"
+          if [ "$tag" != "$ver" ]; then
+            echo "::error::tag（$tag）与源码版本（$ver）不一致 —— 拒绝发版"
+            echo "::error::请先把 backupstudio/__init__.py、pyproject.toml、"
+            echo "::error::.github/workflows/build.yml 的 APP_VERSION 都改成 $tag 再打 tag"
+            exit 1
+          fi
+          echo "✅ tag 与源码版本一致：$ver"
+
+      # ── 门禁 B：产物清单必须齐全 ──
+      # 风险链（审计实证）：
+      #   download-artifact 无 name/pattern（全量模式）→ v4 源码里空列表只 core.info、
+      #   **不抛异常**；叠加 fail_on_unmatched_files: false 与 sha256sum * || true
+      #   → **缺 macOS 产物时 release 照样成功**，SHA256SUMS 只有 4 行、格式完全正常。
+      #
+      # 所以必须显式比对期望清单。缺任何一个都**硬失败**，把静默变成显式。
+      - name: 门禁 B —— 产物清单齐全
+        shell: bash
+        run: |
+          set -eu
+          ver="${GITHUB_REF_NAME#v}"
+          expected="BackupStudio-${ver}-windows-x64.zip
+          BackupStudio-Setup-${ver}.exe
+          BackupStudio-${ver}-arm64.dmg
+          BackupStudio-${ver}-x64.dmg
+          BackupStudio-${ver}-x86_64.AppImage
+          BackupStudio.flatpak"
+          echo "=== 期望产物（6 个）==="
+          echo "$expected"
+          echo
+          echo "=== 实际拿到 ==="
+          ls -la artifacts/ || true
+          echo
+          missing=""
+          for f in $expected; do
+            if [ -f "artifacts/$f" ]; then
+              echo "✅ $f"
+            else
+              echo "❌ 缺失：$f"
+              missing="$missing $f"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::产物不全，拒绝发版。缺少：$missing"
+            echo "::error::macOS arm64 runner 容量不足时，请用 gh run rerun <run-id> --failed 补齐"
+            echo "::error::（artifact 是 run 级作用域，只重跑本 job 补不出 dmg）"
+            exit 1
+          fi
+          echo
+          echo "✅ 6 个产物齐全"
+
       - name: 生成校验值
+        shell: bash
         run: |
           cd artifacts
           ls -la
-          sha256sum * > SHA256SUMS.txt || true
+          # 门禁 B 已确保 6 个文件都在，这里不再 || true
+          sha256sum BackupStudio* > SHA256SUMS.txt
+          echo "=== SHA256SUMS.txt ==="
+          cat SHA256SUMS.txt
       - name: 选择发布说明
         id: notes
         run: |
