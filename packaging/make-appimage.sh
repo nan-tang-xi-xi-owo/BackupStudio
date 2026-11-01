@@ -91,5 +91,16 @@ fi
 "$TOOLS/appimagetool" --version
 
 echo "==> 生成 AppImage"
-ARCH="$ARCH" APPIMAGE_EXTRACT_AND_RUN=1 "$TOOLS/appimagetool" --no-appstream "$APPDIR" "$OUT"
+# runtime 文件：appimagetool 默认会去 GitHub 下载 type2-runtime，但那边返回 302
+# 重定向，appimagetool 自带的下载器不跟随 → 报 "Failed to download runtime"。
+# 这里自己下载并显式传入（--runtime-file），避免依赖它的下载逻辑。
+RUNTIME="$TOOLS/runtime-${ARCH}"
+if [[ ! -x "$RUNTIME" ]]; then
+  echo "==> 下载 AppImage runtime"
+  curl -L --fail --retry 3 --retry-delay 2 -o "$RUNTIME" \
+    "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-${ARCH}"
+  chmod +x "$RUNTIME"
+fi
+ARCH="$ARCH" APPIMAGE_EXTRACT_AND_RUN=1 "$TOOLS/appimagetool" --no-appstream \
+  --runtime-file "$RUNTIME" "$APPDIR" "$OUT"
 echo "==> 完成：$OUT"

@@ -611,13 +611,21 @@ def _post_build() -> None:
     _copy_licenses(target)
     readme = target / "README.md"
     if readme.exists():
-        (target / "使用说明.txt").write_text(
+        # **Linux 上不能写中文文件名**：AppImage 的 appimagetool 对非 ASCII
+        # 路径直接崩（`Option parsing failed: Invalid byte sequence in
+        # conversion input`，实测），squashfs 打包阶段也容易出问题。
+        # 因此非 Windows 平台用 ASCII 名 QUICKSTART.txt，并改写说明里的
+        # 可执行文件名（Linux 没有 .exe）。
+        _linux = sys.platform.startswith("linux")
+        _doc_name = "QUICKSTART.txt" if _linux else "使用说明.txt"
+        _exe = "BackupStudio" if _linux else "BackupStudio.exe"
+        (target / _doc_name).write_text(
             f"BackupStudio 备份工坊 {_project_version()}\n\n"
-            "1. 双击 BackupStudio.exe 启动，右下角托盘会出现图标。\n"
+            f"1. 双击 {_exe} 启动，右下角托盘会出现图标。\n"
             "2. 点「新建任务」选择要备份的文件夹、备份位置、压缩格式（可选密码/分卷）。\n"
             "3. 「计划与保留」里设置自动备份时间，并可自动清理旧备份。\n"
             "4. 关闭窗口会最小化到托盘；想彻底退出请右键托盘图标 → 退出。\n\n"
-            "命令行：BackupStudio.exe --help（info / doctor / task / run / daemon / extract）\n"
+            f"命令行：{_exe} --help（info / doctor / task / run / daemon / extract）\n"
             "详细说明见同目录的 README.md。\n"
             "第三方许可见 THIRD-PARTY-NOTICES.txt 与 THIRD-PARTY-7ZIP.txt（7-Zip 为 LGPL）。\n",
             encoding="utf-8",
