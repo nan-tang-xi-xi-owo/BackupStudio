@@ -24,27 +24,62 @@
 
 ---
 
-## 1. GitHub Token：已找回，但存储位置不牢靠
+## 1. GitHub Token：已存到项目内
 
-**状态：可用，但随时可能再丢。**
+**状态：可用，位置已加固。**
 
 ### 现状
 
-Token 是 40 字符的 OAuth token（`gho_` 前缀），当前存在：
+Token 是 40 字符的 OAuth token（`gho_` 前缀），现在存在**两处**：
 
 ```
-%TEMP%\gh-tok.txt      ← ⚠️ 这个目录会被系统/清理工具清掉
+C:\APP\deepseek\work\定时备份及其压缩项目\.gh-token   ← ✅ 主用（稳定）
+%TEMP%\gh-tok.txt                                    ← 备份（易被清理）
 ```
 
-**历史教训**：上一任交接前，`%TEMP%` 被清理过一次，token 丢了。后来从 **Windows 凭据管理器**里找了回来（`git:https://github.com` 条目，用 GCM 的 `get` 命令可读出）。
-
-### 如果 token 又丢了，怎么找回
+**`.gh-token` 已被 `.gitignore` 挡住**，已做三重验证：
 
 ```powershell
-# Windows 凭据管理器里有这条记录（GCM 存 OAuth token）
-cmdkey /list | findstr github
+git check-ignore -v .gh-token     # → .gitignore:24:.gh-token
+git ls-files --error-unmatch .gh-token   # → error: did not match（未追踪）
+git add -n .gh-token              # → paths are ignored by .gitignore（被拦截）
+git status --ignored              # → !! .gh-token（标记为 ignored）
+```
 
-# 用 GCM 取出（GCM 在非标准路径）：
+> ⚠️ **这个仓库是公开的**（`private=False`）。**绝对不要** `git add -f .gh-token`
+> 或把 token 写进任何被追踪的文件。`.gitignore` 里已加规则：
+> ```
+> .gh-token
+> gh-tok.txt
+> gh-token.txt
+> *.token
+> .env
+> .env.*
+> ```
+
+### 脚本里怎么读 token
+
+统一用这个模式（先找项目内，再退回 %TEMP%）：
+
+```python
+from pathlib import Path
+import tempfile
+
+PROJ = Path(r"C:\APP\deepseek\work\定时备份及其压缩项目")
+TOK_FILE = PROJ / ".gh-token"
+if not TOK_FILE.is_file():
+    TOK_FILE = Path(tempfile.gettempdir()) / "gh-tok.txt"
+TOK = TOK_FILE.read_text().strip()
+```
+
+### 如果 token 又失效了，怎么找回
+
+优先查 **Windows 凭据管理器**（GCM 存的是 OAuth token，不会过期那么快）：
+
+```powershell
+cmdkey /list | findstr github
+# 应看到：Target: LegacyGeneric:target=git:https://github.com
+
 $gcm = 'C:\APP\Git\ucrt64\bin\git-credential-manager.exe'
 $env:GCM_INTERACTIVE='never'
 $inp = "protocol=https`nhost=github.com`nusername=nan-tang-xi-xi-owo`n`n"
@@ -52,14 +87,19 @@ $out = $inp | & $gcm get 2>&1
 ($out | Where-Object { $_ -match '^password=' }) -replace '^password=',''
 ```
 
-如果凭据管理器里也没了，就请用户重新授权（见下方）。
-
-### 建议：把 token 挪到不会丢的地方
+如果凭据管理器里也没了，就重新授权：
 
 ```powershell
-Copy-Item "$env:TEMP\gh-tok.txt" "C:\APP\deepseek\work\.gh-token"
+$env:GCM_INTERACTIVE='always'
+$env:GIT_TERMINAL_PROMPT='1'
+& 'C:\APP\Git\cmd\git.exe' push origin HEAD:main
+# 会弹出 "Connect to GitHub" 窗口，按提示走 device code 授权
+# 拿到后写回 .gh-token：
+#   Set-Content .gh-token $token -NoNewline
 ```
-并在需要时改脚本里的读取路径。
+
+**注意**：必须**在前台**执行（不要在后台 job 里跑），否则
+`bash: /dev/tty: No such device or address`，窗口弹不出来 —— 这是本机踩过的坑。
 
 ### 各操作当前可用性
 
@@ -67,19 +107,8 @@ Copy-Item "$env:TEMP\gh-tok.txt" "C:\APP\deepseek\work\.gh-token"
 |---|---|
 | `git fetch` / `git ls-remote`（读） | ✅ 能（公开仓库，无需 token） |
 | `git clone`（读） | ✅ 能 |
-| `git push`（写） | ⚠️ **能，但网络极不稳**（见第 8.4 节） |
-| GitHub API 写操作（建 release、上传 asset） | ✅ 能（token 有效，API 很快） |
-
-### 如果 token 彻底失效，怎么重新授权
-
-```powershell
-$env:GCM_INTERACTIVE='always'
-$env:GIT_TERMINAL_PROMPT='1'
-& 'C:\APP\Git\cmd\git.exe' push origin HEAD:main
-# 会弹出 "Connect to GitHub" 窗口，按提示走 device code 授权
-```
-
-**注意**：必须**在前台**执行（不要在后台 job 里跑），否则 `bash: /dev/tty: No such device or address`，窗口弹不出来。
+| `git push`（写） | ⚠️ 能，但**网络极不稳**（见第 1.5 节，建议改走 API） |
+| GitHub API 写操作（建 release、上传 asset） | ✅ 能（API 快且稳） |
 
 ---
 

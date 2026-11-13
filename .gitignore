@@ -1,4 +1,4 @@
-﻿__pycache__/
+__pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
@@ -18,3 +18,12 @@ dev/__pycache__/
 
 # 内部工作材料（审查报告、规划文档等，不入公开仓库）
 _pm/
+
+# ⚠️ 凭据：**绝对不能进仓库**（本仓库是公开的）
+# 打包/发版需要的 GitHub token 就放在项目根，靠这几条规则挡住。
+.gh-token
+gh-tok.txt
+gh-token.txt
+*.token
+.env
+.env.*
