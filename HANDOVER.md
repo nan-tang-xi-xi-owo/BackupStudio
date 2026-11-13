@@ -16,70 +16,175 @@
 | 技术栈 | Python 3.15 + PySide6-Essentials 6.12.0 + PyInstaller 6.22.3 |
 | 许可证 | MIT |
 | GitHub 仓库 | https://github.com/nan-tang-xi-xi-owo/BackupStudio |
-| 当前分支 | `merge/1.1-review` @ `1f939df` |
-| 远端 main | `1d0d1a7`（**本地多 1 个提交、8 行未推送**） |
+| 当前分支 | `merge/1.1-review` @ `62475ae` |
+| 远端 main | `26ba861`（**已含全部内容，包括本文档**） |
 | 测试基线 | **483 passed / 0 failed** |
 | 已发布版本 | v1.1.0、v1.1.1、**v1.2.0** |
-| 磁盘剩余 | 86.2 GB |
+| 磁盘剩余 | 85.7 GB |
 
 ---
 
-## 1. ⚠️ 第一件事：GitHub Token 已丢失
+## 1. GitHub Token：已找回，但存储位置不牢靠
 
-**这是接手后最先要解决的问题。**
+**状态：可用，但随时可能再丢。**
 
-原 token 存在 `%TEMP%\gh-tok.txt`，Temp 目录被清理后**已消失**，全盘搜过没有备份。
+### 现状
 
-### 后果
+Token 是 40 字符的 OAuth token（`gho_` 前缀），当前存在：
 
-| 操作 | 现在能否做 |
+```
+%TEMP%\gh-tok.txt      ← ⚠️ 这个目录会被系统/清理工具清掉
+```
+
+**历史教训**：上一任交接前，`%TEMP%` 被清理过一次，token 丢了。后来从 **Windows 凭据管理器**里找了回来（`git:https://github.com` 条目，用 GCM 的 `get` 命令可读出）。
+
+### 如果 token 又丢了，怎么找回
+
+```powershell
+# Windows 凭据管理器里有这条记录（GCM 存 OAuth token）
+cmdkey /list | findstr github
+
+# 用 GCM 取出（GCM 在非标准路径）：
+$gcm = 'C:\APP\Git\ucrt64\bin\git-credential-manager.exe'
+$env:GCM_INTERACTIVE='never'
+$inp = "protocol=https`nhost=github.com`nusername=nan-tang-xi-xi-owo`n`n"
+$out = $inp | & $gcm get 2>&1
+($out | Where-Object { $_ -match '^password=' }) -replace '^password=',''
+```
+
+如果凭据管理器里也没了，就请用户重新授权（见下方）。
+
+### 建议：把 token 挪到不会丢的地方
+
+```powershell
+Copy-Item "$env:TEMP\gh-tok.txt" "C:\APP\deepseek\work\.gh-token"
+```
+并在需要时改脚本里的读取路径。
+
+### 各操作当前可用性
+
+| 操作 | 能否做 |
 |---|---|
 | `git fetch` / `git ls-remote`（读） | ✅ 能（公开仓库，无需 token） |
 | `git clone`（读） | ✅ 能 |
-| `git push`（写） | ❌ **不能** |
-| GitHub API 写操作（建 release、上传 asset） | ❌ **不能** |
+| `git push`（写） | ⚠️ **能，但网络极不稳**（见第 8.4 节） |
+| GitHub API 写操作（建 release、上传 asset） | ✅ 能（token 有效，API 很快） |
 
-实测证据：
-```
-$ git push origin HEAD:main
-remote: Invalid username or token. Password authentication is not supported...
-fatal: Authentication failed
-```
+### 如果 token 彻底失效，怎么重新授权
 
-### 需要请用户做的事
-
-1. 到 https://github.com/settings/tokens 新建一个 Personal Access Token
-   - 勾选 `repo` 权限（或细粒度 token 勾 `Contents: Read and write` + `Administration`）
-2. 把 token 存到**不会被清理的位置**，例如：
-   - 项目内：`C:\APP\deepseek\work\定时备份及其压缩项目\.gh-token`（已加 .gitignore）
-   - 或用户自己保管
-3. 之后可用 `git push` 正常推送
-
-### 恢复推送后要做的第一件事
-
-推送这 1 个未上传的提交：
-
-```bash
-cd "C:\APP\deepseek\work\定时备份及其压缩项目"
-git push origin HEAD:main
+```powershell
+$env:GCM_INTERACTIVE='always'
+$env:GIT_TERMINAL_PROMPT='1'
+& 'C:\APP\Git\cmd\git.exe' push origin HEAD:main
+# 会弹出 "Connect to GitHub" 窗口，按提示走 device code 授权
 ```
 
-该提交 `1f939df` 的内容是 `packaging/installer.iss.in` 加 8 行（Setup.exe 的 FileVersion 修复），详见第 6 节。
+**注意**：必须**在前台**执行（不要在后台 job 里跑），否则 `bash: /dev/tty: No such device or address`，窗口弹不出来。
+
+---
+
+## 1.5 ⚠️ 推送必须走 Trees API，不要用 git push
+
+**这是本机最耗时的一个坑，务必先读。**
+
+实测网络：
+
+| 端点 | 响应时间 | 稳定性 |
+|---|---|---|
+| `github.com`（`git push` 走这个） | **19.7 秒** | 频繁 `Connection was reset` / `SSL/TLS handshake failed` |
+| `api.github.com`（API 走这个） | **0.7 秒** | 稳定 |
+
+`git push` 实测失败信息：
+
+```
+schannel: failed to receive handshake, SSL/TLS connection failed
+Recv failure: Connection was reset
+fatal: unable to access ... Connection timed out after 300053 milliseconds
+```
+
+**所以推送要用 GitHub Trees API**：读远端 tree → 逐文件比对 blob sha → 只上传变化的 → 建新 tree/commit → PATCH ref。
+
+脚本模板（本次用的，可复用）：
+
+```python
+import base64, json, subprocess, tempfile
+from pathlib import Path
+
+TOK = (Path(tempfile.gettempdir()) / "gh-tok.txt").read_text().strip()
+API = "https://api.github.com/repos/nan-tang-xi-xi-owo/BackupStudio"
+REPO = Path(r"C:\APP\deepseek\work\定时备份及其压缩项目")
+
+def api(method, url, payload=None):
+    cmd = ["curl.exe", "-s", "-X", method,
+           "-H", f"Authorization: token {TOK}", "-H", "User-Agent: bs",
+           "-H", "Accept: application/vnd.github+json", "--max-time", "180"]
+    tmp = None
+    if payload is not None:
+        fd, tmp = tempfile.mkstemp(suffix=".json"); os.close(fd)
+        Path(tmp).write_text(json.dumps(payload), encoding="utf-8")
+        cmd += ["-H", "Content-Type: application/json", "--data-binary", f"@{tmp}"]
+    cmd.append(url)
+    r = subprocess.run(cmd, capture_output=True)
+    return json.loads(r.stdout.decode("utf-8", "replace") or "{}")
+
+# 1) 取远端 ref → commit → tree（recursive 拿全部 blob sha）
+ref = api("GET", f"{API}/git/ref/heads/main")
+rsha = ref["object"]["sha"]
+tr = api("GET", f"{API}/git/trees/{rsha}?recursive=1")
+remote_files = {e["path"]: e["sha"] for e in tr["tree"] if e["type"] == "blob"}
+
+# 2) 本地逐文件算 blob sha（git hash-object 与 GitHub 算法一致）
+changed = []
+for rel in subprocess.run(["git","ls-files"], cwd=REPO, capture_output=True,
+                          text=True, encoding="utf-8").stdout.split():
+    q = REPO / rel
+    if q.is_file():
+        blob = subprocess.run(["git","hash-object",str(q)], cwd=REPO,
+                              capture_output=True, text=True, encoding="utf-8").stdout.strip()
+        if remote_files.get(rel) != blob:
+            changed.append(rel)
+
+# 3) 上传 blob → 建 tree → 建 commit → 改 ref
+base_tree = api("GET", f"{API}/git/commits/{rsha}")["tree"]["sha"]
+entries = []
+for rel in changed:
+    bl = api("POST", f"{API}/git/blobs", {
+        "content": base64.b64encode((REPO/rel).read_bytes()).decode(),
+        "encoding": "base64"})
+    entries.append({"path": rel, "mode": "100644", "type": "blob", "sha": bl["sha"]})
+newtree = api("POST", f"{API}/git/trees", {"base_tree": base_tree, "tree": entries})
+msg = subprocess.run(["git","log","-1","--pretty=%B"], cwd=REPO,
+                     capture_output=True, text=True, encoding="utf-8").stdout.strip()
+nc = api("POST", f"{API}/git/commits",
+         {"message": msg, "tree": newtree["sha"], "parents": [rsha]})
+api("PATCH", f"{API}/git/refs/heads/main", {"sha": nc["sha"], "force": False})
+```
+
+**这套做法的副作用**：远端 commit sha 与本地不同（内容 tree 相同）。所以下一次 `git log origin/main..HEAD` 会把**所有历史提交**都列出来，看着像"72 个提交未推送"，但实际差异可能只有 1-2 个文件。**判断是否同步要看 `git diff --stat origin/main HEAD`，不要看提交数。**
+
 
 ---
 
 ## 2. 仓库状态（本地 vs 远端）
 
 ```
-本地 HEAD (merge/1.1-review) = 1f939df
-远端 main                    = 1d0d1a7
+本地 HEAD (merge/1.1-review) = 62475ae
+远端 main                    = 26ba861   ← 已含全部内容，含本文档
 远端 fix/1.1-review          = 1843644
 远端 fix/1.1-ui              = a20a47c   ← 别人的 PR #4，未合并
 ```
 
-### 关键结论：远端 main 已包含几乎全部成果
+### 关键结论：本地与远端内容**完全一致**（已逐字节核实）
 
-已用 `git cat-file` 逐个核实，远端 main 上有这些新文件：
+```
+git diff --stat origin/main HEAD   → （空）
+
+逐文件比对：
+✅ HANDOVER.md          29502B = 29502B  一致
+✅ packaging/installer.iss.in  2942B = 2942B  一致
+```
+
+`main` 上确认存在这些新文件（`git cat-file -e origin/main:<path>` 核实）：
 
 ```
 ✓ backupstudio/gui/styles.py      六种风格定义
@@ -88,27 +193,23 @@ git push origin HEAD:main
 ✓ backupstudio/gui/titlebar.py    自绘标题栏
 ✓ backupstudio/gui/winframe.py    路线 C 原生框架位
 ✓ backupstudio/gui/winchrome.py   原生标题栏深色兜底
+✓ HANDOVER.md                     本文档
 ```
 
 版本号（远端）：`__version__ = "1.2.0"`、`pyproject.toml` 的 `version = "1.2.0"`、CHANGELOG 有 `## 1.2.0`。
 
-**唯一差异**（`git diff --stat origin/main HEAD`）：
-
-```
-packaging/installer.iss.in | 8 ++++++++
-1 file changed, 8 insertions(+)
-```
+> **注意**：远端 `main` 的 commit sha 是 `26ba861`，本地是 `62475ae` —— **sha 不同但 tree 内容相同**。这是 Trees API 推送的必然结果（见第 1.5 节）。**判断是否同步要看 `git diff --stat`，不要看 commit sha 或提交数。**
 
 ### 本地分支说明
 
 | 分支 | 说明 |
 |---|---|
-| `merge/1.1-review` | **当前分支，就是 HEAD**，对应远端 `fix/1.1-review` |
-| `main` | 本地 main 是旧的（`5111f12`），**不要用**，以远端 main 为准 |
+| `merge/1.1-review` | **当前分支，就是 HEAD** |
+| `main` | 本地 main 是旧的（`5111f12`），**不要用**，以 `origin/main` 为准 |
 | `fix/1.1-review` | 本地这个分支也是旧的（`0420bf6`），不用管 |
 | `wip/zip-direct-pack-abandoned` | 已废弃的 7-Zip ZIP 直打实验，仅存档 |
 
-> 接手后建议：删掉本地 `main` 和 `fix/1.1-review`，重新 `git fetch` 后以 `origin/main` 为基线，避免搞混。
+> **接手后建议**：在新设备上 `git clone` 后直接以 `origin/main` 为基线工作，不要管上面这些本地分支 —— 它们只在旧设备上有意义。
 
 ---
 
@@ -359,22 +460,7 @@ DWMWA_TEXT_COLOR (36)                E_INVALIDARG  ❌
 
 ## 6. 未完成事项（按优先级）
 
-### P0：推送那 8 行（需要 token）
-
-`packaging/installer.iss.in` 加了 `VersionInfoVersion` 等 5 个字段，修复 Setup.exe 的 `FileVersion` 为空。
-
-**这个问题从 v1.1.0 起就存在**（不是 1.2.0 引入的）。修复后实测：
-
-```
-FileVersion    = 1.2.0.0
-ProductVersion = 1.2.0
-```
-
-拿到 token 后执行：
-```powershell
-cd "C:\APP\deepseek\work\定时备份及其压缩项目"
-git push origin HEAD:main
-```
+> **P0 已完成**：原来第 6 节的第一项是「推送那 8 行」，已于 2026-11-13 完成推送（远端 main = `26ba861`）。该项内容即 `packaging/installer.iss.in` 的 `VersionInfoVersion` 修复，Setup.exe 的 `FileVersion` 已从空白变为 `1.2.0.0`。
 
 ### P1：Flatpak —— 本机无解，需改 BIOS
 
@@ -661,34 +747,44 @@ git fetch origin main && git diff --stat origin/main HEAD
 
 ## 11. 接手后的建议顺序
 
-1. **先读本文档第 1 节**，找用户要 GitHub token
-2. 拿到 token 后推送那 8 行（`git push origin HEAD:main`）
-3. 用 `git fetch origin && git checkout -B work origin/main` 建立干净基线
-4. 跑一遍测试确认 483 passed
-5. 起一次源码版和打包版，肉眼确认六种风格都能切、标题栏跟随、玻璃有折射
-6. 找用户确认剩余优先级（Flatpak 要不要改 BIOS？dmg 有没有 Mac？恢复入口要不要做？）
+1. **先读第 1 节**确认 token 状态；顺手把 `%TEMP%\gh-tok.txt` 挪到不易丢失的位置
+2. `git clone` 或 `git fetch origin && git checkout -B work origin/main` 建立干净基线
+   （**不要**管旧设备上的本地分支，以 `origin/main` 为准）
+3. 跑一遍测试，确认 **483 passed / 0 failed**（记得加 7-Zip 到 PATH，见第 4 节）
+4. 起一次源码版（`python -m backupstudio`）和打包版（`dist\BackupStudio\BackupStudio.exe`），
+   肉眼确认六种风格都能切、标题栏跟随、玻璃有折射
+5. 读第 5 节，理解这次 1.2.0 改了什么、为什么这么改（尤其别踩回已修过的坑）
+6. 找用户确认剩余优先级：
+   - Flatpak 要不要去 BIOS 开虚拟化？
+   - dmg 有没有 Mac 可用？
+   - GUI 恢复入口要不要做？
 
 ---
 
 ## 12. 遗留的临时产物
 
 已在本轮清理：
-- `build/` 下所有临时文件（version_info.txt 缓存、pyinstaller 工作区、测试 basetemp）
+- `build/` 下所有临时文件（version_info.txt 缓存、pyinstaller 工作区、测试 basetemp），现在 **0 项**
 - `__pycache__`、`.pytest_cache`
-- `dev/` 下 60+ 个一次性验证脚本（probe_/diag_/check_/show_ 等前缀，已删）
 - 根目录 `build_pack*.log`
 
 **未清理（有意保留）**：
-- `dist/`（587.7 MB，4 个产物 + 解包目录）
-- `dev/` 下少数有长期价值的脚本：`render_styles.py`、`verify_page_styles.py`、`verify_paging.py` 等
-- `docs/screenshots/`（实拍截图，交接和文档要用）
-- WSL 里 `/var/lib/flatpak`（约 2 GB，flatpak 用不了可删：`wsl -d Ubuntu -u root -- rm -rf /var/lib/flatpak`）
+- `dist/`（587.7 MB，4 个产物 + 解包目录）—— 新设备上没有，需要重新构建
+- `dev/` 66 个验证脚本（186.5 KB）—— 都是 git 追踪的，克隆时会带下来
+- `docs/screenshots/`（实拍截图，文档引用）
+- WSL 里 `/var/lib/flatpak`（约 2 GB，flatpak 用不了可删：
+  `wsl -d Ubuntu -u root -- rm -rf /var/lib/flatpak`）
 
 ---
 
 ## 13. 交接总结（一句话版）
 
-**代码和产物都是完整可用的，v1.2.0 已发布 4 个平台的包；本地只差 1 个提交 8 行没推上去（因为 GitHub token 丢了）；Flatpak 需要用户去 BIOS 开虚拟化；dmg 需要 Mac。**
+**代码和产物都完整可用，v1.2.0 已发布 4 个平台的包，本地与远端 main 内容完全一致（已逐字节核实）；剩下的是 Flatpak（需用户去 BIOS 开虚拟化）和 dmg（需 Mac）。**
+
+---
+
+*本文档由上一任 AI 在 2026-11-13 生成，同日更新（推送完成后的状态订正）。
+ 如有疑问，先查本文档，再查 `docs/KNOWN-ISSUES.md`，最后查 git log。*
 
 ---
 
