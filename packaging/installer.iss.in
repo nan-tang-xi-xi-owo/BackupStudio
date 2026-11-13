@@ -14,6 +14,14 @@ AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
+; **必须显式给 VersionInfoVersion**：Inno Setup 默认只写 ProductVersion
+; （字符串），不写文件版本 → 资源管理器"详细信息"里 FileVersion 为空
+; （v1.1.0 起一直如此，本次修复）。格式要求 x.y.z.w 四段纯数字。
+VersionInfoVersion={#MyAppVersion}.0
+VersionInfoProductVersion={#MyAppVersion}
+VersionInfoProductName={#MyAppName}
+VersionInfoCompany={#MyAppPublisher}
+VersionInfoDescription={#MyAppName} Setup
 UninstallDisplayIcon={app}\{#MyAppExeName}
 OutputDir=__ROOT__\dist
 OutputBaseFilename=BackupStudio-Setup-{#MyAppVersion}
